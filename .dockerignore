@@ -10,7 +10,6 @@ build
 site
 docs
 test
-scripts
 Dockerfile
 .dockerignore
 *.md
