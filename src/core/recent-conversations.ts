@@ -51,6 +51,7 @@ import { chatMessagesFromCopilot, COPILOT_EVENTS_FILE, copilotSessionStateRoots 
 import { chatFromAntigravity } from './antigravity-chat'
 import { ANTIGRAVITY_SESSION_ID_RE } from './handoff/locate'
 import { untrustedLine } from './github/control-read'
+import { isRecord } from '../shared/is-record'
 
 /** Candidates opened per root (newest by mtime). A root with thousands of old transcripts costs a
  *  directory listing and a stat each, never a read. */
@@ -227,9 +228,6 @@ function parseJson(line: string): Record<string, unknown> | null {
   }
 }
 
-const isObj = (v: unknown): v is Record<string, unknown> =>
-  !!v && typeof v === 'object' && !Array.isArray(v)
-
 /** An absolute directory string, or null. A history file is input we did not write. */
 export function safeCwd(v: unknown): string | null {
   if (typeof v !== 'string') return null
@@ -296,13 +294,13 @@ async function parseClaude(c: Candidate): Promise<Parsed> {
 async function parseCodex(c: Candidate): Promise<Parsed> {
   const lines = await headLines(c)
   const meta = lines.length ? parseJson(lines[0]) : null
-  if (!meta || meta.type !== 'session_meta' || !isObj(meta.payload)) return null
+  if (!meta || meta.type !== 'session_meta' || !isRecord(meta.payload)) return null
   const p = meta.payload
   const id = p.id
   if (typeof id !== 'string' || !CODEX_THREAD_ID_RE.test(id) || !validId(id)) return null
   // MEASURED (codex 0.156): a spawned child rollout carries `thread_source: "subagent"` and a
   // `source: {subagent: …}` object; a user's own thread says `thread_source: "user"`.
-  if (p.thread_source === 'subagent' || isObj(p.source)) return null
+  if (p.thread_source === 'subagent' || isRecord(p.source)) return null
   const prompt = firstPrompt(chatMessagesFromCodex(lines.join('\n')))
   const t = titled(null, prompt)
   if (t.titleSource === 'none') return null
@@ -336,10 +334,10 @@ async function parseGrok(c: Candidate, sessionId: string, cwd: string | null): P
 async function parseCopilot(c: Candidate, dirId: string): Promise<Parsed> {
   const lines = await headLines(c)
   const start = lines.map(parseJson).find((o) => o?.type === 'session.start')
-  const data = start && isObj(start.data) ? start.data : null
+  const data = start && isRecord(start.data) ? start.data : null
   // The journal's own id must name the directory it sits in — a copied journal is not this session.
   if (!data || data.sessionId !== dirId || !validId(dirId)) return null
-  const cwd = isObj(data.context) ? safeCwd(data.context.cwd) : null
+  const cwd = isRecord(data.context) ? safeCwd(data.context.cwd) : null
   const prompt = firstPrompt(chatMessagesFromCopilot(lines.join('\n')))
   const t = titled(null, prompt)
   if (t.titleSource === 'none') return null
@@ -623,7 +621,7 @@ export function listRecentConversationsReused(
 
 /** Sanitize a request that arrived over IPC / the WS bridge. */
 export function normalizeRecentRequest(raw: unknown): RecentConversationsRequest {
-  if (!isObj(raw)) return {}
+  if (!isRecord(raw)) return {}
   const ids = Array.isArray(raw.codexAccountIds)
     ? raw.codexAccountIds.filter((x): x is string => typeof x === 'string').slice(0, MAX_CODEX_ACCOUNTS)
     : undefined

@@ -53,6 +53,7 @@ export { accountNodeColor, agentAccountColor } from '@shared/agents/account-colo
 import { mutationTrustsLaunch, sanitizeInboundNode } from '@shared/node-exec'
 import { SYSTEM_NODE_COLORS } from '@shared/node-colors'
 import { groupsFirstBy } from '@shared/node-order'
+import { rootPositionWith } from '@shared/root-position'
 
 // Preserve the renderer's long-standing import surface; validation and the palette now live in
 // shared so Server Edition and canvas-control accept exactly what these pickers display.
@@ -2036,19 +2037,7 @@ function groupsFirst(nodes: CanvasNode[]): CanvasNode[] {
 /** A node's position in ROOT space: its own position plus every ancestor frame's origin. */
 export function rootPosition(node: CanvasNode, nodes: CanvasNode[]): { x: number; y: number } {
   const byId = new Map(nodes.map((candidate) => [candidate.id, candidate]))
-  const seen = new Set<string>([node.id])
-  let x = node.position.x
-  let y = node.position.y
-  let parentId = node.parentId
-  while (parentId && !seen.has(parentId)) {
-    seen.add(parentId)
-    const parent = byId.get(parentId)
-    if (!parent) break
-    x += parent.position.x
-    y += parent.position.y
-    parentId = parent.parentId
-  }
-  return { x, y }
+  return rootPositionWith(node, (id) => byId.get(id))
 }
 
 /**

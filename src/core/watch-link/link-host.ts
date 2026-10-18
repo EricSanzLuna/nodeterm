@@ -174,6 +174,7 @@ import {
   wrapWatcherSink
 } from './watcher-policy'
 import { CONTROL_WRONG_MAX, type WatchLinkRecord } from './store'
+import { errorText } from '../../shared/error-text'
 
 export const MAX_VIEWERS_PER_LINK = 10
 /** While the link is full (no idle listener, so no mint), how often the API is asked whether the link
@@ -412,7 +413,6 @@ interface CaptureSlot {
   next: { result: Promise<VisibleCapture>; start(): void } | null
 }
 
-const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err))
 /** The same members, in any order (the typing set is a set: a new order alone is no news). */
 function sameMembers(a: string[], b: string[]): boolean {
   if (a.length !== b.length) return false
