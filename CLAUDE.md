@@ -2404,6 +2404,14 @@ raw-HTML tokens as escaped TEXT (a program's `<stdin>` is not markup; parsed as 
 stripped it) and trims capture-pane's trailing padding. The escape is on the `html` token, never a
 global pre-escape of `<`, which would double-escape code spans/fences.
 
+**The TS/JS worker is reaped, not idled** (`renderer/editor/tsWorkerReaper.ts`, audit #18). Monaco
+0.57 stops the css/html/json workers after 2 min idle but never the TypeScript one (separate TS and JS
+managers can pin two compiler isolates, order of 70-100 MB each). monaco-setup stops it with a no-op
+`setCompilerOptions` on `monaco.typescript.*Defaults` (`onDidChange` → `_stopWorker`; the next request
+restarts it lazily) 2 min after the last TS/JS model is disposed or changes language.
+`noSemanticValidation` does not stop it. This only works if every node **disposes its models on
+unmount**: one leaked `.ts` model pins the worker for the session.
+
 **The rendered-Markdown font is a setting** (`markdownFontFamily` / `markdownFontSize`, Settings →
 Appearance; `@shared/markdown-font`). App.tsx publishes it as `--md-font-family` / `--md-font-size`
 on <html>, plus `--md-code-font-family` = the TERMINAL font family; styles.css keeps the defaults on

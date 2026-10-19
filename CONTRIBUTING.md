@@ -1372,6 +1372,8 @@ bite most often:
   hibernation and the WebGL budget.
 - Search big in-memory text with one escaped `RegExp(q, 'iu')` per query, never `toLowerCase()`
   per entry (transcript index: 20-52 ms + 7-15 MB garbage → 2-13 ms + 0 MB per search).
+- Dispose every Monaco model your node creates when it unmounts. The TS/JS worker (a whole
+  compiler isolate) is only stopped once no TS/JS model is left (`renderer/editor/tsWorkerReaper.ts`).
 
 **SSH projects on Windows** run over an in-process transport (`src/core/remote-ssh/native/`),
 not the ssh binary. If you add an ssh call site, route it through `useNativeSsh()` like the
