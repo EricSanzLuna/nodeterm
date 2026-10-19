@@ -9071,6 +9071,19 @@ one attribute with two owners is a race over who clears it. The claim is refcoun
 mount the incoming view before unmounting the outgoing one, and a plain set/clear pair would let
 that unmount erase the live view's claim.
 
+**The board gate does not stop xterm; `terminal/board-render-pause.ts` does.** CSS reaches the glows,
+not the terminals: xterm pauses only on its own GEOMETRIC IntersectionObserver, and a node under
+the board still intersects. MEASURED (audit GT-6, dev, 12 streaming terminals): board open 36.5 %
+GPU vs 0.0 % over silent terminals, and `visibility: hidden` on the canvas 35.5 % — no help. Each
+TerminalNode wraps its RenderService's `_handleIntersectionChange` so xterm is told "not
+intersecting" while `boardOpen` (Omni included) is up and the node is not the focus-mode node (the
+focus surface, z 40, sits above the board, z 25); uncovering replays the real entry through xterm's
+own resume and then `fullRepaint`. Parsing never stops, so nothing is lost. Two rules: never fold
+the board into `reportVisible` / the WebGL budget's visibility (that verdict drives hibernation and
+the offscreen teardown — the board would put the very sessions it shows to sleep), and any other
+"is the board up" predicate must OR in `isGlobalKanbanOpen()` (`boardCoversCanvas` missed the Omni
+board until GT-6, the same omission 12564a20 fixed for focus restore).
+
 **Specificity is the quiet failure mode in all of this, and it has already happened twice.** The
 three glows carry their own `animation:` shorthand, which RESETS `animation-play-state` — so
 inheriting the variable does nothing for them and every gate has to name them explicitly. A first
