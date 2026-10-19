@@ -271,7 +271,7 @@ factories (`createTerminalNode`, `createSshTerminalNode`, `createAgentNode(agent
 group transforms (`groupSelectedNodes`, `ungroupNodes`, `duplicateNode`), and the
 `nodeStatesToFlow` / `flowToNodeStates` serializers. Node kinds (`NodeKind` in
 `src/shared/types.ts`): `terminal | sticky | group | editor | diff | video | web | browser |
-files | subagent | loop | dino | trigger` — `subagent` and `loop` are render-only (ephemeral hook-driven
+files | subagent | loop | dino | trigger | simulator | whiteboard` — `subagent` and `loop` are render-only (ephemeral hook-driven
 viz) and never persisted. `trigger` (issue #493, all four
 phases landed) is a first-class PERSISTED kind. The whole host-side
 machine is composed ONCE in `core/trigger-service.ts` (`startTriggerService`) and booted
@@ -2161,6 +2161,17 @@ number: change the table in that one module, never in one emulator.
     one file. Guard on both dialects, construct in one.
   - **Mobile**: N/A — *nodeterm mobile* attaches to tmux sessions over the transport protocol and
     has no canvas or file-browsing concept; adding one means extending that protocol.
+- **whiteboard** (`WhiteboardNode.tsx`, `whiteboard/WhiteboardEditor.tsx`) — an Excalidraw board;
+  full write-up in `docs/whiteboard-node.md`. The invariants: (1) editing is ONE live editor
+  portaled into `.canvas-root` over the node's box, never inside the scaled node (pointer drift,
+  blur, and `.flow-wrap`'s wheel capture); (2) the scene is a side file the core addresses by
+  (project, node id) — `core/whiteboards.ts` — and NEVER by a path from node data (project.json is
+  git-shared, hostile input); node data holds only `whiteboardSource` (a copy's original, by id)
+  and `boardRev` (once per session); (3) the overlay is `data-nt-keyboard-owner`, which every
+  typing-aware key site honours via `isKeyboardOwnerTarget`; (4) every save path compares versions
+  against disk, and the unmount flush writes a snapshot kept from `onChange` — Excalidraw's api is
+  empty by cleanup time, and reading it there once erased a board. Excalidraw loads lazily; fonts
+  come from `scripts/excalidraw-assets-plugin.ts`; mermaid is aliased to a stub.
 - **Run node** (a `terminal` node carrying `data.runConfig`, NOT a new NodeKind;
   `@shared/run-config`, `core/run-service.ts`, `nodes/RunBar.tsx`) — VS Code's "Run Without
   Debugging" for any `.vscode/launch.json` configuration. The toolbar picks a folder (defaults to

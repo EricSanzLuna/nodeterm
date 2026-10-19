@@ -113,6 +113,7 @@ import {
 import { StickyNode } from '../nodes/StickyNode'
 import { GroupNode, setWorktreeActionHandler } from '../nodes/GroupNode'
 import { LazyEditorNode, LazyDiffNode } from '../nodes/lazyMonacoNodes'
+import { WhiteboardNode } from '../nodes/WhiteboardNode'
 import { DinoNode } from '../nodes/DinoNode'
 import { TriggerNode } from '../nodes/TriggerNode'
 import BrowserNode from '../nodes/BrowserNode'
@@ -166,6 +167,7 @@ import {
   IconLock,
   IconMinus,
   IconNote,
+  IconWhiteboard,
   IconPhone,
   IconPlay,
   IconPlus,
@@ -323,7 +325,7 @@ import {
   type GlobalKeyEvent,
   type GlobalKeydownDeps
 } from '../lib/globalKeybindings'
-import { isTerminalTarget, type ContextElement } from '../lib/keyContext'
+import { isTerminalTarget, KEYBOARD_OWNER_SELECTOR, type ContextElement } from '../lib/keyContext'
 import { nextMdMode } from '../lib/markdownModeToggle'
 import { installTerminalFocusMirror } from '../lib/terminalFocusMirror'
 import { nodeToRefocus } from '../lib/focusRestore'
@@ -916,6 +918,7 @@ import {
   createAgentNode,
   createBrowserNode,
   createDinoNode,
+  createWhiteboardNode,
   createTriggerNode,
   createFilesNode,
   createRunNode,
@@ -2333,6 +2336,7 @@ export function Canvas() {
       subagent: withNodeBoundary(SubagentNode),
       loop: withNodeBoundary(LoopNode),
       dino: withNodeBoundary(DinoNode),
+      whiteboard: withNodeBoundary(WhiteboardNode),
       trigger: withNodeBoundary(TriggerNode),
       video: withNodeBoundary(VideoNode),
       web: withNodeBoundary(WebNode),
@@ -5950,7 +5954,7 @@ export function Canvas() {
     const editableTarget = (target: EventTarget | null): boolean => {
       const element = target instanceof Element ? target : null
       return !!element?.closest(
-        'input, textarea, select, button, [contenteditable], [role="dialog"], .monaco-editor, .xterm, .react-flow__node'
+        `input, textarea, select, button, [contenteditable], [role="dialog"], .monaco-editor, .xterm, .react-flow__node, ${KEYBOARD_OWNER_SELECTOR}`
       )
     }
     const onPointerDown = (event: PointerEvent) => {
@@ -6384,6 +6388,17 @@ export function Canvas() {
     (center?: { x: number; y: number }, groupId?: string) => {
       setNodes((ns) => {
         const node = createStickyNode(ns.length, center ?? emptyNodePos())
+        return [...ns, groupId ? parentInto(node, groupId) : node]
+      })
+      markDirty()
+    },
+    [setNodes, markDirty, emptyNodePos, parentInto]
+  )
+
+  const addWhiteboard = useCallback(
+    (center?: { x: number; y: number }, groupId?: string) => {
+      setNodes((ns) => {
+        const node = createWhiteboardNode(ns.length, center ?? emptyNodePos())
         return [...ns, groupId ? parentInto(node, groupId) : node]
       })
       markDirty()
@@ -10284,7 +10299,7 @@ export function Canvas() {
       tag === 'input' ||
       tag === 'textarea' ||
       document.activeElement?.getAttribute('contenteditable') === 'true' ||
-      document.activeElement?.closest('.monaco-editor, .xterm')
+      document.activeElement?.closest(`.monaco-editor, .xterm, ${KEYBOARD_OWNER_SELECTOR}`)
     )
       return false
     const sel = window.getSelection?.()?.toString()
@@ -10597,6 +10612,7 @@ export function Canvas() {
       // keystroke was consumed by us and must not fall through to the platform.
       'node.newWebView': () => { void addWebView(); return true },
       'node.newDino': () => { addDino(); return true },
+      'node.newWhiteboard': () => { addWhiteboard(); return true },
       'node.newFile': () => {
         // Same gate the pane menu / ⌘K use for their "New file…" row: the file is created UNDER
         // the project folder, so a cwd-less (inline) project has nowhere to put it. Refuse rather
@@ -11379,6 +11395,7 @@ export function Canvas() {
       run: (at) => void addRun(at),
       simulator: (at) => addSimulator(at),
       dino: (at) => addDino(at),
+      whiteboard: (at) => addWhiteboard(at),
       trigger: (at) => addTrigger(at),
       openFile: (at) => void openFileDialog(at),
       newFile: (at) => void newProjectFile(at),
@@ -11395,6 +11412,7 @@ export function Canvas() {
       addWebView,
       addSticky,
       addDino,
+      addWhiteboard,
       addTrigger,
       openFileDialog,
       newProjectFile,
@@ -18778,6 +18796,7 @@ export function Canvas() {
       ...(!simulatorRefusal(activeSession.source === 'relay', isSshProject)
         ? [{ id: 'new-simulator', label: 'New simulator', icon: <IconPhone />, run: () => addSimulator() }]
         : []),
+      { id: 'new-whiteboard', label: 'New whiteboard', icon: <IconWhiteboard />, run: () => addWhiteboard() },
       { id: 'new-dino', label: 'New dino game', icon: <IconDino />, run: () => addDino() },
       { id: 'open-file', label: 'Open file…', icon: <IconEditor />, run: () => void openFileDialog() },
       // "New file…" needs a project folder to create into — hidden when the project has no cwd.
@@ -19046,6 +19065,8 @@ export function Canvas() {
           <IconEditor />
         ) : n.type === 'sticky' ? (
           <IconNote />
+        ) : n.type === 'whiteboard' ? (
+          <IconWhiteboard />
         ) : (
           <IconTerminal />
         )
@@ -19088,6 +19109,7 @@ export function Canvas() {
     addRun,
     addSimulator,
     addDino,
+    addWhiteboard,
     addWebView,
     addBrowser,
     openFileDialog,
@@ -20435,6 +20457,7 @@ export function Canvas() {
         onAddSticky={addSticky}
         onSpawnTeam={() => setSpawnTeamDialog({})}
         onAddDino={addDino}
+        onAddWhiteboard={addWhiteboard}
         onAddTrigger={addTrigger}
         onAddFiles={() => addFiles()}
         onAddRun={() => void addRun()}

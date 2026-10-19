@@ -24,6 +24,7 @@ export const NODE_SIZE_CHOICES: readonly NodeSizeChoice[] = ['terminal', ...SIZA
 export const NODE_SIZE_CHOICE_LABELS: Record<NodeSizeChoice, string> = {
   terminal: 'Terminal & agent',
   sticky: 'Sticky note',
+  whiteboard: 'Whiteboard',
   browser: 'Browser',
   web: 'Web view',
   editor: 'Editor',

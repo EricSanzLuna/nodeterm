@@ -7,6 +7,7 @@ import {
   createStickyNode,
   createTerminalNode,
   createTriggerNode,
+  createWhiteboardNode,
   defaultNodeSize
 } from './workspace'
 
@@ -43,6 +44,12 @@ describe('per-kind default node sizes (Settings → Behavior → Default node si
     const t = createTriggerNode(0)
     expect(size(t)).toEqual([360, 220])
     expect(t.style).toMatchObject({ width: 360, height: 220 })
+  })
+
+  it('opens a whiteboard at 900×600, or at the size the user set for whiteboards', () => {
+    expect(size(createWhiteboardNode(0))).toEqual([900, 600])
+    settings({ defaultNodeSizes: { whiteboard: { width: 1280, height: 720 } } })
+    expect(size(createWhiteboardNode(0))).toEqual([1280, 720])
   })
 
   it('keeps terminals on their own long-standing setting', () => {

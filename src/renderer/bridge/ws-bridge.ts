@@ -85,6 +85,8 @@ import {
 import type { PeerIdentity } from '../../shared/presence'
 import type { PaneOwner } from '../../shared/agents/pane-owner-predicate'
 import type { LaunchIntentExecutionResult } from '../../shared/types'
+import type { WhiteboardFile } from '../../shared/whiteboard'
+import { fitsOneWsFrame } from '../../shared/ws-frame'
 import { buildStubApi, unsupported } from './stubs'
 import { sanitizeStationNotices } from '@shared/station-notice'
 import { sanitizeOutcomeRecords } from '@shared/station-outcome'
@@ -687,6 +689,18 @@ export function buildFilesApi(
       client.request(IPC.filesSaveCanvasImage, projectId, name, dataBase64) as Promise<
         string | null
       >,
+    // Real: the whiteboard's side file sits beside the server's project.json.
+    // The server closes the WHOLE socket (code 1009) on a client frame over WS_MAX_PAYLOAD, so a
+    // board too big for one frame is refused here, before sending — the node shows "Not saved"
+    // instead of the browser tab losing its connection to every terminal.
+    saveWhiteboard: (projectId, nodeId, scene, thumbnailBase64) =>
+      fitsOneWsFrame([projectId, nodeId, scene, thumbnailBase64])
+        ? (client.request(IPC.filesSaveWhiteboard, projectId, nodeId, scene, thumbnailBase64) as Promise<
+            string | null
+          >)
+        : Promise.resolve(null),
+    readWhiteboard: (projectId, nodeId, sourceId, withScene) =>
+      client.request(IPC.filesReadWhiteboard, projectId, nodeId, sourceId, withScene) as Promise<WhiteboardFile | null>,
     // Real: the browser holds the picked sound's bytes and the data dir is the server's, so the
     // server stores it and serves it back by kind (issue #289). The browser's own path never leaves
     // the browser — a host-local path would not exist on the server anyway.

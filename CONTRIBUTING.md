@@ -1195,6 +1195,17 @@ the kind union, so a new kind is a **compile error** until you route it. The kan
 `addMenuSpec.surfaces.test.ts` pins that split so "make them all consistent" stays a decision
 rather than a reflex.
 
+**A surface that takes the whole keyboard marks itself `data-nt-keyboard-owner`.** The canvas
+decides "is the user typing" from the focused element (`isTypingTarget` and friends), and a canvas-
+or div-based editor — the whiteboard's Excalidraw — is not a text field to that check, so Space,
+Delete and ⌘Z reached canvas commands over it. The attribute is honoured by every typing-aware key
+site through `isKeyboardOwnerTarget` (`lib/keyContext.ts`); add new sites to it, not a class list.
+
+**Files a node owns are addressed by id, never by a path from node data.** `project.json` is
+git-shared and hand-editable, so a path in it is attacker-controlled: a whiteboard's side file is
+derived by the core from (project, node id) (`core/whiteboards.ts`), and the id must be a string
+passing `isSafeNodeId`. A copy refers to its original by id (`whiteboardSource`), not by path.
+
 **A new node kind also gets a default size the user can change.** Add it to `SizableNodeKind` /
 `SIZABLE_NODE_KINDS` (`shared/default-node-size.ts`) and `BUILTIN_NODE_SIZES`, and place it with
 `placeSized(kind, …)` in its factory. A literal `*_SIZE` passed to `placeNode` compiles fine and

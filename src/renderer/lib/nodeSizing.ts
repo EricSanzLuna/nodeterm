@@ -25,7 +25,8 @@ export const NODE_MIN_SIZES: Record<NodeKind, { width: number; height: number }>
   loop: { width: 180, height: 84 },
   dino: { width: 400, height: 160 },
   trigger: { width: 240, height: 120 },
-  simulator: { width: 200, height: 260 }
+  simulator: { width: 200, height: 260 },
+  whiteboard: { width: 320, height: 220 }
 }
 
 export interface Rect {

@@ -246,6 +246,8 @@ export const VIEW: Readonly<Record<string, Check>> = Object.freeze({
   [IPC.ptyTmuxStatus]: pass,
   [IPC.fsList]: pathArg0,
   [IPC.fsRead]: pathArg0,
+  // A whiteboard is read by (projectId, nodeId); the core derives the file inside that project.
+  [IPC.filesReadWhiteboard]: projectArg0,
   [IPC.fsReadBinary]: pathArg0,
   [IPC.fsExists]: pathArg0,
   // Every git VIEW method: the cwd jail, then the shared root must be its own repository (C1).
@@ -340,6 +342,7 @@ export const EDITOR_ONLY: ReadonlySet<string> = new Set<string>([
   IPC.filesDownloadTicket,
   IPC.filesSaveUpload,
   IPC.filesSaveCanvasImage,
+  IPC.filesSaveWhiteboard,
   // Custom alert sounds live in the HOST's data dir and replace the host user's own chime.
   IPC.filesSaveAlertSound,
   IPC.filesReadAlertSound,

@@ -17534,7 +17534,7 @@ body.focus-mode .dock:hover {
 /* An empty field must look empty (visual QA round 3, NM1): the placeholder's 4.5:1 floor sits at
    --text's own alpha in light (0.85), so TYPED text in chrome fields takes --text-strong instead.
    Terminal nodes and the card-modal terminal keep their theme ink; notes keep their own. */
-:root[data-nt-glass='on'] :is(input:not([type]), input[type='text'], input[type='search'], textarea):not(.term-node *, .sticky-node *, .kanban-modal__termwrap *, .monaco-editor *) {
+:root[data-nt-glass='on'] :is(input:not([type]), input[type='text'], input[type='search'], textarea):not(.term-node *, .sticky-node *, .kanban-modal__termwrap *, .monaco-editor *, .excalidraw *) {
   color: var(--text-strong);
 }
 :root[data-nt-glass='on'] .settings-nav-row {
@@ -18279,4 +18279,82 @@ body.focus-mode .dock:hover {
   justify-content: flex-end;
   gap: 6px;
   margin-top: 2px;
+}
+
+/* ── Whiteboard node (nodes/WhiteboardNode.tsx) ─────────────────────────────────────────────
+   The node shows a still picture of the board; the live Excalidraw editor is a fixed overlay on
+   document.body laid over the node's box (see the component for why it is not inside the node). */
+.whiteboard-node {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.whiteboard-node.selected {
+  box-shadow: 0 0 0 2px var(--accent);
+}
+.whiteboard-node__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+  background: var(--surface-overlay);
+}
+.whiteboard-node__body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  outline: none;
+  cursor: crosshair;
+}
+.whiteboard-node__thumb {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+}
+.whiteboard-node__hint {
+  color: var(--muted);
+  font-size: 13px;
+  pointer-events: none;
+}
+.whiteboard-node__save-failed {
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--state-error) 15%, transparent);
+  color: var(--state-error);
+  font-size: 11px;
+  font-weight: 600;
+}
+/* The canvas area, in .canvas-root coordinates: clips the live editor to the canvas and stacks it
+   under the sessions sidebar (z 12) and the Dock (z 20), which sit beside .flow-wrap. */
+.whiteboard-clip {
+  position: absolute;
+  z-index: 10;
+  overflow: hidden;
+  pointer-events: none;
+}
+.whiteboard-overlay {
+  position: absolute;
+  overflow: hidden;
+  border-radius: 0 0 9px 9px;
+  background: var(--bg);
+  pointer-events: auto;
+}
+.whiteboard-overlay__loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--muted);
+  font-size: 13px;
 }

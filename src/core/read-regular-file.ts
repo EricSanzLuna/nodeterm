@@ -46,3 +46,42 @@ export async function readRegularFileNoFollow(
     await fh?.close().catch(() => {})
   }
 }
+
+/**
+ * `readRegularFileNoFollow`'s rules for binary or large files: the same single-descriptor open →
+ * fstat → lstat-identity check, but the buffer is sized from the fstat (not `maxBytes`, which for a
+ * whiteboard scene is 64 MB), the bytes come back raw, and `read: false` answers only the file's
+ * mtime — so a caller can learn a file's revision without reading it. Resolves `null` for anything
+ * that is not a readable regular file within `maxBytes`. Never throws.
+ */
+export async function readRegularFileBytesNoFollow(
+  file: string,
+  maxBytes: number,
+  opts: { read?: boolean } = {}
+): Promise<{ bytes?: Buffer; mtimeMs: number } | null> {
+  let fh: fs.FileHandle | undefined
+  try {
+    fh = await fs.open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0))
+    const st = await fh.stat({ bigint: true })
+    if (!st.isFile() || st.size > BigInt(maxBytes)) return null
+    const named = await fs.lstat(file, { bigint: true })
+    if (!named.isFile() || (st.ino !== 0n && (named.dev !== st.dev || named.ino !== st.ino))) return null
+    const mtimeMs = Number(st.mtimeMs)
+    if (opts.read === false) return { mtimeMs }
+    // One byte past what fstat reported, from the SAME handle: a file that grew since is refused.
+    const want = Number(st.size) + 1
+    const buf = Buffer.alloc(want)
+    let total = 0
+    while (total < want) {
+      const { bytesRead } = await fh.read(buf, total, want - total, total)
+      if (bytesRead === 0) break
+      total += bytesRead
+    }
+    if (total > Number(st.size) || total > maxBytes) return null
+    return { bytes: buf.subarray(0, total), mtimeMs }
+  } catch {
+    return null
+  } finally {
+    await fh?.close().catch(() => {})
+  }
+}

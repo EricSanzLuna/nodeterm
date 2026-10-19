@@ -85,6 +85,8 @@ const BROWSER_SIZE = { width: 800, height: 560 }
 const FILES_SIZE = { width: 340, height: 460 }
 /** A phone held upright, with room for the toolbar. The screen keeps its own aspect inside. */
 const SIMULATOR_SIZE = { width: 360, height: 760 }
+/** Landscape and roomy: a whiteboard is for sketching, and the board pans and zooms inside itself. */
+const WHITEBOARD_SIZE = { width: 900, height: 600 }
 
 /** Height of a node when collapsed (header only). */
 export const COLLAPSED_HEIGHT = 40
@@ -182,6 +184,18 @@ export interface NodeData {
    *  hand edit — the stamp means "an agent synced this", not "last touched". */
   textUpdatedAt?: number
   textUpdatedBy?: string
+  /**
+   * whiteboard-only: the board this node shows until it saves its own — set on a duplicate or a
+   * reopen (which get a NEW id) so the copy needs no file copy and no board file is ever deleted.
+   * A node id, never a path: the core resolves it inside this project (core/whiteboards.ts).
+   */
+  whiteboardSource?: string
+  /** whiteboard-only: epoch ms of the last editing session that changed the board. Written once
+   *  per session (never per stroke) — what a linked agent's "the board changed" keys on. */
+  boardRev?: number
+  /** whiteboard-only, renderer-only (never serialized): open the editor as soon as the board has
+   *  loaded. Set by `createWhiteboardNode` so a new board opens ready to draw; cleared on use. */
+  autoEdit?: boolean
   filePath?: string
   /**
    * editor/diff-only: true once this node's `filePath` was confirmed gone — e.g. a worktree
@@ -379,7 +393,8 @@ export const BUILTIN_NODE_SIZES: Readonly<Record<SizableNodeKind, NodeSize>> = {
   files: FILES_SIZE,
   dino: DINO_SIZE,
   trigger: TRIGGER_SIZE,
-  simulator: SIMULATOR_SIZE
+  simulator: SIMULATOR_SIZE,
+  whiteboard: WHITEBOARD_SIZE
 }
 
 /**
@@ -1347,6 +1362,21 @@ export function createStickyNode(index: number, center?: { x: number; y: number 
       color: '#ffd60a',
       group: null,
       text: ''
+    }
+  }
+}
+
+/** Creates a new whiteboard: an Excalidraw sketching surface (nodes/WhiteboardNode.tsx). */
+export function createWhiteboardNode(index: number, center?: { x: number; y: number }): CanvasNode {
+  return {
+    id: nextId('whiteboard'),
+    type: 'whiteboard',
+    ...placeSized('whiteboard', center, index),
+    data: {
+      title: 'Whiteboard',
+      color: '#64d2ff',
+      group: null,
+      autoEdit: true
     }
   }
 }
@@ -2432,8 +2462,12 @@ export function groupSelectedNodes(
 
 /** Returns a copy of a node with a fresh id, offset position, and top-level placement. */
 export function duplicateNode(node: CanvasNode, offset = 28): CanvasNode {
-  const kind: NodeKind = node.type === 'sticky' ? 'sticky' : node.type === 'group' ? 'group' : 'terminal'
+  const kind: NodeKind =
+    node.type === 'sticky' || node.type === 'group' || node.type === 'whiteboard' ? node.type : 'terminal'
   const prefix = kind === 'terminal' ? 'term' : kind
+  // A whiteboard copy starts from the original's drawing: it reads that board (by id) until it
+  // saves its own, so no file is copied and the original is never written by the copy.
+  const whiteboardSource = node.type === 'whiteboard' ? (node.data.whiteboardSource ?? node.id) : undefined
   return {
     ...node,
     id: nextId(prefix),
@@ -2445,7 +2479,14 @@ export function duplicateNode(node: CanvasNode, offset = 28): CanvasNode {
     // the binding would put a phantom run on the issue card (a chip and `#N` with no run-started,
     // then a run-ended when it closes). `openedBy` likewise: nobody's open verb made the copy, and
     // an orchestrator told about it would be told about a station it never opened.
-    data: { ...node.data, initialCommand: undefined, launchIntent: undefined, issueRef: undefined, openedBy: undefined }
+    data: {
+      ...node.data,
+      initialCommand: undefined,
+      launchIntent: undefined,
+      issueRef: undefined,
+      openedBy: undefined,
+      ...(whiteboardSource ? { whiteboardSource } : {})
+    }
   }
 }
 
@@ -2727,6 +2768,11 @@ export function nodeStatesToFlow(states: CanvasNodeState[]): CanvasNode[] {
         textUpdatedBy: n.textUpdatedBy,
         filePath: n.filePath,
         fileMissing: n.fileMissing,
+        // Re-validated: project.json is git-shared and hand-editable, and the core resolves this id
+        // to a file. Anything that is not a plain node id is dropped (the copy shows a blank board).
+        whiteboardSource:
+          typeof n.whiteboardSource === 'string' && isSafeNodeId(n.whiteboardSource) ? n.whiteboardSource : undefined,
+        boardRev: typeof n.boardRev === 'number' && Number.isFinite(n.boardRev) ? n.boardRev : undefined,
         url: n.url,
         partition: n.partition,
         dockTo: n.kind === 'browser' && typeof n.dockTo === 'string' && RUN_NODE_ID.test(n.dockTo) ? n.dockTo : undefined,
@@ -2786,7 +2832,9 @@ export function flowToNodeStates(nodes: CanvasNode[], retainInitialCommand = tru
                         ? FILES_SIZE
                         : kind === 'simulator'
                           ? SIMULATOR_SIZE
-                          : TERMINAL_SIZE
+                          : kind === 'whiteboard'
+                            ? WHITEBOARD_SIZE
+                            : TERMINAL_SIZE
   return nodes
     .map((n) => {
       const kind: NodeKind = (n.type as NodeKind) ?? 'terminal'
@@ -2826,6 +2874,8 @@ export function flowToNodeStates(nodes: CanvasNode[], retainInitialCommand = tru
         textUpdatedBy: n.data.textUpdatedBy,
         filePath: n.data.filePath,
         fileMissing: n.data.fileMissing,
+        whiteboardSource: n.data.whiteboardSource,
+        boardRev: n.data.boardRev,
         url: n.data.url,
         partition: n.data.partition,
         dockTo: kind === 'browser' && typeof n.data.dockTo === 'string' && RUN_NODE_ID.test(n.data.dockTo) ? n.data.dockTo : undefined,

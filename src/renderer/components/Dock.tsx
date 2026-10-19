@@ -29,6 +29,7 @@ interface DockProps {
   /** Opens the Spawn-a-team dialog (issue #78) — the conductor lands at the Dock's default spot. */
   onSpawnTeam: () => void
   onAddDino: () => void
+  onAddWhiteboard: () => void
   onAddTrigger: () => void
   onAddFiles: () => void
   /** A run node (a launch.json configuration) rooted in the project folder. */
@@ -83,6 +84,7 @@ export function Dock({
   onAddSticky,
   onSpawnTeam,
   onAddDino,
+  onAddWhiteboard,
   onAddTrigger,
   onAddFiles,
   onAddRun,
@@ -199,6 +201,7 @@ export function Dock({
     sticky: onAddSticky,
     spawnTeam: onSpawnTeam,
     dino: onAddDino,
+    whiteboard: onAddWhiteboard,
     trigger: onAddTrigger,
     files: onAddFiles,
     run: onAddRun,

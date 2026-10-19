@@ -4,6 +4,7 @@ import type { CorePlatform } from './platform'
 import * as fsOps from './fs-ops'
 import { saveUpload } from './uploads'
 import { saveCanvasImage } from './canvas-images'
+import { readWhiteboard, saveWhiteboard } from './whiteboards'
 import { clearAlertSound, readAlertSound, saveAlertSound } from './alert-sounds'
 import type { AlertSoundKind } from '../shared/alert-sound'
 import { IPC } from '../shared/ipc'
@@ -78,6 +79,29 @@ export function registerFsHandlers(
         name,
         dataBase64
       })
+  )
+  // A whiteboard's scene + picture: beside project.json when the project has a local cwd, else in
+  // this core's data dir. Addressed by node id only — see core/whiteboards.ts for why a path is
+  // never accepted.
+  platform.handle(
+    IPC.filesSaveWhiteboard,
+    (projectId: string, nodeId: string, scene: string, thumbnailBase64?: string) =>
+      saveWhiteboard(
+        { projectCwd: deps.localProjectCwd?.(projectId), userDataDir: platform.userDataDir },
+        nodeId,
+        scene,
+        thumbnailBase64
+      )
+  )
+  platform.handle(
+    IPC.filesReadWhiteboard,
+    (projectId: string, nodeId: string, sourceId?: string, withScene?: boolean) =>
+    readWhiteboard(
+      { projectCwd: deps.localProjectCwd?.(projectId), userDataDir: platform.userDataDir },
+      nodeId,
+      sourceId,
+      withScene !== false
+    )
   )
   // Custom alert sounds (issue #289): bytes in, a FIXED per-kind file under this core's data dir
   // out. Reads and deletes take only a kind, so no caller can aim them at another file. See
