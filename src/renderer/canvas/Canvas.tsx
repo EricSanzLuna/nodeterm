@@ -300,6 +300,7 @@ import { conductorPrompt } from '../lib/spawnTeamPrompt'
 import { NotifyConsentDialog } from '../components/NotifyConsentDialog'
 import { SessionsSidebar } from '../components/SessionsSidebar'
 import type { SessionNodeInput } from '../lib/sessionList'
+import { needsYouQueue, nextNeedingYou } from '../lib/nextNeedingYou'
 import { liveProjectJumpTarget, projectJumpDigit } from '../lib/projectJump'
 import {
   liveZoomShortcutAction,
@@ -10493,6 +10494,51 @@ export function Canvas() {
   }, [sessionsPinned, sessionsDismissed, explorerOpen, explorer.pinned, fitMaximizedToUsableArea])
 
   /**
+   * "Go to next agent needing you" (`node.nextNeedingYou`, ⌘K; audit roadmap #19 / qol-2): one
+   * chord instead of the 3-5 sidebar clicks a waiting agent in another project took. The queue is
+   * built ON DEMAND from `getState()` reads — Canvas never subscribes to `statusById` (every
+   * working/waiting flip would re-render the whole canvas; see StatusAwareMiniMap). The cycle
+   * cursor is memory only: a restart starts again at the oldest wait, which is the right answer.
+   * Travel is `travelToNodeRef` (declared above this point; the callback itself is defined much
+   * further down) so a closed-project hop keeps travelToNode's hosted-team reopen guard.
+   */
+  const needsYouCursorRef = useRef<string | null>(null)
+  const needsYouQueueNow = useCallback((): string[] => {
+    const { projects, activeProjectId: active } = useProjects.getState()
+    // The live canvas only when it is the ACTIVE project's (the epoch pair): mid-switch nodesRef
+    // still holds the outgoing project's nodes. Live adds a just-created node the store has not
+    // committed yet; without it the persisted nodes are used, exactly as the closed sidebar does.
+    const live: SessionNodeInput[] | null =
+      nodesProjectIdRef.current === active
+        ? nodesRef.current
+            .filter((n) => (n.type ?? 'terminal') === 'terminal')
+            .map((n) => ({
+              id: n.id,
+              kind: 'terminal' as const,
+              title: n.data.title ?? n.id,
+              color: n.data.color ?? '#888'
+            }))
+        : null
+    return needsYouQueue(projects, live, active, useAgentStatus.getState().byId)
+  }, [nodesRef, nodesProjectIdRef])
+  const goToNextNeedingYou = useCallback((): void => {
+    const target = nextNeedingYou(
+      needsYouQueueNow(),
+      needsYouCursorRef.current,
+      useAgentStatus.getState().activeId
+    )
+    if (!target) {
+      // Claimed even when empty: from a focused terminal xterm has already withheld the chord
+      // (terminalChordBubbles), so declining would not hand it back — it would only make a chord
+      // the user bound on purpose do nothing, silently.
+      setNotice({ kind: 'info', text: 'No agent is waiting for you.' })
+      return
+    }
+    needsYouCursorRef.current = target
+    travelToNodeRef.current(target)
+  }, [needsYouQueueNow])
+
+  /**
    * Zone snap (issue #394 v1): place `nodeId` (or the placement target, for the keyboard chords)
    * into a zone of the visible canvas. Same declines as maximize; no toggle state — the node has
    * simply been moved, exactly as if by hand (see `placeNodeInRect`).
@@ -10610,6 +10656,7 @@ export function Canvas() {
       'node.focusRight': () => moveNodeFocus('right'),
       'node.focusUp': () => moveNodeFocus('up'),
       'node.focusDown': () => moveNodeFocus('down'),
+      'node.nextNeedingYou': () => { goToNextNeedingYou(); return true },
       'node.maximize': toggleMaximizeCommand,
       // Every zone, halves through quarters, from the one table (issue #1169).
       ...Object.fromEntries(
@@ -18884,6 +18931,22 @@ export function Canvas() {
         icon: <IconFit />,
         run: toggleFocusMode
       },
+      // The ⌘K twin of `node.nextNeedingYou` (same function, so they share the cycle cursor).
+      // Hidden when nothing waits, like Tidy canvas below: it could only report "no agent".
+      ...((): Command[] => {
+        const waiting = needsYouQueueNow().length
+        return waiting > 0
+          ? [
+              {
+                id: 'next-needing-you',
+                label: 'Go to next agent needing you',
+                hint: `${waiting} waiting · attention blocked permission`,
+                icon: <IconJump />,
+                run: goToNextNeedingYou
+              }
+            ]
+          : []
+      })(),
       { id: 'fit', label: 'Fit view', icon: <IconFit />, run: fitAll },
       // Hidden below 2 top-level nodes — see arrangeAllNodes.
       ...(hasArrangeableNodes()
@@ -19112,6 +19175,8 @@ export function Canvas() {
     saveCanvasLayout,
     restoreCanvasLayout,
     toggleFocusMode,
+    needsYouQueueNow,
+    goToNextNeedingYou,
     hostedBookmarks,
     copyHostedInviteCode,
     forgetHostedTeam,

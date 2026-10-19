@@ -998,6 +998,13 @@ make it show up; a command with no effective binding is omitted rather than list
 replaced hand-listed 24 ids against a 45-command registry and had drifted four live chords behind
 — if you find yourself typing a command id into that file, that is the bug reappearing.
 
+**A command that reads agent status reads it per keypress, never by subscription.** Canvas must not
+subscribe to `useAgentStatus`'s `byId` (every working/waiting flip would re-render the whole
+canvas): `node.nextNeedingYou` builds its queue on demand (`lib/nextNeedingYou.ts`, over
+`buildStatusList`) from `getState()` and travels with `travelToNode`, keeping its cycle cursor in a
+ref. A new ships-unbound command also needs a `'<id>':` handler entry that
+`keybindings-handler-parity.test.ts` can see — the handlers map is `Partial`, so nothing else will.
+
 **Comments explain WHY, and name the failure they prevent.** The codebase is deliberately dense with
 reasoning. A comment that restates the code is noise; one that says "do not simplify this back,
 here is what broke" is the point.

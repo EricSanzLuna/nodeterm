@@ -90,6 +90,7 @@ export type CommandId =
   | 'node.focusRight'
   | 'node.focusUp'
   | 'node.focusDown'
+  | 'node.nextNeedingYou'
   | 'node.maximize'
   | 'node.zoneLeft'
   | 'node.zoneRight'
@@ -244,6 +245,14 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
   { id: 'node.focusDown', title: 'Focus node below', group: 'Nodes', scope: 'canvas',
     defaultBindings: { darwin: ['Cmd+ArrowDown'], other: ['Ctrl+Shift+ArrowDown'] },
     allowInTerminal: true },
+  // Travel to the agent that has waited longest for you (waiting/blocked), across projects; each
+  // press steps to the next one (audit roadmap #19 / qol-2: one chord instead of 3-5 clicks
+  // through the sidebar). Ships UNBOUND — every obvious chord already has an owner, and a default
+  // would steal it from a user who never asked. Scope 'canvas' + allowInTerminal for the
+  // node.focus* reason: the hand that wants to move is in a terminal, and over the kanban board
+  // there is no canvas to land on. The queue is built on demand per press (lib/nextNeedingYou).
+  { id: 'node.nextNeedingYou', title: 'Go to next agent needing you', group: 'Nodes',
+    scope: 'canvas', defaultBindings: both(), allowInTerminal: true },
   // The header maximize toggle's chord (issue #399): fill the viewport with the node under the
   // keyboard (else the single selected node), or restore it. allowInTerminal for focus-mode's
   // reason — the hand that wants more rows is already typing in the terminal being enlarged.
