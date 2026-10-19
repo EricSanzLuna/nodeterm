@@ -4190,8 +4190,9 @@ command-bearing opens; this does not add a human-confirm dialog or change mobile
   A send therefore goes through `pty.sendChatPrompt`, where core captures the pane first and
   refuses (`ChatPromptBlocked`, nothing written, the draft kept) when the bottom of the screen is a
   dialog footer or has no input box; an empty or unreadable capture is NOT evidence and sends as
-  before. A LOCAL pane is also polled every 2 s while the view is visible, to disable the composer
-  and show the dialog's lines; SSH and relay panes are not polled (a round trip per read) and rely
+  before. A LOCAL pane is also polled every 2 s while the view is visible AND the window focused
+  (an unfocused window skips ticks — ~30 tmux spawns a minute per view otherwise — and `focus`
+  re-reads at once; unknown focus polls), to disable the composer and show the dialog's lines; SSH and relay panes are not polled (a round trip per read) and rely
   on the send-time check. Another CLI's layout would read as a permanent dialog, so an agent joins
   the list only with its own measured reader.
   **Live progress (2026-09).** While the agent works, a `role=status` row closes the thread (the ONE
