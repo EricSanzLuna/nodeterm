@@ -19212,6 +19212,9 @@ export function Canvas() {
         onOpenWelcome={() => setWelcomeOpen(true)}
         onRename={renameProject}
         onSetFolder={setProjectFolder}
+        onMoveStorage={(id, to) =>
+          void (to === 'appData' ? moveProjectToAppData : moveProjectToFolder)(id, projectStorageMoveDeps)
+        }
         onCloseProject={closeProject}
         onRemoteAccess={() => setRemoteDialogOpen(true)}
         onSetDefaultAccount={setProjectDefaultAccount}
