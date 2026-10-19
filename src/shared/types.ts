@@ -1114,6 +1114,13 @@ export interface Project {
   icon?: ProjectIcon
   /** Default working directory for new terminals created in this project. */
   cwd?: string
+  /**
+   * MACHINE-LOCAL: this folder project's canvas lives in app data (`userData/inline-projects/<id>.json`),
+   * not in `<cwd>/.nodeterm/project.json`, and nothing is written into the folder (issue #1145).
+   * Only meaningful beside a local `cwd`; never written to any shared file. See the
+   * folder-data-ref kind in core/workspace-files.ts (`IndexEntryV3.dataFile`).
+   */
+  storeInAppData?: boolean
   /** When set, this is an SSH project: its terminals run on `server` in `remoteCwd` (remote tmux). */
   ssh?: { server: import('./ssh').SshConnection; remoteCwd: string }
   viewport: Viewport

@@ -12,7 +12,8 @@ import {
 } from '../shared/types'
 import { contentOf, type CanvasContent } from '../shared/canvas-content'
 import {
-  PROJECT_DIR, PROJECT_FILE, fileToProject, inlineProjectFileRelPath, isInlineProjectFileId,
+  PROJECT_DIR, PROJECT_FILE, fileToProject, folderFileCwd, inlineProjectFileRelPath, isFolderDataRef,
+  isInlineProjectFileId,
   projectToFile, resolveNodes, sameProjectContent,
   sanitizeLoadedClosedSessions, sanitizeNodeTriggers, serializeProjectFile, splitWorkspace,
   sanitizeHandedOffTo,
@@ -569,11 +570,16 @@ export class WorkspaceStore {
     for (const e of index.entries) {
       // A LOCAL-DATA ref reads its own file first; `e.project` below is its cache and answers only
       // when the file is missing or unreadable (and for a pre-file entry, which has no file yet).
-      const fromDataFile = e.dataFile && !e.cwd && !e.ssh
+      // A FOLDER-DATA-REF (issue #1145) is a local-data ref with a working directory: the file and
+      // its cache are stored without `cwd` (see splitWorkspace), so the folder is put back here.
+      const folderData = isFolderDataRef(e)
+      const inFolder = (project: Project): Project =>
+        folderData ? { ...project, cwd: e.cwd, storeInAppData: true } : project
+      const fromDataFile = e.dataFile && !e.ssh
         ? await this.loadDataFileEntry(e, sideline)
         : null
       if (fromDataFile) {
-        built.push(fromDataFile)
+        built.push({ ...fromDataFile, project: inFolder(fromDataFile.project) })
       } else if (e.project) {
         // Inline projects are stored verbatim in the index (no fileToProject pass), so apply the
         // same kanban shape guard here — a v1/hand-edited board would otherwise crash the render —
@@ -597,7 +603,7 @@ export class WorkspaceStore {
         const history = sanitizeLoadedClosedSessions(closedSessions)
         built.push({
           entry: e,
-          project: {
+          project: inFolder({
             ...base,
             nodes: sanitizeNodeTriggers(base.nodes),
             ...(admittedBridges ? { bridges: admittedBridges } : {}),
@@ -605,8 +611,13 @@ export class WorkspaceStore {
             ...(history ? { closedSessions: history } : {}),
             ...(admitted ? { layouts: admitted } : {}),
             ...(views ? { layoutViewports: views } : {})
-          }
+          })
         })
+      } else if (folderData) {
+        // File AND cache gone. Never fall through to the folder branch below: that reads the
+        // folder's own `.nodeterm/project.json` — a stale copy or a teammate's canvas — and the
+        // next save would adopt it as this project. The grey placeholder keeps the kind instead.
+        built.push({ entry: e, project: { ...unavailableProject(e), storeInAppData: true } })
       } else if (e.cwd) {
         if (sideline) await sweepStaleTmp(projectFilePath(e.cwd))
         const read = await this.readProjectFile(e.cwd, sideline)
@@ -830,7 +841,7 @@ export class WorkspaceStore {
     const local = this.localSettingsByProject.get(projectId)
     if (e.ssh) return this.readSshSettings(projectId, e.ssh, local)
     // An inline canvas has no folder, so there is no shared document to have.
-    if (!e.cwd) return { shared: null, local }
+    if (!folderFileCwd(e) || !e.cwd) return { shared: null, local }
     const read = await readProjectSettingsFile(e.cwd)
     if (read.status === 'ok') {
       // The rev source for the next write — a write that skipped the read would restart at rev 1
@@ -1026,7 +1037,7 @@ export class WorkspaceStore {
     const e = this.index?.entries.find((x) => x.id === projectId)
     if (!e) return false
     if (e.ssh) return this.writeSshSettings(projectId, e.ssh, doc)
-    if (!e.cwd) return false
+    if (!folderFileCwd(e) || !e.cwd) return false
     const read = await readProjectSettingsFile(e.cwd)
     // absent → nothing to lose, start at rev 1. invalid → the read already sidelined the only
     // copy to `.corrupt-<ts>`, so this write destroys nothing either.
@@ -1282,7 +1293,7 @@ export class WorkspaceStore {
   async readProjectContent(projectId: string): Promise<CanvasContent | null> {
     const e = this.index?.entries.find((x) => x.id === projectId)
     if (!e || e.ssh) return null
-    if (e.cwd) {
+    if (folderFileCwd(e) && e.cwd) {
       const file = await this.knownProjectFile(e.cwd)
       if (!file) return null
       return contentOf(fileToProject(file, { id: e.id, cwd: e.cwd, localExec: localExecOverlay(e, file) }))
@@ -1338,7 +1349,7 @@ export class WorkspaceStore {
     const e = this.index?.entries.find((x) => x.id === projectId)
     if (!e || e.ssh) return false
     const savedAt = new Date().toISOString()
-    if (e.cwd) return this.writeFolderContent(e, e.cwd, content, savedAt)
+    if (folderFileCwd(e) && e.cwd) return this.writeFolderContent(e, e.cwd, content, savedAt)
     if (e.project) return this.writeInlineContent(e, e.project, content, savedAt)
     return false
   }
@@ -1507,7 +1518,7 @@ export class WorkspaceStore {
     // are joined here, through the index entry that owns the folder. At most one ref entry exists
     // per cwd (splitWorkspace's second tab on a folder becomes an inline entry, no cwd at all).
     const projectIdForCwd = new Map(
-      index.entries.filter((e) => e.cwd).map((e) => [e.cwd!, e.id] as const)
+      index.entries.filter((e) => folderFileCwd(e)).map((e) => [e.cwd!, e.id] as const)
     )
     for (const [cwd, candidate] of files) {
       const projectId = projectIdForCwd.get(cwd) ?? cwd
@@ -1536,6 +1547,23 @@ export class WorkspaceStore {
     // candidate overwrite a populated file this store has not read — plus the one rule only this
     // leg needs (see `writeDataFile`): a second app instance shares this userData, so a file whose
     // rev has moved ahead of ours belongs to that instance and is not overwritten.
+    // A folder project that has just moved its canvas INTO app data (issue #1145) may find a file
+    // of its own already there — litter from an earlier "Set folder…" or move, same id and same
+    // lineage. It is never what this project holds now, and left alone it can win: an empty
+    // candidate is refused over a populated file this store never read, and the next load would
+    // adopt those stale bytes. So it is cleared before the write, for exactly that transition.
+    // Only for an id this store already had as a folder ref: a file under an id we never held is
+    // another instance's (see `sweepRemovedDataFiles`).
+    const wasFolderRef = new Set(
+      (previousIndex?.entries ?? []).filter((e) => folderFileCwd(e)).map((e) => e.id)
+    )
+    for (const e of index.entries) {
+      if (!isFolderDataRef(e) || !wasFolderRef.has(e.id) || !isInlineProjectFileId(e.id)) continue
+      const file = inlineFilePath(e.id)
+      await fs.rm(file, { force: true }).catch(() => undefined)
+      this.lastWritten.delete(file)
+      this.lastWrittenParsed.delete(file)
+    }
     for (const [projectId, candidate] of dataFiles) await this.writeDataFile(projectId, candidate)
 
     // ssh caches: bump rev on change so a later remote write can win; mirror write in Task 8.
@@ -1699,9 +1727,25 @@ export class WorkspaceStore {
     next: WorkspaceIndexV3
   ): Promise<void> {
     if (!previous) return
-    const live = new Set(next.entries.map((e) => e.id))
+    // Ids whose entry still keeps its content in a data file. An id that is live but no longer a
+    // data ref left that storage — "Set folder…" bound it to a folder, or a folder-data-ref moved
+    // its canvas back into the folder (issue #1145) — and its file is deleted too: same id, same
+    // lineage, and a leftover with a higher rev would win `writeDataFile`'s rev rule (and its stale
+    // bytes be adopted) the day the project moved back into app data.
+    //
+    // Only once the folder holds the canvas, though: the folder leg swallows a failed write (an
+    // unmounted or read-only disk), and deleting the data file then would leave the canvas in
+    // memory only. Until this store has written or read that folder's file, the leftover stays.
+    const nextById = new Map(next.entries.map((e) => [e.id, e] as const))
+    const keep = (id: string): boolean => {
+      const n = nextById.get(id)
+      if (!n) return false
+      if (n.dataFile) return true
+      const cwd = folderFileCwd(n)
+      return !cwd || !this.lastWritten.has(projectFilePath(cwd))
+    }
     for (const e of previous.entries) {
-      if (!e.dataFile || live.has(e.id) || !isInlineProjectFileId(e.id)) continue
+      if (!e.dataFile || keep(e.id) || !isInlineProjectFileId(e.id)) continue
       const file = inlineFilePath(e.id)
       await fs.rm(file, { force: true }).catch(() => undefined)
       this.lastWritten.delete(file)
@@ -1859,7 +1903,7 @@ export class WorkspaceStore {
   }
 
   localRefPaths(): string[] {
-    return (this.index?.entries ?? []).filter((e) => e.cwd).map((e) => projectFilePath(e.cwd!))
+    return (this.index?.entries ?? []).filter((e) => folderFileCwd(e)).map((e) => projectFilePath(e.cwd!))
   }
 
   isSelfWrite(filePath: string, content: string): boolean {
@@ -1867,7 +1911,7 @@ export class WorkspaceStore {
   }
 
   async readLocalRef(projectId: string): Promise<Project | null> {
-    const e = this.index?.entries.find((x) => x.id === projectId && x.cwd)
+    const e = this.index?.entries.find((x) => x.id === projectId && folderFileCwd(x))
     if (!e?.cwd) return null
     const read = await this.readProjectFile(e.cwd, false)
     if (!read) return null
@@ -2084,7 +2128,7 @@ export class WorkspaceStore {
       let nodes: CanvasNodeState[] | undefined
       if (e.project) nodes = e.project.nodes
       else if (e.cache) nodes = e.cache.nodes
-      else if (e.cwd) {
+      else if (folderFileCwd(e) && e.cwd) {
         const raw = this.lastWritten.get(projectFilePath(e.cwd))
         if (raw) {
           try {
@@ -2099,7 +2143,7 @@ export class WorkspaceStore {
       if (node)
         return {
           node,
-          root: !e.project && !e.cache && e.cwd ? e.cwd : undefined,
+          root: !e.project && !e.cache && folderFileCwd(e) ? e.cwd : undefined,
           ...(!e.project && e.cache && e.ssh ? { ssh: e.ssh } : {})
         }
     }
@@ -2181,7 +2225,7 @@ export class WorkspaceStore {
         e.cache,
         e.cache?.nodes,
         e.cwd,
-        e.cwd ? this.lastWritten.get(projectFilePath(e.cwd)) : undefined
+        folderFileCwd(e) && e.cwd ? this.lastWritten.get(projectFilePath(e.cwd)) : undefined
       )
     }
     return out
@@ -2210,7 +2254,7 @@ export class WorkspaceStore {
       let nodes: CanvasNodeState[] | undefined
       if (e.project) nodes = e.project.nodes
       else if (e.cache) nodes = e.cache.nodes
-      else if (e.cwd) {
+      else if (folderFileCwd(e) && e.cwd) {
         try {
           nodes = this.parsedLastWritten(projectFilePath(e.cwd))?.nodes
         } catch {
@@ -2277,7 +2321,7 @@ export class WorkspaceStore {
           bridges: sanitizeLinks(e.cache.bridges),
           ropes: sanitizeLinks(e.cache.ropes)
         })
-      } else if (e.cwd) {
+      } else if (folderFileCwd(e) && e.cwd) {
         const raw = this.lastWritten.get(projectFilePath(e.cwd))
         if (!raw) continue
         try {
@@ -2363,7 +2407,7 @@ export class WorkspaceStore {
       if (e.id !== projectId) continue
       const ack = e.capabilityAck ? { capabilityAck: e.capabilityAck } : {}
       if (e.cache) return { ...readProjectCapabilities(e.cache), ...ack }
-      if (e.cwd) {
+      if (folderFileCwd(e) && e.cwd) {
         const raw = this.lastWritten.get(projectFilePath(e.cwd))
         if (!raw) return { ...ack } // file never read this run: no flag known, so nothing grants
         try {
@@ -2382,7 +2426,7 @@ export class WorkspaceStore {
       let nodes: CanvasNodeState[] | undefined
       if (e.project) nodes = e.project.nodes
       else if (e.cache) nodes = e.cache.nodes
-      else if (e.cwd) {
+      else if (folderFileCwd(e) && e.cwd) {
         const raw = this.lastWritten.get(projectFilePath(e.cwd))
         if (raw) {
           try {
@@ -2461,7 +2505,7 @@ export class WorkspaceStore {
     now: Date,
     accountColor?: string
   ): Promise<boolean> {
-    const e = this.index?.entries.find((x) => x.id === projectId && x.cwd)
+    const e = this.index?.entries.find((x) => x.id === projectId && folderFileCwd(x))
     if (!e?.cwd) return false
     const file = projectFilePath(e.cwd)
     let raw: string
@@ -2524,7 +2568,7 @@ export class WorkspaceStore {
     for (const e of this.index?.entries ?? []) {
       // Local ref projects only, like appendRemoteNode: an ssh ref's file lives on another
       // machine (and a relay `pty.attach` only ever reaches THIS machine's tmux anyway).
-      if (!e.cwd || e.ssh) continue
+      if (!folderFileCwd(e) || !e.cwd || e.ssh) continue
       const file = projectFilePath(e.cwd)
       let raw: string
       try {
@@ -2727,7 +2771,7 @@ export class WorkspaceStore {
       return { file: parsed, written: true }
     }
 
-    if (!e.cwd) return null
+    if (!folderFileCwd(e) || !e.cwd) return null
     const file = projectFilePath(e.cwd)
     let raw: string
     try {
