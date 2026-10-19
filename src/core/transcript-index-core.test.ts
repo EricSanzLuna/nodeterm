@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   extractEntryFields,
   makeSnippet,
+  queryRegExp,
   searchEntries,
   planRefresh,
   INDEX_TEXT_CAP_BYTES,
@@ -76,6 +77,51 @@ describe('searchEntries', () => {
     const hits = searchEntries(entries, 'tmux', 20, (p) => (p === '/p/s1.jsonl' ? 'work' : undefined))
     expect(hits.find((h) => h.sessionId === 's1')?.accountId).toBe('work')
     expect('accountId' in hits.find((h) => h.sessionId === 's2')!).toBe(false)
+  })
+})
+
+describe('searchEntries matching (RegExp iu, audit #5)', () => {
+  const one = (text: string, title = 'x'): TranscriptIndexEntry[] => [
+    { sessionId: 's', transcriptPath: '/p/s.jsonl', cwd: '/c', mtime: 1, title, text }
+  ]
+  const hit = (text: string, q: string): boolean => searchEntries(one(text), q).length === 1
+
+  it('folds non-ASCII case the way toLowerCase().includes did', () => {
+    expect(hit('Ein Café in München', 'CAFÉ IN MÜNCHEN')).toBe(true)
+    expect(hit('ПРИВЕТ мир', 'привет МИР')).toBe(true)
+    expect(hit('ΑΛΦΑ beta', 'αλφα')).toBe(true)
+    expect(hit('日本語のテキスト', '日本語')).toBe(true)
+    // The cases plain `i` would have LOST (toLowerCase folds them, simple-uppercase canonicalising
+    // does not) — the reason the flag is `iu`.
+    expect(hit('temperature in \u212A', 'in k')).toBe(true) // Kelvin sign
+    expect(hit('unit \u212B', 'it å')).toBe(true) // Ångström sign
+    expect(hit('GROSS\u1E9E', 'sß')).toBe(true) // capital sharp s
+    expect(hit('Deseret \u{10400}', 't \u{10428}')).toBe(true) // astral case pair
+  })
+
+  it('treats regex metacharacters in the query literally', () => {
+    expect(hit('axb', 'a.b')).toBe(false)
+    expect(hit('see a.b here', 'A.B')).toBe(true)
+    expect(hit('cost $5 (approx)', '$5 (approx)')).toBe(true)
+    expect(hit('path\\to\\file', '\\to\\')).toBe(true)
+    expect(hit('aaa', 'a*')).toBe(false)
+    // Characters that are NOT SyntaxCharacters must stay unescaped: `\-` is a SyntaxError in `u` mode.
+    for (const q of ['a-b', 'x]y', 'p}q', 'a/b', 'a\\', 'oops)', '[]', '$^', '((', '{1,2}', '?+|']) {
+      expect(() => searchEntries(one('irrelevant'), q)).not.toThrow()
+      expect(hit(`pre ${q.toUpperCase()} post`, q)).toBe(true)
+    }
+  })
+
+  it('a stateless matcher: the same query matches every entry, not every other one', () => {
+    const many = Array.from({ length: 5 }, (_, i) => ({ ...one('needle')[0], sessionId: `s${i}`, mtime: i }))
+    expect(searchEntries(many, 'needle')).toHaveLength(5)
+    const re = queryRegExp('needle')
+    expect([re.test('needle'), re.test('needle')]).toEqual([true, true])
+  })
+
+  it('centres the snippet on the same match the filter found', () => {
+    const [h] = searchEntries(one('z'.repeat(400) + ' the \u212Aelvin scale ' + 'z'.repeat(400)), 'kelvin')
+    expect(h.snippet).toContain('\u212Aelvin')
   })
 })
 

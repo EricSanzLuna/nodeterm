@@ -1364,6 +1364,8 @@ bite most often:
   `terminal/board-render-pause.ts`. Every "is the board up" check includes the Omni board
   (`isGlobalKanbanOpen()`), and the board never feeds the visibility verdict that drives
   hibernation and the WebGL budget.
+- Search big in-memory text with one escaped `RegExp(q, 'iu')` per query, never `toLowerCase()`
+  per entry (transcript index: 20-52 ms + 7-15 MB garbage → 2-13 ms + 0 MB per search).
 
 **SSH projects on Windows** run over an in-process transport (`src/core/remote-ssh/native/`),
 not the ssh binary. If you add an ssh call site, route it through `useNativeSsh()` like the
