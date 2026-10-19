@@ -3536,11 +3536,17 @@ app.whenReady().then(async () => {
   // once a minute. The send goes through `sendToMain`, which resolves the window AT SEND TIME and
   // no-ops while it is closed (macOS keeps the app alive without one) — the monitor's own
   // try/catch is the backstop, not the primary.
+  //
+  // The kernel leg (macOS only — absent elsewhere) is the one that actually fires there: the byte
+  // leg is silent on darwin and main's RSS never nears 4 GB. It runs the renderer levers ONLY, once
+  // per escalation of `kern.memorystatus_vm_pressure_level`; a kernel CRITICAL deliberately does
+  // NOT sweep the reaper yet — that is a separate, separately measured step (#211).
   createMemoryPressureMonitor({
     onPressure: (severity) => {
       sendToMain(IPC.appMemoryPressure, severity)
       if (severity === 'critical') void sessionReaper.sweep()
-    }
+    },
+    onKernelPressure: (severity) => sendToMain(IPC.appMemoryPressure, severity)
   }).start()
   // Pty-device pressure (core/pty-pressure.ts): the OTHER way this machine runs out, and the one
   // that actually happened. The memory monitor above could not see it — during the 2026-08-11

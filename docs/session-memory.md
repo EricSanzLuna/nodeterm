@@ -512,6 +512,11 @@ macOS (the ps path never runs on Linux)
     AM's 19.00 GB of parts on a 24 GB machine (was 23.9/24.0 before the fix). Still open on
     macOS: give the memory-PRESSURE monitor a real signal (`kern.memorystatus_vm_pressure_level`)
     rather than a byte watermark — the same capture showed 82% used with AM's pressure graph GREEN.
+    **Code DONE 2026-10-19** — a separate darwin kernel-level leg in `core/memory-pressure.ts`
+    (`onKernelPressure`): renderer levers on escalations into warn/critical only, never on a held
+    level, never through `hostMemReader`, no reaper sweep on kernel CRITICAL yet (#211). Owed: a
+    firing log under induced pressure on a dev build (`memory_pressure -S -l warn`), plus the GPU
+    process `footprint` / IOSurface count before and 60 s after the lever run.
     RE-VERIFIED independently 2026-08-12 (second session, shipping function imported via esbuild
     bundle, vm_stat captured on the same tick as an AM screenshot): ours 18.87 GB used vs AM's
     parts 7.23 + 2.99 + 8.66 = 18.88 GB — 0.05% off; AM's HEADLINE "Memory Used" was 19.70 GB,

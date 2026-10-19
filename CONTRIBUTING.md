@@ -1345,6 +1345,9 @@ bite most often:
 - `handleNodesChange` must not call `onNodesChange` with an empty batch (it re-renders the canvas
   every frame through React Flow's ResizeObserver).
 - Work done per terminal on a project switch must be coalesced and on-screen-first.
+- macOS memory pressure comes from the kernel's level (`onKernelPressure` in
+  `core/memory-pressure.ts`), fired on escalations only. Never re-fire it on a held level, and
+  never route it through `hostMemReader`/`MemInfo`: the session reaper shares that reader.
 
 **SSH projects on Windows** run over an in-process transport (`src/core/remote-ssh/native/`),
 not the ssh binary. If you add an ssh call site, route it through `useNativeSsh()` like the

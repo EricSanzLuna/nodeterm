@@ -6633,6 +6633,19 @@ detaching + an always-true pressure signal is why the symptom read as "my sessio
 disappearing" rather than as an occasional cull. The `vm_stat` reader is what makes the pool safe
 again; the grace window was never the thing that was wrong.
 
+**macOS memory pressure is the KERNEL's level, on its own leg, fired on escalations only.** The
+byte leg (`hostMemReader`) stays `null` on darwin and main's RSS never nears the 4 GB self leg, so
+until this leg the renderer's reclaim levers never ran on a visible Mac window — the safety net #179
+counted on was dead. `core/memory-pressure.ts` now samples `kern.memorystatus_vm_pressure_level`
+(1 normal / 2 warn / 4 critical; async `sysctl` per 30 s tick, last landed value) and calls
+`onKernelPressure` once per ESCALATION (normal→warn, →critical). Measured lever effect (dev, 12
+hidden warm terminals): GPU footprint 331 → 152 MB, IOSurface 235 → 91 MB, all 12 re-granted on
+pan-back. Three rules: never re-fire a HELD kernel level (the 60 s floor at a held WARN is #179's
+timed release and its pan-back flicker again); never feed the level through `hostMemReader` /
+`MemInfo` (`planReap` shares it — that would be a new reaper trigger); a kernel CRITICAL runs the
+levers only, no reaper sweep, until that step is measured on its own (#211). A failed read is no
+information: it neither fires nor resets the held level.
+
 ## Live links (Pro browser link to one terminal: watch, chat, or type)
 
 A live link shows ONE node in a plain browser — read-only, or typeable on a Control link by a viewer
