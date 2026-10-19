@@ -15,6 +15,7 @@ import type { CanvasNodeState, Project, Workspace } from '../shared/types'
 
 let userData: string
 let folder: string
+let fake: ReturnType<typeof fakePlatform>
 
 const node = (id: string, over: Partial<CanvasNodeState> = {}): CanvasNodeState => ({
   id, kind: 'terminal', position: { x: 0, y: 0 }, size: { width: 1, height: 1 },
@@ -44,7 +45,8 @@ const foreignFile = (nodeId: string) => JSON.stringify({
 beforeEach(async () => {
   userData = await fs.mkdtemp(path.join(os.tmpdir(), 'nt-folder-data-'))
   folder = await fs.mkdtemp(path.join(os.tmpdir(), 'nt-folder-data-repo-'))
-  initPlatform(fakePlatform({ userDataDir: userData }))
+  fake = fakePlatform({ userDataDir: userData })
+  initPlatform(fake)
 })
 afterEach(async () => {
   resetPlatformForTests()
@@ -166,6 +168,47 @@ describe('its side files', () => {
     expect(store.sideFilesFolderForProject('project-ref')).toBe(folder + '-b')
     expect(store.boardLogRootForProject('project-ref')).toBe(folder + '-b')
     await fs.rm(folder + '-b', { recursive: true, force: true })
+  })
+})
+
+describe('the phone writers', () => {
+  const changes = () => fake.sent.filter((m) => m.channel === 'workspace:external-change').map((m) => m.args[0])
+
+  it('a session registered from the phone lands in the data file, rooted in the folder', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project({ nodes: [] })]))
+    fake.sent.length = 0
+
+    expect(await store.appendRemoteNode('project-p1', { id: 'term-zz1-1', title: 'Mobile' })).toBe(true)
+    expect(await fs.readdir(folder)).toEqual([])
+    const added = (await readData('project-p1')).nodes.find((n: CanvasNodeState) => n.id === 'term-zz1-1')
+    // The append's portable '.' default is resolved: this file keeps absolute cwds.
+    expect(added.cwd).toBe(folder)
+    // The canvas hears about it with its folder and the flag, so the next save stays in app data.
+    expect(changes()).toHaveLength(1)
+    expect(changes()[0]).toMatchObject({ id: 'project-p1', cwd: folder, storeInAppData: true })
+
+    const loaded = (await new WorkspaceStore().load()).projects[0]
+    expect(ids(loaded.nodes)).toEqual(['term-zz1-1'])
+    expect(loaded.nodes[0].cwd).toBe(folder)
+  })
+
+  it('ending a session from the phone removes it from the data file', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project()]))
+    expect(await store.removeRemoteNode('term-1')).toBe(true)
+    expect((await readData('project-p1')).nodes).toEqual([])
+    expect(await fs.readdir(folder)).toEqual([])
+    expect(await store.removeRemoteNode('term-nowhere')).toBe(false)
+  })
+
+  it('the phone board lands in the data file', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project()]))
+    const columns = await store.ensureRemoteBoard('project-p1')
+    expect(columns?.length).toBeGreaterThan(0)
+    expect((await readData('project-p1')).kanban.columns).toHaveLength(columns!.length)
+    expect(await fs.readdir(folder)).toEqual([])
   })
 })
 

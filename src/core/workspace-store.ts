@@ -2558,6 +2558,11 @@ export class WorkspaceStore {
     now: Date,
     accountColor?: string
   ): Promise<boolean> {
+    const data = this.index?.entries.find((x) => x.id === projectId && isFolderDataRef(x))
+    if (data) {
+      return (await this.transformDataFile(data, (raw) => appendProjectNode(raw, input, now, accountColor)))
+        ?.written ?? false
+    }
     const e = this.index?.entries.find((x) => x.id === projectId && folderFileCwd(x))
     if (!e?.cwd) return false
     const file = projectFilePath(e.cwd)
@@ -2621,6 +2626,13 @@ export class WorkspaceStore {
     for (const e of this.index?.entries ?? []) {
       // Local ref projects only, like appendRemoteNode: an ssh ref's file lives on another
       // machine (and a relay `pty.attach` only ever reaches THIS machine's tmux anyway).
+      if (isFolderDataRef(e)) {
+        if (!e.project?.nodes.some((n) => n.id === nodeId)) continue
+        const done = await this.transformDataFile(e, (raw) => removeProjectNode(raw, nodeId, now))
+        if (done?.written) return true
+        if (!done) return false
+        continue
+      }
       if (!folderFileCwd(e) || !e.cwd || e.ssh) continue
       const file = projectFilePath(e.cwd)
       let raw: string
@@ -2824,6 +2836,7 @@ export class WorkspaceStore {
       return { file: parsed, written: true }
     }
 
+    if (isFolderDataRef(e)) return this.transformDataFile(e, transform)
     if (!folderFileCwd(e) || !e.cwd) return null
     const file = projectFilePath(e.cwd)
     let raw: string
@@ -2859,6 +2872,56 @@ export class WorkspaceStore {
     this.revs.set(e.id, parsed.rev)
     this.announceProjectFile(e, parsed)
     return { file: parsed, written: true }
+  }
+
+  /**
+   * The phone writers' leg for a FOLDER-DATA-REF (issue #1145): the same read-transform-write the
+   * folder leg does on `<cwd>/.nodeterm/project.json`, on the project's data file instead — so a
+   * session registered or ended from the phone, or a board move, lands in app data and never
+   * recreates the folder file. Three differences, each because this file is the inline kind:
+   *  - the write goes through `writeDataFile`, under its rev rule (a second instance may share it);
+   *  - node cwds are absolute here, so a portable one the transform produced (the append copies a
+   *    sibling's, or defaults to '.') is resolved against the project's folder before it lands;
+   *  - the index `project` cache is put in step, since the sync readers consult it first.
+   * Null when the entry is not this kind or the file could not be written.
+   */
+  private async transformDataFile(
+    e: IndexEntryV3,
+    transform: (raw: string) => string | null
+  ): Promise<{ file: ProjectFileV1; written: boolean } | null> {
+    if (!isFolderDataRef(e) || !e.cwd || !isInlineProjectFileId(e.id)) return null
+    const read = await this.readDataFile(e.id, false)
+    if (!read) return null
+    const updated = transform(read.raw)
+    if (updated === null) return { file: read.file, written: false }
+    let parsed: ProjectFileV1
+    try {
+      parsed = JSON.parse(updated) as ProjectFileV1
+    } catch {
+      return { file: read.file, written: false }
+    }
+    const candidate = { ...parsed, nodes: resolveNodes(parsed.nodes, e.cwd) }
+    const landed = await this.writeDataFile(e.id, candidate)
+    if (landed !== 'written' && landed !== 'unchanged') return null
+    const file = this.parsedLastWritten(inlineFilePath(e.id)) ?? candidate
+    const project = fileToProject(file, {
+      id: e.id,
+      closed: e.closed,
+      closedAt: e.closedAt,
+      handedOffTo: e.handedOffTo,
+      viewport: e.viewport,
+      defaultAccountId: e.defaultAccountId,
+      breadcrumbs: e.breadcrumbs,
+      closedSessions: e.closedSessions,
+      layoutViewports: e.layoutViewports,
+      capabilityAck: e.capabilityAck,
+      localExec: e.localExec
+    })
+    e.project = project
+    // The data file is the record and wins at load, so a cache write that fails costs nothing lasting.
+    await this.writeIndexNow().catch(() => {})
+    platform().broadcast(IPC.workspaceExternalChange, { ...project, cwd: e.cwd, storeInAppData: true })
+    return { file, written: true }
   }
 
   /** Tell the renderer about a project file THIS store just rewrote outside of `save()`. Shared by
