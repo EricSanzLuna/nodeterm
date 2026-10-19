@@ -204,6 +204,28 @@
   --nt-anim-state: paused;
 }
 
+/* React Flow's own infinite animation joins the gate here. `@xyflow/react/dist/style.css`
+   (imported at the top of this file) runs `dashdraw 0.5s linear infinite` on every `animated`
+   edge — working subagent and loop edges, and the driven-browser rope — and on an animated
+   connection line. That sheet never reads `--nt-anim-state`, so inheriting the variable did
+   nothing and both the idle gate and the covered-canvas gate missed it. MEASURED (dev build, one
+   synthetic edge with React Flow's real classes on a silent 12-terminal canvas, idle gate set,
+   3 alternating 30 s rounds): Liquid Glass 79 % of a core in the GPU process + 36 % renderer and
+   +340 MB GPU footprint; dark 31.5 % + 29 %; with this rule both fell to the no-edge baseline
+   (0.5 % GPU, 3.3 % renderer). The selectors are copied verbatim from xyflow's sheet, so the
+   specificity is identical and this wins on order alone (it comes after the @import); it sets ONLY
+   the play-state, so the shorthand, the dash and the interaction path's `animation: none` are
+   untouched. `styles.animation-gate.test.ts` scans xyflow's sheet too, and fails if an upgrade adds
+   an infinite animation under a selector not listed here.
+
+   This covers idle and covered only. A FOCUSED window still pays the full per-edge cost for as
+   long as an edge works; a cheaper working-edge style is a separate design call, and the driven
+   rope keeps flowing while focused by decision (see CLAUDE.md § Idle energy). */
+.react-flow__edge.animated path,
+.react-flow__connection .animated {
+  animation-play-state: var(--nt-anim-state);
+}
+
 /* ---- Light appearance ----------------------------------------------------------------------
    Set by App.tsx from `settings.appTheme` (see lib/appTheme.ts); absent = dark, so an install
    that never picks one is byte-for-byte unchanged.

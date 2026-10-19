@@ -9076,6 +9076,18 @@ unfocused case. The driven-browser rope still flows (it lasts only while an agen
 `styles.animation-gate.test.ts` pins the bounded shorthands, the resting values and the keyframe
 endpoints.
 
+**React Flow's `dashdraw` is gated in `styles.css`, not by xyflow.** Every `animated` edge (working
+subagent and loop edges, the driven-browser rope) and an animated connection line run xyflow's own
+`dashdraw 0.5s linear infinite`, from a vendor sheet that never reads `--nt-anim-state` — so until
+this rule it escaped BOTH the idle and the covered gate, and "the idle gate covers the unfocused
+case" above was false for edges. MEASURED (dev build, one synthetic edge with React Flow's real
+classes, idle gate set, 3 alternating 30 s rounds): Liquid Glass 79 % GPU + 36 % renderer and
++340 MB GPU footprint; dark 31.5 % + 29 %; with the play-state rule, the 0.5 % / 3.3 % no-edge
+baseline. The rule repeats xyflow's selectors verbatim (same specificity, wins on order after the
+`@import`), and `styles.animation-gate.test.ts` scans the vendor sheet for infinite animations, so an
+xyflow upgrade that adds one fails there. A FOCUSED window still pays the full per-edge cost while an
+edge works; a cheaper working-edge style is an open design call (the driven rope keeps flowing).
+
 **The viewport is never promoted — not even while the camera moves.** A `will-change: transform`
 on `.react-flow__viewport` during pan/zoom was tried (00c9c5fc, measured 41–48% → 30–36% CPU on
 12 WebGL terminals) and removed: the viewport layer spans the WHOLE canvas, and Chromium rasters it

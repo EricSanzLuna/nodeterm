@@ -1477,8 +1477,10 @@ the step is at the FIRST animation, not the twentieth. Two consequences when you
 `animation-play-state: var(--nt-anim-state);` right after the shorthand so it joins the idle-window
 gate (`src/renderer/styles.animation-gate.test.ts` fails if you forget, because one ungated
 animation takes the whole win back), and prefer a static state to a pulse wherever the pulse is not
-carrying information the user needs at a glance. The full measurement table and the reasoning are
-in CLAUDE.md § Idle energy.
+carrying information the user needs at a glance. A dependency's stylesheet counts too: React Flow's
+`dashdraw` on animated edges is gated by a rule in `styles.css` that repeats xyflow's selectors, and
+the same test scans `@xyflow/react/dist/style.css` so an upgrade that adds an infinite animation
+fails there. The full measurement table and the reasoning are in CLAUDE.md § Idle energy.
 
 ## Pull requests
 
