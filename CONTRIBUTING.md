@@ -1363,6 +1363,14 @@ on a file it has no loader for). No CI job builds the server bundle, but
 `src/server/server-build.test.ts` builds it in both views and goes red. The server runs from a
 `node_modules` tree, so an external is resolved at runtime.
 
+**Session memory's display-only figures stay display-only.** The RAM pill's swap and kernel-pressure
+tint live in `MemInfo.display`, which the reaper and the pressure monitor never read; never fill
+`swapTotalMb`/`swapFreeMb` on darwin (a healthy Mac keeps swap ~85% used, so the reaper's swap term
+would fire all day). The panel's "nodeterm itself" group takes pids/types/CPU time from
+`app.getAppMetrics()` but memory from the sweep's own table (`top` footprint on macOS) — never
+`workingSetSize`, which on macOS misses the GPU helper's IOSurfaces (≈1.6 GB footprint vs ≈120 MB
+rss). It is local-only and never part of the session total. CLAUDE.md, Session memory.
+
 ## Testing
 
 **Run the suite with a scratch `HOME`, and know what else points at your real config.** The worker

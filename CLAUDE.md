@@ -6498,6 +6498,25 @@ about which machine they describe. Reading + parsing is `core/session-memory.ts`
   re-exports it. The reaper's watermark and the pill must never disagree about how much RAM is free,
   and a second copy is exactly the drift this file warns about elsewhere. `null` = could not read,
   never zero.
+- **The pill's swap figure and kernel-pressure tint live in `MemInfo.display`, and nothing but the
+  pill reads it** (audit roadmap #14). darwin: `sysctl vm.swapusage` and
+  `kern.memorystatus_vm_pressure_level` (1/2/4 → normal/warn/critical), each a separate optional
+  read inside `darwinMemInfo`; Linux: copied from the same `/proc/meminfo` text. **Never fill
+  `swapTotalMb`/`swapFreeMb` on darwin** — `hostUnderMemoryPressure` reads them, and a Mac keeps
+  its swap ~85% used while healthy (the audited one: 7.7 of 9 GB, level flapping 1↔2), so the
+  reaper's swap term would fire all day. The level only RAISES the used-% tint, never lowers it;
+  a failed read omits its field (no "0 GB swap"). Not an input to the reaper, the pressure monitor
+  or any lever — that is a separate, measured change.
+- **"nodeterm itself" is a separate group, never a session row and never in the header total**
+  (`SessionMemoryReport.app`, audit roadmap #4). The GPU helper's footprint was 1557-1845 MB while
+  `ps` rss said 96-153 MB, and no surface attributed it. The desktop shell injects
+  `appProcesses` from `app.getAppMetrics()` for **pid, type and `cumulativeCPUUsage` only**: on
+  macOS `memory.workingSetSize` is resident size (blind to IOSurfaces, like rss) and
+  `privateBytes` is Windows-only, so memory comes from the sweep's OWN table — `top`'s footprint
+  on darwin (`ProcEntry.footprint`; a pid `top` missed is "not measured", never its rss), VmRSS on
+  Linux, working set on Windows. No second `top` (~0.5 s each). CPU is lifetime CPU TIME, not a
+  rate: `percentCPUUsage` answers 0 on its first call. Local scope only; absent = not available
+  (Server Edition, SSH, relay); `ok:false` = tried and could not, rendered as such.
 - **The local reader reads `/proc/<pid>/status`, never `statm`.** `status` carries `PPid` and `VmRSS`
   in one file, already in kB; `statm` reports RSS in **pages**, forcing a page-size assumption — a
   hard-coded 4096 under-reports **4×** on a 16 KiB-page arm64 kernel and **16×** on the 64 KiB-page

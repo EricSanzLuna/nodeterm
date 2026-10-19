@@ -3583,6 +3583,17 @@ app.whenReady().then(async () => {
     unmeasuredSessions: () => ptyManager.zellijSessionCount(),
     // Windows (no tmux): the session host's sessions; undefined where it is not the backend.
     sessionHost: () => ptyManager.sessionHostListing(),
+    // The panel's "nodeterm itself" group (audit roadmap #4): pids, types and CPU time only. Memory
+    // is NOT taken from here — on macOS `memory.workingSetSize` is resident size and misses the GPU
+    // helper's IOSurfaces (footprint 1557-1845 MB vs 96-153 MB), and `privateBytes` is Windows-only;
+    // core looks each pid up in the sweep's own footprint table instead. Called once per panel
+    // sweep, never on a timer.
+    appProcesses: () =>
+      app.getAppMetrics().map((m) => ({
+        pid: m.pid,
+        type: m.type,
+        ...(typeof m.cpu.cumulativeCPUUsage === 'number' ? { cpuSeconds: m.cpu.cumulativeCPUUsage } : {})
+      })),
     remote: {
       // Identity, not liveness: a DISCONNECTED SSH project is still someone else's machine, and
       // `connectedHosts()` alone would answer "local" for it — exactly the window the service's

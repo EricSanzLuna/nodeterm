@@ -3157,6 +3157,28 @@ export interface MemInfo {
   psiSomeAvg60?: number
   /** `/proc/pressure/memory` `full avg60` — % of the last minute EVERY task was stalled. Thrash. */
   psiFullAvg60?: number
+  /**
+   * What the RAM pill SHOWS beyond used/total. **Display only: never an input to the reaper, the
+   * memory-pressure monitor or a reclaim lever** (audit §5b invariant 1). It is a separate object,
+   * rather than more top-level fields, so that rule is structural: `hostUnderMemoryPressure` reads
+   * `swapTotalMb`/`swapFreeMb`, and filling THOSE on darwin would fire the reaper's swap term all
+   * day on a Mac that keeps its swap ~85% used as a matter of course (audit agent-trees-2/3: 16%
+   * swap free while healthy). Absent field = not measured, never zero.
+   */
+  display?: MemDisplay
+}
+
+/** See `MemInfo.display`. Every field is optional and independent: one failed read omits one fact. */
+export interface MemDisplay {
+  /** Swap in use, MB. darwin: `sysctl vm.swapusage`; Linux: `SwapTotal - SwapFree`. */
+  swapUsedMb?: number
+  /** Swap currently provisioned, MB. On darwin this GROWS on demand (dynamic swap files), so it is
+   *  a size, not a ceiling. */
+  swapTotalMb?: number
+  /** The kernel's own verdict (`kern.memorystatus_vm_pressure_level`: 1/2/4), darwin only — the
+   *  colour Activity Monitor's pressure graph shows. Linux has no equivalent level and PSI has no
+   *  measured threshold here, so it is never invented there. */
+  pressureLevel?: 'normal' | 'warn' | 'critical'
 }
 
 /** One nt- session's memory, as the panel renders it. */
@@ -3204,6 +3226,41 @@ export interface SessionMemoryReport {
    * could not be measured: never a fake zero. The tmux leg never sets it.
    */
   host?: SessionHostOverhead
+  /**
+   * nodeterm's OWN processes (main, renderer(s), GPU, helpers) — the "nodeterm itself" group.
+   * Display only, LOCAL scope only. Absent = this shell cannot enumerate its processes (Server
+   * Edition, a relay stub, every SSH scope): not available. `ok:false` = it tried and could not
+   * measure. Never part of the session total — see AppSelfMemory.
+   */
+  app?: AppSelfMemory
+}
+
+/** Which of nodeterm's own processes a group is (Electron `ProcessMetric.type`, folded). */
+export type AppProcessKind = 'main' | 'renderer' | 'gpu' | 'helper'
+
+/** One kind of nodeterm process, summed over every pid of that kind (the HUD is a 2nd renderer). */
+export interface AppSelfGroup {
+  kind: AppProcessKind
+  count: number
+  /** Summed memory in MB, in the SAME accounting as the session rows (darwin: phys_footprint from
+   *  the panel's own `top` read; Linux: VmRSS; Windows: working set). Absent when any pid of the
+   *  group was missing from the table: a partial sum would understate, which is a wrong number. */
+  mb?: number
+  /** Summed CPU time since each process started, seconds (Electron `cumulativeCPUUsage`). Absent =
+   *  not reported. A lifetime total, deliberately not a percentage. */
+  cpuSeconds?: number
+}
+
+/**
+ * The audit's roadmap #4: the GPU helper's real footprint (1557-1845 MB live, mostly IOSurfaces)
+ * was invisible because `ps` RSS says 96-153 MB and nothing attributed it. `ok:false` (no groups)
+ * when the process list or the table could not be read, or no pid of ours was in it.
+ */
+export interface AppSelfMemory {
+  ok: boolean
+  groups: AppSelfGroup[]
+  /** Sum of every group, only when every group was measured. */
+  totalMb?: number
 }
 
 /** See `SessionMemoryReport.host`. All MB figures are MEASURED working sets, not estimates. */

@@ -261,6 +261,47 @@ machine read **23.9 / 24.0 GB**.
 The test fixture remains composed from Apple's documented format; what is verified is the FORMULA
 against a real machine, not that fixture's specific numbers.
 
+### Swap and kernel pressure in the pill (display only)
+
+Added from the 2026-10-19 performance audit (roadmap #14). The pill said 86% "warn" while 8.5 GB
+were swapped and the kernel sat at pressure level 2, and nothing on screen said either.
+
+- **Where.** `MemInfo.display` — `swapUsedMb`, `swapTotalMb`, `pressureLevel`. darwin reads
+  `sysctl vm.swapusage` (`total = 9216.00M  used = 7853.62M  free = 1362.38M  (encrypted)`, parsed by
+  `parseSwapUsage`; K/M/G only) and `kern.memorystatus_vm_pressure_level` (`parsePressureLevel`:
+  1 normal, 2 warn, 4 critical, anything else omitted). Each is its own optional read in
+  `darwinMemInfo`; a failure omits that one field and leaves the `vm_stat` reading untouched. Linux
+  copies its swap from the `/proc/meminfo` text already parsed. Linux has no kernel level; PSI is
+  not mapped to one because no threshold has been measured.
+- **Why a sub-object.** `hostUnderMemoryPressure` reads `swapTotalMb`/`swapFreeMb`. Filling those on
+  darwin would turn a healthy Mac (16% swap free on the audited one) into permanent "pressure" for the
+  reaper. The pill reads only `display`; nothing else does.
+- **The tint.** `max(used-% threshold, kernel level)`: the level can raise the colour, never lower it.
+- **No fake zero.** No `display` → no swap text. A measured 0 used is stated in the title only.
+- **Owed.** Pill vs `sysctl vm.swapusage` and Activity Monitor's pressure colour over a day.
+
+### "nodeterm itself" in the panel
+
+Roadmap #4 of the same audit. The GPU helper's real footprint was 1557-1845 MB (window swap chain,
+raster tiles, terminal WebGL buffers, driver memory) while `ps` rss said 96-153 MB; the pill counted
+it in the host total, but the panel never attributed it.
+
+- **Data.** The desktop shell injects `appProcesses` (`app.getAppMetrics()` → pid, type,
+  `cumulativeCPUUsage`). Memory is looked up per pid in the sweep's own process table, so the group
+  uses the rows' accounting with no second `top`: footprint on darwin (only for pids `top` covered,
+  `ProcEntry.footprint`), VmRSS on Linux, working set on Windows. `getAppMetrics().memory` is not
+  used: on macOS `workingSetSize` is resident size and `privateBytes` is Windows-only.
+- **Groups.** Browser → main, Tab → renderer (the HUD is a second one), GPU → gpu, everything else
+  → helpers. A group with an unmeasured pid has no MB; the group total exists only when every group
+  has one.
+- **States.** Absent = this surface cannot enumerate its processes (Server Edition, SSH, relay):
+  nothing drawn. `ok:false` = it tried and could not: "Could not measure nodeterm's own processes."
+  Never in the header total, never a row, local scope only.
+- **CPU** is lifetime CPU time per group, not a percentage (`percentCPUUsage` returns 0 on its
+  first call, and the sweep takes one sample).
+- **Owed.** Panel GPU figure within 5% of `footprint <gpu pid>` and not equal to `ps rss`, on a
+  real build.
+
 ## 6. The SSH leg
 
 An SSH project's sessions live on the host, so the sweep runs there: core generates ONE POSIX `sh`
