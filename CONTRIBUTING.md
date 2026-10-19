@@ -1043,6 +1043,13 @@ happened synchronously at your `console.log`, and wrapping that call in `try/cat
 (measured on node 22). If you write to a stream that can go away, attach an `'error'` listener and
 latch the writer off — `installLogSink` (`src/core/log-sink.ts`) is the worked example. Issue #382.
 
+**A dead or hung process is logged, never acted on.** `child-process-gone`, window
+`unresponsive`/`responsive` and external WebGL context losses each write one tagged line to the
+debug log ring (`main/process-health-log.ts`, `[webgl]` in `terminal/webgl-budget.ts`) and nothing
+else. Chromium respawns its own GPU process; a reload or relaunch on top of that turns a GPU reset
+into a lost session. If you add a loss path, report it through `handle.contextLost(kind)` so the
+external counts stay apart from our own `loseWebglContexts` releases.
+
 **A retry budget must measure the thing it is waiting for, and running out must be VISIBLE.** The
 armed-launch loop (canvas-control `--after`, and the cold open a `--project` node gets) delivered its
 held command on a flat 5 × 400 ms budget started when the *canvas* held the node — so on a cold

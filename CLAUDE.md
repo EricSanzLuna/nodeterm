@@ -250,6 +250,24 @@ PTY output flows main → renderer over per-session channels (`pty:data:<session
 input flows renderer → main over `pty:write`. node-pty is kept **external** in the bundle
 (`externalizeDepsPlugin` in `electron.vite.config.ts`) because it's a native module.
 
+**Process death and hangs are telemetry, never triggers** (audit roadmap #6, tmux-2 / obs-5).
+Until then the only handler was `render-process-gone`, and it logged nothing, so a GPU-process
+crash or a renderer hang left no trace. Now app `child-process-gone` (`{type, reason, exitCode,
+name}`, per-type session count; `clean-exit` at info, every other reason at warn), the main window's
+`unresponsive` → `responsive` pair (one line per hang, duration measured from Electron's own hang
+timeout so it is a lower bound) and `render-process-gone` each write a `[process]` line to the
+debug log ring (`main/process-health-log.ts`, wired in `index.ts`). `child-process-gone` is
+registered before `ready` because the GPU process can die during boot. None of them reloads,
+relaunches or kills anything: Chromium respawns the GPU process itself, and repeated GPU deaths
+can trip its per-domain 3D-API block "until restart" (the audit's tmux-4), so provoking more of
+them degrades the session. In the renderer, `webgl-budget.ts` counts EXTERNAL WebGL losses by
+kind through `handle.contextLost(kind)` — `lost` (the addon's `onContextLoss`: still lost after
+its 3s window) and `restored` (a GPU reset the browser recovered, which `TerminalNode` rebuilds on
+a fresh addon) — and writes one `[webgl]` warn per loss carrying the session totals, which main's
+`console-message` mirror puts in the ring. Our own `loseWebglContexts` releases are counted as
+`released` and never logged per event (routine churn on every pan). A Server Edition tab has no
+main, so its `[webgl]` lines stay in the browser console.
+
 ## Key abstraction: TerminalTransport
 
 This is the load-bearing design decision. The renderer depends only on the

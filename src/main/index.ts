@@ -22,6 +22,14 @@ import { IPC } from '../shared/ipc'
 // in-memory and redacted at its push boundary; the panel/IPC side is gated on the setting.
 const logBuffer = new LogBuffer()
 installLogSink(logBuffer)
+// Process-death telemetry (audit roadmap #6, tmux-2 / obs-5): a GPU-process crash used to leave
+// no trace at all. Registered here, before 'ready', because the GPU process launches during boot
+// and can die there. LOG ONLY — Chromium respawns the GPU process itself; see process-health-log.ts.
+const childProcessGoneLine = createChildProcessGoneLog()
+app.on('child-process-gone', (_event, details) => {
+  const { level, msg } = childProcessGoneLine(details)
+  console[level](`[process] ${msg}`)
+})
 import { nativeMux, setNativeWindowsAgentOptIn, useNativeSsh } from '../core/remote-ssh/native/native-runtime'
 import { writeFilesToClipboard } from './clipboard-files'
 import { writeWindowsFileDrop } from './clipboard-files-win'
@@ -189,6 +197,7 @@ import {
 import { answerHeldPermission, isStructuredTicket, type HeldPermissionIo } from '../core/agents/permission-decision'
 import type { AnswerPermissionPayload } from '../shared/agents/permission-answer'
 import { setMainWindow, getMainWindow, sendToMain, closeAction, createCrashReloadPolicy } from './main-window'
+import { createChildProcessGoneLog, createHangTracker, formatRenderProcessGone } from './process-health-log'
 import { WINDOW_VISIBILITY_EVENTS, windowVisibilitySignal } from './window-visibility'
 import {
   MENU_ITEM_ID_CLOSE,
@@ -1389,7 +1398,21 @@ function createWindow(): BrowserWindow {
     })
   }
   const crashReload = createCrashReloadPolicy()
+  // Renderer hangs (audit roadmap #6): Electron declares one after its own input-ack timeout and
+  // clears it on the next ack. Paired into one line with a duration; logged, never acted on.
+  const hangs = createHangTracker()
+  win.on('unresponsive', () => {
+    const line = hangs.unresponsive(Date.now())
+    if (line) console[line.level](`[process] ${line.msg}`)
+  })
+  win.on('responsive', () => {
+    const line = hangs.responsive(Date.now())
+    if (line) console[line.level](`[process] ${line.msg}`)
+  })
   win.webContents.on('render-process-gone', (_event, details) => {
+    // The ring's only record that the page died — the reload below wipes the renderer's own console.
+    const gone = formatRenderProcessGone(details)
+    console[gone.level](`[process] ${gone.msg}`)
     ptyManager.dropClient(presenceId)
     // A dead renderer sends no disarm and no focus-lost report. The reloaded page mounts no
     // recorder and no terminal, so without this the user would come back to an app where ⌘W does

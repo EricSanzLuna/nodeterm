@@ -2701,7 +2701,7 @@ export function TerminalNode({
           webgl = null
           verifyCleanDomState('context-restored')
           fullRepaint()
-          webglHandle?.contextLost()
+          webglHandle?.contextLost('restored')
         })
         // A fresh addon starts from an EMPTY model; the swap's own refresh is the exact one
         // that gets swallowed when this grant races a park/pause. Repaint unconditionally.
