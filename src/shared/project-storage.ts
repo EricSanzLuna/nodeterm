@@ -28,7 +28,7 @@ export type ReleaseFolderFilesResult =
  */
 export type PrepareFolderStorageResult =
   | { ok: true }
-  | { ok: false; reason: 'not-app-data' | 'occupied' | 'unreadable' | 'settings-occupied' }
+  | { ok: false; reason: 'not-app-data' | 'occupied' | 'unreadable' | 'settings-occupied' | 'settings-unreadable' }
 
 export const PREPARE_FOLDER_STORAGE_REFUSALS: Record<Exclude<PrepareFolderStorageResult, { ok: true }>['reason'], string> = {
   'not-app-data': 'This project already stores its canvas in its folder.',
@@ -36,5 +36,6 @@ export const PREPARE_FOLDER_STORAGE_REFUSALS: Record<Exclude<PrepareFolderStorag
     'The folder already has a .nodeterm/project.json. Delete it first, or use “Open folder…” to open that canvas instead.',
   unreadable: 'The folder’s .nodeterm/project.json could not be read, so nothing was changed.',
   'settings-occupied':
-    'The folder already has a .nodeterm/settings.json. Delete it first so this project’s own settings are not lost.'
+    'The folder already has a .nodeterm/settings.json. Delete it first so this project’s own settings are not lost.',
+  'settings-unreadable': 'The folder’s .nodeterm/settings.json could not be read or written, so nothing was changed.'
 }

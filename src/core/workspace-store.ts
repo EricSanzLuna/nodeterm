@@ -1857,17 +1857,20 @@ export class WorkspaceStore {
 
     const folderSettings = await readProjectSettingsFile(cwd)
     if (folderSettings.status === 'ok') {
+      // The folder's copy is the current one: this project read its settings from there until the
+      // move. An app-data file already present is a leftover (a sweep that did not finish), so it is
+      // overwritten rather than allowed to win, with its rev continued.
       const root = appDataProjectRoot(e.id)
       const own = await readProjectSettingsFile(root)
-      let carried = own.status === 'ok'
-      if (own.status === 'absent') {
+      if (own.status === 'ok' || own.status === 'absent' || own.status === 'invalid') {
         try {
-          const written = await writeProjectSettingsFile(root, folderSettings.file, null, new Date().toISOString())
+          const written = await writeProjectSettingsFile(
+            root, folderSettings.file, own.status === 'ok' ? own.file : null, new Date().toISOString()
+          )
           this.lastSharedSettings.set(e.id, written)
-          carried = true
-        } catch { /* not carried: the folder's copy stays below */ }
+          candidates.push(projectSettingsPath(cwd))
+        } catch { /* not carried: the folder's copy stays */ }
       }
-      if (carried) candidates.push(projectSettingsPath(cwd))
     }
 
     const removed: string[] = []
@@ -1909,14 +1912,14 @@ export class WorkspaceStore {
     if (state === 'unreadable') return { ok: false, reason: 'unreadable' }
     const folderSettings = await readProjectSettingsFile(e.cwd)
     if (folderSettings.status === 'ok' || folderSettings.status === 'conflict') return { ok: false, reason: 'settings-occupied' }
-    if (folderSettings.status === 'error') return { ok: false, reason: 'unreadable' }
+    if (folderSettings.status === 'error') return { ok: false, reason: 'settings-unreadable' }
     if (isInlineProjectFileId(e.id)) {
       const own = await readProjectSettingsFile(appDataProjectRoot(e.id))
       if (own.status === 'ok') {
         try {
           await writeProjectSettingsFile(e.cwd, own.file, null, new Date().toISOString())
         } catch {
-          return { ok: false, reason: 'unreadable' }
+          return { ok: false, reason: 'settings-unreadable' }
         }
       }
     }

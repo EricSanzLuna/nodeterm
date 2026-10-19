@@ -312,6 +312,20 @@ describe('the move steps', () => {
     expect((await store.readProjectSettings('project-p1'))?.shared?.terminal?.shell).toBe('/bin/zsh')
   })
 
+  it("release: the folder's current settings win over a leftover app-data copy", async () => {
+    const store = new WorkspaceStore()
+    await seedFolder()
+    await fs.mkdir(path.dirname(settingsIn(appRoot())), { recursive: true })
+    await fs.writeFile(settingsIn(appRoot()), JSON.stringify({ version: 1, rev: 9, savedAt: '', terminal: { shell: '/bin/stale' } }))
+    await store.save(ws([project({ storeInAppData: undefined })]))
+    await store.save(ws([project()]))
+
+    expect((await store.releaseFolderFiles('project-p1', false)).ok).toBe(true)
+    const own = JSON.parse(await fs.readFile(settingsIn(appRoot()), 'utf-8'))
+    expect(own.terminal.shell).toBe('/bin/zsh')
+    expect(own.rev).toBe(10)
+  })
+
   it('release: keeps files git tracks unless told to remove them', async () => {
     execFileSync('git', ['init', '-q'], { cwd: folder })
     const store = new WorkspaceStore()
