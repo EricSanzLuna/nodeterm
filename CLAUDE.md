@@ -9284,6 +9284,12 @@ unix-socket forward and dev-server `-L` forward over it. POSIX keeps OpenSSH unt
   A killed streaming child must never write to its ended pipes (an uncaught
   `ERR_STREAM_WRITE_AFTER_END` in main). A stream nobody reads never emits `close` — tests must
   `resume()` the channels they hold.
+- **ssh2 is loaded on first use, never at module scope** (`ssh2()` in `native-mux.ts`; every other
+  shipped import of it is `import type`). native-runtime → native-mux is on main's module-scope
+  graph, which runs before Chromium's `ready`; a top-level import cost every launch 14–25 ms warm
+  (~680 ms in one cold-cache sample) on machines that never open an SSH project (audit startup-6).
+  Pinned by `native-mux.lazy.test.ts` (import does not evaluate ssh2) and
+  `src/main/lazy-deps.source.test.ts` (no shipped value import).
 - **Tests run on every OS** against ssh2's own in-process `Server` (loopback, no sshd); the
   directory is in the `windows-latest` CI job. Live numbers (macOS, `NODETERM_NATIVE_SSH=1`,
   89-terminal project): 89/89 attached, 0 ssh processes, ~1 login per connect, main CPU 3–5% idle.
@@ -10213,6 +10219,14 @@ update vX" item); on `update-downloaded` an OS notification also fires when the 
 unfocused. Exposed via `window.nodeTerminal.updates` (`UpdateApi`). macOS *silent* self-install
 requires a signed+notarized build; unsigned builds still surface the card for a manual download.
 Rules a refactor must not undo (pure + tested: `shared/update-gate.ts`, `renderer/lib/updateCardState.ts`):
+- **electron-updater is never imported at module scope** (audit startup-6: 32–47 ms warm before
+  `ready`, on every launch). `initUpdater` loads it through `UpdaterDeps.loadUpdater` (default: a
+  plain `require`) only where it is used — at init for a build with a feed, on a restart click in
+  dev, never for `no-channel` — and only AFTER the `appGetVersion` / `appGetStagedUpdate` /
+  `appRestartToUpdate` handlers are registered, which stay eager on every build (the renderer
+  invokes them on mount; an invoke with no handler rejects). Tests pass their double through
+  `loadUpdater`, because `vi.mock` does not reach a `require()`. Pinned in
+  `updater.no-channel.test.ts` and `src/main/lazy-deps.source.test.ts`.
 - **electron-updater keeps re-announcing a STAGED update** (the running binary is still old, so every
   6h check emits `update-available` → cached `update-downloaded` again, and on macOS re-stages the zip
   through Squirrel). The gate forwards and notifies **once per version**; once staged, `autoDownload`

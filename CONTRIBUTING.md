@@ -1382,6 +1382,12 @@ bite most often:
 - Dispose every Monaco model your node creates when it unmounts. The TS/JS worker (a whole
   compiler isolate) is only stopped once no TS/JS model is left (`renderer/editor/tsWorkerReaper.ts`).
 
+**`ssh2` and `electron-updater` load on first use, never at main's module scope**, which runs
+before Chromium's `ready` (together ~50–70 ms warm on every launch, audit startup-6). Use `import
+type` for their types; values come from `ssh2()` in `native-mux.ts` and `initUpdater`'s
+`loadUpdater`. `src/main/lazy-deps.source.test.ts` goes red on a value import. A `require()` is
+not reached by `vi.mock`, so a test injects its double (see the updater tests).
+
 **SSH projects on Windows** run over an in-process transport (`src/core/remote-ssh/native/`),
 not the ssh binary. If you add an ssh call site, route it through `useNativeSsh()` like the
 others, and if you add an ssh option to `control-master.ts`, teach `ssh-argv.ts` about it (the
