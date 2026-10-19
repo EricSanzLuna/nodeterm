@@ -68,6 +68,7 @@ import type {
   Settings,
   Workspace
 } from '../shared/types'
+import { STICKY_NODE_MIN_SIZE, STICKY_NODE_SIZE, resolveDefaultNodeSize } from '../shared/default-node-size'
 
 export interface ServerControlReply {
   ok: boolean
@@ -234,7 +235,6 @@ const AGENT_LIMIT = 5
 const TERMINAL_COLS = 120
 const TERMINAL_ROWS = 36
 const TERMINAL_SIZE = { width: 640, height: 440 }
-const STICKY_SIZE = { width: 240, height: 200 }
 const H_GAP = 80
 const V_GAP = 36
 const GROUP_PAD = 28
@@ -1802,11 +1802,16 @@ export class HeadlessNodeFactory {
       if ('id' in resolved) node = source.project.nodes.find((candidate) => candidate.id === resolved.id)
       else if (parsed.create) {
         created = true
+        const stickySize = resolveDefaultNodeSize(
+          this.deps.settings().defaultNodeSizes?.sticky,
+          STICKY_NODE_SIZE,
+          STICKY_NODE_MIN_SIZE
+        )
         node = {
           id: nextId('sticky'),
           kind: 'sticky',
-          position: placeRight(source.project, source.node, STICKY_SIZE),
-          size: { ...STICKY_SIZE },
+          position: placeRight(source.project, source.node, stickySize),
+          size: stickySize,
           title: oneLine(parsed.ref) || 'Note',
           color: '#ffd60a',
           group: null,

@@ -4,6 +4,7 @@ import type { IdentitySeedEntry } from './agent-identity-seed'
 import type { PrWaitHold } from './pr-wait'
 import type { SessionBackend } from './session-backend'
 import type { AgentIntegrationsSettings } from './agent-integrations'
+import type { NodeSize, SizableNodeKind } from './default-node-size'
 // Types shared across the main, preload, and renderer processes.
 
 import { TABBAR_HEIGHT_PX } from './window-chrome-metrics'
@@ -1939,6 +1940,10 @@ export interface Settings {
    *  whatever size they were saved with; other node kinds keep their own defaults. */
   defaultNodeWidth: number
   defaultNodeHeight: number
+  /** Default size (px) for NEW nodes of every other kind the add menus create, keyed by kind; a
+   *  kind with no entry opens at its built-in size. Read through `defaultNodeSize` (renderer) /
+   *  `resolveDefaultNodeSize` (@shared/default-node-size), which clamp hand edits. Machine-local. */
+  defaultNodeSizes: Partial<Record<SizableNodeKind, NodeSize>>
   /** Sessions sidebar: the DEFAULT for a project row the user never toggled — on (historical)
    *  keeps the active project expanded and collapses the others, off leaves everything expanded.
    *  Explicit toggles live in `sidebarCollapsedItems` and always win. */
@@ -2448,6 +2453,7 @@ export const DEFAULT_SETTINGS: Settings = {
   markdownFontSize: DEFAULT_MARKDOWN_FONT_SIZE,
   defaultNodeWidth: 640,
   defaultNodeHeight: 440,
+  defaultNodeSizes: {},
   sidebarAutoCollapse: true,
   sidebarCollapsedItems: {},
   sidebarGrouping: 'project',
