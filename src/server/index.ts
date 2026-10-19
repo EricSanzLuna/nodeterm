@@ -377,7 +377,7 @@ export async function startServer(
     getSettings: () => settingsStore.get(),
     onSettingsChange: (cb) => settingsStore.onChange(cb),
     downloadTickets,
-    localProjectCwd: (projectId: string) => workspaceStore.localCwdForProject(projectId)
+    localProjectCwd: (projectId: string) => workspaceStore.sideFilesFolderForProject(projectId)
   })
   // Project setup/archive runner — same construction as src/main/index.ts, and the SAME
   // `registerProjectSetupHandlers` trust boundary (project-setup-handlers.ts): it derives rootPath/
@@ -445,7 +445,7 @@ export async function startServer(
   // an SSH-ref project answers `{ entries: [], unsupported: true }` (v1: no remote board log here).
   const boardLog = registerBoardLogHandlers(platform, {
     route: (projectId: string): BoardLogRoute => {
-      const cwd = workspaceStore.localCwdForProject(projectId)
+      const cwd = workspaceStore.boardLogRootForProject(projectId)
       return cwd ? { kind: 'local', cwd } : { kind: 'unsupported' }
     }
   })

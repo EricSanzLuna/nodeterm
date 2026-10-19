@@ -142,6 +142,52 @@ describe('a folder project stored in app data', () => {
     expect(ref.storeInAppData).toBeUndefined()
     expect(ids(data.nodes)).toEqual(['term-1'])
     expect(data.storeInAppData).toBe(true)
+
+    // The folder's file belongs to the ref: an outside edit to it reaches the ref, whichever of
+    // the two entries comes first in the index.
+    const watched = new WorkspaceStore()
+    await watched.save(ws([project(), project({ id: 'project-ref', storeInAppData: undefined, nodes: [node('term-ref')] })]))
+    expect((await watched.readLocalRefByPath(folderFile()))?.id).toBe('project-ref')
+  })
+})
+
+describe('its side files', () => {
+  it('canvas images take the app-data fallback; the board log gets a userData root', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project(), project({ id: 'project-ref', storeInAppData: undefined, cwd: folder + '-b' })]))
+
+    // Terminals still run in the folder…
+    expect(store.localCwdForProject('project-p1')).toBe(folder)
+    // …but nodeterm writes nothing there.
+    expect(store.sideFilesFolderForProject('project-p1')).toBeUndefined()
+    expect(store.boardLogRootForProject('project-p1')).toBe(path.join(userData, 'project-files', 'project-p1'))
+
+    // A folder ref is unchanged: both answer its folder.
+    expect(store.sideFilesFolderForProject('project-ref')).toBe(folder + '-b')
+    expect(store.boardLogRootForProject('project-ref')).toBe(folder + '-b')
+    await fs.rm(folder + '-b', { recursive: true, force: true })
+  })
+})
+
+describe('its project settings', () => {
+  it('live in its app-data root, still as the shared document', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project()]))
+    // A settings.json committed in the folder is not this project's.
+    await fs.mkdir(path.join(folder, '.nodeterm'))
+    await fs.writeFile(path.join(folder, '.nodeterm', 'settings.json'), JSON.stringify({ version: 1, rev: 5, savedAt: '', terminal: { shell: '/bin/evil' } }))
+
+    expect((await store.readProjectSettings('project-p1'))?.shared).toBeNull()
+    expect(await store.writeProjectSettings('project-p1', { terminal: { shell: '/bin/zsh' } })).toBe(true)
+
+    const own = path.join(userData, 'project-files', 'project-p1', '.nodeterm', 'settings.json')
+    expect(JSON.parse(await fs.readFile(own, 'utf-8')).terminal.shell).toBe('/bin/zsh')
+    expect(JSON.parse(await fs.readFile(path.join(folder, '.nodeterm', 'settings.json'), 'utf-8')).terminal.shell).toBe('/bin/evil')
+    // Read back as `shared` (never folded into the machine-local overlay), so every consent rule
+    // that guards a shared value still applies.
+    const read = await new WorkspaceStore().load().then(async () => store.readProjectSettings('project-p1'))
+    expect(read?.shared?.terminal?.shell).toBe('/bin/zsh')
+    expect(read?.local).toBeUndefined()
   })
 })
 
@@ -172,6 +218,11 @@ describe('moving a folder project between the two locations', () => {
     const loaded = (await new WorkspaceStore().load()).projects[0]
     expect(loaded.storeInAppData).toBeUndefined()
     expect(loaded.nodes[0].cwd).toBe(path.join(folder, 'sub'))
+
+    // The rev continues across the move: the project's counter was not reset with the sweep.
+    const rev = file.rev
+    await store.save(ws([project({ storeInAppData: undefined, nodes: [node('term-1'), node('term-2')] })]))
+    expect(JSON.parse(await fs.readFile(folderFile(), 'utf-8')).rev).toBe(rev + 1)
   })
 
   it('to the folder: keeps the data file while the folder write cannot land', async () => {

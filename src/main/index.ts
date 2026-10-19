@@ -2118,7 +2118,7 @@ app.whenReady().then(async () => {
   // answers undefined for an SSH project (its cwd is on the host, and the image node reads
   // locally) and for a relay tab (not in this index at all) — both take the app-local fallback.
   registerFsHandlers(corePlatform, {
-    localProjectCwd: (projectId: string) => workspaceStore.localCwdForProject(projectId)
+    localProjectCwd: (projectId: string) => workspaceStore.sideFilesFolderForProject(projectId)
   })
 
   const githubSecret = new ElectronGitHubSecretStore(app.getPath('userData'), safeStorage)
@@ -2211,7 +2211,7 @@ app.whenReady().then(async () => {
         }
         return { kind: 'remote', remoteCwd: ref.remoteCwd, exec, fingerprint }
       }
-      const cwd = workspaceStore.localCwdForProject(projectId)
+      const cwd = workspaceStore.boardLogRootForProject(projectId)
       if (cwd) return { kind: 'local', cwd }
       return { kind: 'unsupported' }
     }

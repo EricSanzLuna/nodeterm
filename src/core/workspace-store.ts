@@ -102,6 +102,24 @@ const projectFilePath = (cwd: string): string => {
 /** The data file of one cwd-less ("inline") project: `userData/inline-projects/<id>.json`. Only
  *  ever called with an id `isInlineProjectFileId` has already accepted — workspace.json is
  *  hand-editable, so an id read back out of it is input and may not reach a path unchecked. */
+/** Per-project side files (the board log) of a folder project kept in app data, under userData. */
+const PROJECT_SIDE_FILES_DIR = 'project-files'
+
+/**
+ * The directory whose `.nodeterm/` holds a local project's own files — settings.json and the board
+ * log: the folder of a folder ref, the per-project app-data root of a folder-data-ref (the folder's
+ * `.nodeterm/` layout, moved under userData), and none for ssh (routed separately) or a cwd-less
+ * canvas.
+ */
+export const appDataProjectRoot = (projectId: string): string =>
+  path.join(platform().userDataDir, PROJECT_SIDE_FILES_DIR, projectId)
+
+function settingsRootFor(e: IndexEntryV3): string | undefined {
+  if (e.ssh) return undefined
+  if (isFolderDataRef(e)) return isInlineProjectFileId(e.id) ? appDataProjectRoot(e.id) : undefined
+  return folderFileCwd(e)
+}
+
 const inlineFilePath = (projectId: string): string =>
   path.join(platform().userDataDir, inlineProjectFileRelPath(projectId))
 
@@ -840,9 +858,12 @@ export class WorkspaceStore {
     if (!e) return null
     const local = this.localSettingsByProject.get(projectId)
     if (e.ssh) return this.readSshSettings(projectId, e.ssh, local)
-    // An inline canvas has no folder, so there is no shared document to have.
-    if (!folderFileCwd(e) || !e.cwd) return { shared: null, local }
-    const read = await readProjectSettingsFile(e.cwd)
+    // An inline canvas has no folder, so there is no shared document to have. A folder project
+    // kept in app data has one, in its app-data root rather than the folder (issue #1145) — read
+    // exactly like the folder's, so its values still resolve as 'shared' and keep every consent.
+    const root = settingsRootFor(e)
+    if (!root) return { shared: null, local }
+    const read = await readProjectSettingsFile(root)
     if (read.status === 'ok') {
       // The rev source for the next write — a write that skipped the read would restart at rev 1
       // and lose the counter a remote/offline comparison depends on.
@@ -1037,8 +1058,9 @@ export class WorkspaceStore {
     const e = this.index?.entries.find((x) => x.id === projectId)
     if (!e) return false
     if (e.ssh) return this.writeSshSettings(projectId, e.ssh, doc)
-    if (!folderFileCwd(e) || !e.cwd) return false
-    const read = await readProjectSettingsFile(e.cwd)
+    const root = settingsRootFor(e)
+    if (!root) return false
+    const read = await readProjectSettingsFile(root)
     // absent → nothing to lose, start at rev 1. invalid → the read already sidelined the only
     // copy to `.corrupt-<ts>`, so this write destroys nothing either.
     if (read.status === 'conflict' || read.status === 'error') return false
@@ -1049,7 +1071,7 @@ export class WorkspaceStore {
     }
     try {
       const written = await writeProjectSettingsFile(
-        e.cwd, doc, prev, new Date().toISOString()
+        root, doc, prev, new Date().toISOString()
       )
       this.lastSharedSettings.set(projectId, written)
       return true
@@ -1750,7 +1772,9 @@ export class WorkspaceStore {
       await fs.rm(file, { force: true }).catch(() => undefined)
       this.lastWritten.delete(file)
       this.lastWrittenParsed.delete(file)
-      this.revs.delete(e.id)
+      // A project that only moved its canvas keeps its rev: it continues in the new location, and
+      // resetting it would send the folder's next write out as rev 1 over the rev N just written.
+      if (!nextById.has(e.id)) this.revs.delete(e.id)
     }
   }
 
@@ -1938,7 +1962,12 @@ export class WorkspaceStore {
 
   /** Maps a watched file path back to its project and re-reads it. */
   async readLocalRefByPath(filePath: string): Promise<Project | null> {
-    const e = this.index?.entries.find((x) => x.cwd && projectFilePath(x.cwd) === filePath)
+    // `folderFileCwd`, not `cwd`: a folder-data-ref on the same folder as a folder ref must not
+    // answer for the ref's file, or the ref misses its outside edit.
+    const e = this.index?.entries.find((x) => {
+      const cwd = folderFileCwd(x)
+      return cwd !== undefined && projectFilePath(cwd) === filePath
+    })
     return e ? this.readLocalRef(e.id) : null
   }
 
@@ -2024,9 +2053,33 @@ export class WorkspaceStore {
   }
 
   /** The local folder cwd of a project by id (index lookup), or undefined for ssh/inline/unknown
-   *  projects. Sync (reads the in-memory index): the board-log router's local-vs-unsupported call. */
+   *  projects. Sync (reads the in-memory index). Where the project's terminals RUN — which is
+   *  also a relay seat's folder jail. Not where nodeterm may write its own files: see
+   *  `sideFilesFolderForProject` and `boardLogRootForProject`. */
   localCwdForProject(projectId: string): string | undefined {
     return this.index?.entries.find((e) => e.id === projectId && e.cwd)?.cwd
+  }
+
+  /**
+   * The folder whose `.nodeterm/` may hold this project's side files (canvas images), or undefined
+   * — the caller's app-data fallback. A folder-data-ref has a cwd and still answers undefined: the
+   * whole point of keeping its canvas in app data is that nothing is written into the folder
+   * (issue #1145).
+   */
+  sideFilesFolderForProject(projectId: string): string | undefined {
+    const e = this.index?.entries.find((x) => x.id === projectId)
+    return e ? folderFileCwd(e) : undefined
+  }
+
+  /**
+   * The root a project's board log lives under (`<root>/.nodeterm/board-log.jsonl`), or undefined
+   * when it has none (ssh — routed separately — and cwd-less canvases). A folder ref's is its
+   * folder, beside project.json; a folder-data-ref's is a per-project directory in userData, so the
+   * log — and the cookie trace that reads it — keeps working without touching the folder.
+   */
+  boardLogRootForProject(projectId: string): string | undefined {
+    const e = this.index?.entries.find((x) => x.id === projectId)
+    return e ? settingsRootFor(e) : undefined
   }
 
   /** Minimal per-project target info for the setup/archive runner (project-setup-runner-local.ts's
