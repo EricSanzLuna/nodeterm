@@ -1492,6 +1492,13 @@ export interface WorkspaceApi {
   /** Whether <folder>/.nodeterm/project.json is `present`, definitely `absent`, or `unreadable`
    *  (any non-ENOENT error). Never guesses absence from a failed read — see issue #385. */
   projectFileState(folder: string): Promise<'present' | 'absent' | 'unreadable'>
+  /** "Store in app data", second half (issue #1145): once the move's save has landed, carry the
+   *  folder's settings into app data and remove its `.nodeterm` files (git-tracked ones only with
+   *  `removeTracked`). See `WorkspaceStore.releaseFolderFiles`. */
+  releaseFolderFiles(projectId: string, removeTracked: boolean): Promise<import('./project-storage').ReleaseFolderFilesResult>
+  /** "Store in folder", first half (issue #1145): refuse a folder that already holds a canvas or
+   *  settings, else carry this project's settings in. See `WorkspaceStore.prepareFolderStorage`. */
+  prepareFolderStorage(projectId: string): Promise<import('./project-storage').PrepareFolderStorageResult>
   /** Fired once after an on-disk migration: `v2` = a v2→v3 migration wrote .nodeterm/ dirs into the
    *  project folders; `exec` = the custom shell / advanced ssh args of already-open projects moved
    *  out of the shared project file into this machine's own workspace index (@shared/node-exec). */

@@ -311,6 +311,9 @@ export const EDITOR_ONLY: ReadonlySet<string> = new Set<string>([
   IPC.workspaceClaimLaunch,
   IPC.workspaceProbeFolder,
   IPC.workspaceProjectFileState,
+  // Moving a project's storage (issue #1145): both write and delete files on the host.
+  IPC.workspaceReleaseFolderFiles,
+  IPC.workspacePrepareFolderStorage,
   IPC.projectSettingsRead,
   IPC.projectSettingsWriteShared,
   IPC.projectSettingsUpdateLocal,

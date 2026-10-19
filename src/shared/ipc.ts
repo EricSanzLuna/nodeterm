@@ -486,6 +486,10 @@ export const IPC = {
   /** Is a folder's .nodeterm/project.json present / absent / unreadable — the distinction
    *  `probeFolder`'s null collapses. Recovery of an `unavailable` project needs it (issue #385). */
   workspaceProjectFileState: 'workspace:project-file-state',
+  /** "Store in app data", second half (issue #1145): carry settings over, remove the folder files. */
+  workspaceReleaseFolderFiles: 'workspace:release-folder-files',
+  /** "Store in folder", first half (issue #1145): refuse an occupied folder, carry settings in. */
+  workspacePrepareFolderStorage: 'workspace:prepare-folder-storage',
   projectSettingsRead: 'project-settings:read',
   projectSettingsWriteShared: 'project-settings:write-shared',
   projectSettingsUpdateLocal: 'project-settings:update-local',

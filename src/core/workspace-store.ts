@@ -21,7 +21,9 @@ import {
   sanitizeLinks,
   type IndexEntryV3, type ProjectFileV1, type WorkspaceIndexV3
 } from './workspace-files'
-import { readProjectSettingsFile, writeProjectSettingsFile } from './project-settings-files'
+import { projectSettingsPath, readProjectSettingsFile, writeProjectSettingsFile } from './project-settings-files'
+import { gitTracksFile } from './git-tracked'
+import type { PrepareFolderStorageResult, ReleaseFolderFilesResult } from '../shared/project-storage'
 import {
   parseProjectSettingsFile, sameProjectSettingsContent, sanitizeProjectLocalSettings,
   sanitizeProjectSettingsDoc, serializeProjectSettingsFile,
@@ -450,6 +452,13 @@ export class WorkspaceStore {
     platform().handle(IPC.workspaceProbeFolder, (folder: string) => this.probeFolder(folder))
     platform().handle(IPC.workspaceProjectFileState, (cwd: unknown) =>
       typeof cwd === 'string' && cwd ? this.projectFileState(cwd) : 'unreadable')
+    // Issue #1145. Host-only for every peer (core/relay/access-policy.ts): both write files.
+    platform().handle(IPC.workspaceReleaseFolderFiles, (projectId: unknown, removeTracked: unknown) =>
+      typeof projectId === 'string'
+        ? this.releaseFolderFiles(projectId, removeTracked === true)
+        : { ok: false, reason: 'not-app-data' })
+    platform().handle(IPC.workspacePrepareFolderStorage, (projectId: unknown) =>
+      typeof projectId === 'string' ? this.prepareFolderStorage(projectId) : { ok: false, reason: 'not-app-data' })
     platform().handle(IPC.projectSettingsRead, (projectId: unknown) =>
       typeof projectId === 'string' ? this.readProjectSettings(projectId) : null)
     platform().handle(IPC.projectSettingsWriteShared, (projectId: unknown, doc: ProjectSettingsDoc) =>
@@ -1775,6 +1784,13 @@ export class WorkspaceStore {
       // A project that only moved its canvas keeps its rev: it continues in the new location, and
       // resetting it would send the folder's next write out as rev 1 over the rev N just written.
       if (!nextById.has(e.id)) this.revs.delete(e.id)
+      // A folder-data-ref that moved back into its folder: its app-data settings were carried into
+      // the folder by `prepareFolderStorage`. Removed only once the folder demonstrably has them —
+      // a move that skipped the carry must not lose the project's settings.
+      const moved = nextById.get(e.id)
+      if (moved?.cwd && isFolderDataRef(e) && (await readProjectSettingsFile(moved.cwd)).status === 'ok') {
+        await fs.rm(projectSettingsPath(appDataProjectRoot(e.id)), { force: true }).catch(() => undefined)
+      }
     }
   }
 
@@ -1811,6 +1827,102 @@ export class WorkspaceStore {
    * read is never evidence of absence — so the errno is the answer, and anything that is not a
    * definite ENOENT reports `unreadable`, the side that changes nothing. See issue #385.
    */
+  /**
+   * The second half of "Store in app data" (issue #1145), run once the move's save has landed:
+   * carry the folder's settings.json into the project's app-data root (when it has none of its
+   * own), then remove `.nodeterm/project.json` and `settings.json` from the folder, so a later
+   * "Open folder…", a worktree or an older build cannot adopt the stale copy as a second project.
+   *
+   * Refused unless the entry IS a folder-data-ref whose data file this store has written or read —
+   * the canvas must demonstrably be in app data before its folder copy goes. A file git tracks (or
+   * that could not be checked) is KEPT unless `removeTracked`: deleting it is a change in the
+   * user's repo, which the caller asks about first. A settings file that could not be carried over
+   * is kept too. Queued on `saveChain`, after any save in flight.
+   */
+  releaseFolderFiles(projectId: string, removeTracked: boolean): Promise<ReleaseFolderFilesResult> {
+    const run = this.saveChain.then(() => this.releaseFolderFilesNow(projectId, removeTracked))
+    this.saveChain = run.catch(() => {})
+    return run
+  }
+
+  private async releaseFolderFilesNow(projectId: string, removeTracked: boolean): Promise<ReleaseFolderFilesResult> {
+    const e = this.index?.entries.find((x) => x.id === projectId)
+    if (!e || !isFolderDataRef(e) || !e.cwd) return { ok: false, reason: 'not-app-data' }
+    if (!isInlineProjectFileId(e.id) || !this.lastWritten.has(inlineFilePath(e.id))) {
+      return { ok: false, reason: 'not-saved' }
+    }
+    const cwd = e.cwd
+    const candidates: string[] = []
+    if ((await this.projectFileState(cwd)) === 'present') candidates.push(projectFilePath(cwd))
+
+    const folderSettings = await readProjectSettingsFile(cwd)
+    if (folderSettings.status === 'ok') {
+      const root = appDataProjectRoot(e.id)
+      const own = await readProjectSettingsFile(root)
+      let carried = own.status === 'ok'
+      if (own.status === 'absent') {
+        try {
+          const written = await writeProjectSettingsFile(root, folderSettings.file, null, new Date().toISOString())
+          this.lastSharedSettings.set(e.id, written)
+          carried = true
+        } catch { /* not carried: the folder's copy stays below */ }
+      }
+      if (carried) candidates.push(projectSettingsPath(cwd))
+    }
+
+    const removed: string[] = []
+    const kept: string[] = []
+    for (const file of candidates) {
+      const tracked = await gitTracksFile(cwd, file)
+      if (tracked !== false && !removeTracked) {
+        kept.push(file)
+        continue
+      }
+      try {
+        await fs.rm(file, { force: true })
+        removed.push(file)
+        // Forget it as ours, or a move back with an unchanged canvas would skip the folder write as
+        // "unchanged" and the sweep would then delete the data file: the only copy.
+        this.lastWritten.delete(file)
+        this.lastWrittenParsed.delete(file)
+      } catch {
+        kept.push(file)
+      }
+    }
+    // An emptied `.nodeterm/` goes too; one still holding images or a board log stays.
+    if (removed.length) await fs.rmdir(path.join(cwd, PROJECT_DIR)).catch(() => undefined)
+    return { ok: true, removed, kept }
+  }
+
+  /**
+   * The first half of "Store in folder" (issue #1145), run before the move's save: refuse when the
+   * folder already holds a project.json (the save would overwrite that canvas — the same
+   * probe-before-bind rule as "Set folder…") or a settings.json (this project's own would be lost),
+   * and an unreadable file is never taken for an absent one. Otherwise carry the project's
+   * app-data settings into the folder, so they are there the moment the canvas is.
+   */
+  async prepareFolderStorage(projectId: string): Promise<PrepareFolderStorageResult> {
+    const e = this.index?.entries.find((x) => x.id === projectId)
+    if (!e || !isFolderDataRef(e) || !e.cwd) return { ok: false, reason: 'not-app-data' }
+    const state = await this.projectFileState(e.cwd)
+    if (state === 'present') return { ok: false, reason: 'occupied' }
+    if (state === 'unreadable') return { ok: false, reason: 'unreadable' }
+    const folderSettings = await readProjectSettingsFile(e.cwd)
+    if (folderSettings.status === 'ok' || folderSettings.status === 'conflict') return { ok: false, reason: 'settings-occupied' }
+    if (folderSettings.status === 'error') return { ok: false, reason: 'unreadable' }
+    if (isInlineProjectFileId(e.id)) {
+      const own = await readProjectSettingsFile(appDataProjectRoot(e.id))
+      if (own.status === 'ok') {
+        try {
+          await writeProjectSettingsFile(e.cwd, own.file, null, new Date().toISOString())
+        } catch {
+          return { ok: false, reason: 'unreadable' }
+        }
+      }
+    }
+    return { ok: true }
+  }
+
   async projectFileState(cwd: string): Promise<'present' | 'absent' | 'unreadable'> {
     try {
       await fs.stat(projectFilePath(cwd))

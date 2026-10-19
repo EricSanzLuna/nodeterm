@@ -6,6 +6,7 @@
 // the side a move departs from.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { promises as fs } from 'fs'
+import { execFileSync } from 'child_process'
 import os from 'os'
 import path from 'path'
 import { initPlatform, resetPlatformForTests } from './platform'
@@ -286,5 +287,93 @@ describe('moving a folder project between the two locations', () => {
     await store.save(ws([project({ storeInAppData: undefined })]))
     expect(await exists(dataFile('project-p1'))).toBe(false)
     expect(await exists(folderFile())).toBe(true)
+  })
+})
+
+describe('the move steps', () => {
+  const settingsIn = (root: string) => path.join(root, '.nodeterm', 'settings.json')
+  const appRoot = () => path.join(userData, 'project-files', 'project-p1')
+  const seedFolder = async () => {
+    await fs.mkdir(path.join(folder, '.nodeterm'), { recursive: true })
+    await fs.writeFile(settingsIn(folder), JSON.stringify({ version: 1, rev: 3, savedAt: '', terminal: { shell: '/bin/zsh' } }))
+  }
+
+  it('release: carries settings into app data and removes the folder files', async () => {
+    const store = new WorkspaceStore()
+    await seedFolder()
+    await store.save(ws([project({ storeInAppData: undefined })]))
+    expect(await exists(folderFile())).toBe(true)
+
+    await store.save(ws([project()]))
+    const res = await store.releaseFolderFiles('project-p1', false)
+    expect(res).toEqual({ ok: true, removed: [folderFile(), settingsIn(folder)], kept: [] })
+    expect(await exists(path.join(folder, '.nodeterm'))).toBe(false)
+    expect(JSON.parse(await fs.readFile(settingsIn(appRoot()), 'utf-8')).terminal.shell).toBe('/bin/zsh')
+    expect((await store.readProjectSettings('project-p1'))?.shared?.terminal?.shell).toBe('/bin/zsh')
+  })
+
+  it('release: keeps files git tracks unless told to remove them', async () => {
+    execFileSync('git', ['init', '-q'], { cwd: folder })
+    const store = new WorkspaceStore()
+    await store.save(ws([project({ storeInAppData: undefined })]))
+    execFileSync('git', ['add', '.nodeterm/project.json'], { cwd: folder })
+
+    await store.save(ws([project()]))
+    expect(await store.releaseFolderFiles('project-p1', false)).toEqual({ ok: true, removed: [], kept: [folderFile()] })
+    expect(await exists(folderFile())).toBe(true)
+    expect(await store.releaseFolderFiles('project-p1', true)).toEqual({ ok: true, removed: [folderFile()], kept: [] })
+    expect(await exists(folderFile())).toBe(false)
+  })
+
+  it('release: refused for a project whose canvas is still in its folder', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project({ storeInAppData: undefined })]))
+    expect(await store.releaseFolderFiles('project-p1', true)).toEqual({ ok: false, reason: 'not-app-data' })
+    expect(await exists(folderFile())).toBe(true)
+  })
+
+  it('a round trip with an unchanged canvas writes the folder file again before the data file goes', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project({ storeInAppData: undefined })]))
+    await store.save(ws([project()]))
+    await store.releaseFolderFiles('project-p1', false)
+    expect(await exists(folderFile())).toBe(false)
+
+    expect(await store.prepareFolderStorage('project-p1')).toEqual({ ok: true })
+    await store.save(ws([project({ storeInAppData: undefined })]))
+    expect(ids(JSON.parse(await fs.readFile(folderFile(), 'utf-8')).nodes)).toEqual(['term-1'])
+    expect(await exists(dataFile('project-p1'))).toBe(false)
+  })
+
+  it('prepare: refuses a folder that already holds a canvas or settings', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project()]))
+    await fs.mkdir(path.join(folder, '.nodeterm'))
+    await fs.writeFile(folderFile(), foreignFile('term-foreign'))
+    expect(await store.prepareFolderStorage('project-p1')).toEqual({ ok: false, reason: 'occupied' })
+
+    await fs.rm(folderFile())
+    await fs.writeFile(settingsIn(folder), JSON.stringify({ version: 1, rev: 1, savedAt: '' }))
+    expect(await store.prepareFolderStorage('project-p1')).toEqual({ ok: false, reason: 'settings-occupied' })
+  })
+
+  it('prepare + save: the settings follow the canvas into the folder, and leave app data', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project()]))
+    await store.writeProjectSettings('project-p1', { terminal: { shell: '/bin/fish' } })
+
+    expect(await store.prepareFolderStorage('project-p1')).toEqual({ ok: true })
+    expect(JSON.parse(await fs.readFile(settingsIn(folder), 'utf-8')).terminal.shell).toBe('/bin/fish')
+    await store.save(ws([project({ storeInAppData: undefined })]))
+    expect(await exists(settingsIn(appRoot()))).toBe(false)
+    expect((await store.readProjectSettings('project-p1'))?.shared?.terminal?.shell).toBe('/bin/fish')
+  })
+
+  it('a move back that skipped prepare keeps the app-data settings', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project()]))
+    await store.writeProjectSettings('project-p1', { terminal: { shell: '/bin/fish' } })
+    await store.save(ws([project({ storeInAppData: undefined })]))
+    expect(await exists(settingsIn(appRoot()))).toBe(true)
   })
 })
