@@ -14,6 +14,7 @@ import { backgroundCloseDescription, backgroundCloseRowVisible } from '@renderer
 import type { BackgroundOnCloseSetting } from '@shared/types'
 import { clampWheelZoomSpeed } from '@renderer/canvas/wheel-zoom'
 import { DEFAULT_WORKTREE_PATH_TEMPLATE } from '@shared/worktree'
+import type { NewProjectStorage } from '@shared/project-storage'
 
 const ROWS = {
   defaultView: {
@@ -71,6 +72,10 @@ const ROWS = {
   sidebarGrouping: {
     title: 'Sidebar: group by',
     keywords: ['sidebar', 'sessions', 'group', 'status', 'project', 'attention']
+  },
+  projectStorage: {
+    title: 'New folder projects store their canvas',
+    keywords: ['project', 'storage', 'app data', 'nodeterm', 'folder', 'repo', 'project.json', 'git', 'client']
   },
   worktreePath: {
     title: 'Worktree path template',
@@ -368,6 +373,22 @@ export function BehaviorSection({ isActive }: { isActive: boolean }): React.JSX.
               ]}
               onChange={(v) => update({ sidebarGrouping: v })}
             />
+          }
+        />
+      </SearchableRow>
+      <SearchableRow {...ROWS.projectStorage}>
+        <FieldRow
+          label="New folder projects store their canvas"
+          description="In the folder writes .nodeterm/project.json there, to share through git. In app data writes nothing into the folder. A folder that already has a project.json opens as it is. Move an existing project from its tab menu."
+          control={
+            <Select
+              aria-label="New folder projects store their canvas"
+              value={settings.newProjectStorage}
+              onChange={(e) => update({ newProjectStorage: e.target.value as NewProjectStorage })}
+            >
+              <option value="folder">In the folder</option>
+              <option value="appData">In app data</option>
+            </Select>
           }
         />
       </SearchableRow>

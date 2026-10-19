@@ -313,6 +313,29 @@ Persistence has two layers:
   | folder-ref | `<cwd>/.nodeterm/project.json` (git-shared) | `cwd` + header + machine-local half |
   | ssh-ref | the same file on the host | `ssh` + header + `cache` (offline copy, rev-reconciled) |
   | local-data-ref | `userData/inline-projects/<id>.json` | `dataFile` + header + `project` (cache) |
+  | folder-data-ref | `userData/inline-projects/<id>.json` | `cwd` + `dataFile` + header + `project` (cache, stored WITHOUT `cwd`) |
+
+  **The folder-data-ref (issue #1145)** is a folder project whose canvas is kept in app data
+  (`Project.storeInAppData`) so that nothing is written into the folder — for client repos and
+  folders the user does not own. It is a local-data ref with a working directory: the file and the
+  cache hold the project without `cwd` (node cwds stay absolute), so the inline load and write paths
+  serve it unchanged and the entry adds the folder back. Three rules keep the promise:
+  `folderFileCwd(e)`, not `e.cwd`, decides every read or write of `<cwd>/.nodeterm/project.json`
+  (watcher, content authority, the phone writers, settings); a missing data file falls back to the
+  cache and then to a grey placeholder, **never** to the folder branch (that would adopt a stale or
+  a teammate's canvas); and the cache's missing `cwd` is the downgrade contract — an older build
+  opens it as a plain inline canvas instead of writing a fresh file into the folder. Its side files
+  follow it: settings.json and the board log under `userData/project-files/<id>/.nodeterm/`
+  (`appDataProjectRoot`; settings still load as `'shared'`), canvas images to the existing
+  `userData/canvas-images` fallback (`sideFilesFolderForProject`). `localCwdForProject` still answers
+  the folder, because it means where terminals run and what a relay seat is jailed to. Moving
+  between the two is the tab menu's "Store canvas in app data / in folder"
+  (`lib/projectStorageMove.ts`): into app data = save, then `releaseFolderFiles` (refused until the
+  data file holds the canvas; files git tracks are kept unless the user confirms); into the folder =
+  `prepareFolderStorage` (refuses an occupied folder, like "Set folder…"), then save; the sweep
+  deletes the departed side's copy only once the folder file has landed, and keeps the rev. New
+  folder projects follow `settings.newProjectStorage`; a folder that already has a project.json is
+  adopted as it is, in its folder.
 
   In all three the file carries CONTENT and the entry carries the machine-local half — project
   `id`, `viewport`, `defaultAccountId`, `breadcrumbs`, `closedSessions`, `localApprovalId`,

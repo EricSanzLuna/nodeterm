@@ -240,6 +240,7 @@ import {
   type AddHandlers
 } from '../lib/addMenuSpec'
 import { planSetProjectFolder } from '../lib/setProjectFolder'
+import { moveProjectToAppData, moveProjectToFolder, type ProjectStorageMoveDeps } from '../lib/projectStorageMove'
 import { effectiveAccountId, observationIsRemote, type ObservationOrigin } from '../lib/accountChip'
 import { reopenVariants } from '../lib/reopenVariants'
 import { modelsForAgent, type GatewayModel } from '@shared/agents/model-gateway'
@@ -4142,7 +4143,7 @@ export function Canvas() {
   useEffect(() => {
     return api.workspace.onCorruptRecovered((backupFile) => {
       setMigrationNote(
-        `The workspace index was corrupted and has been backed up as ${backupFile} (in the app's data folder). Projects with a folder are safe — their canvas is in <folder>/.nodeterm/project.json, so “Open folder…” adds them back. A project with no folder lived only in the index: keep that backup, it is the only copy of its canvas.`
+        `The workspace index was corrupted and has been backed up as ${backupFile} (in the app's data folder). Projects stored in their folder are safe — their canvas is in <folder>/.nodeterm/project.json, so “Open folder…” adds them back. A project with no folder, or one stored in app data, has no copy in any folder: keep that backup.`
       )
     })
   }, [])
@@ -17610,6 +17611,32 @@ export function Canvas() {
     [persist, switchProject, reopenProject]
   )
 
+  // Issue #1145: move a folder project's canvas between its folder and app data. The ordering and
+  // the refusals live in lib/projectStorageMove.ts; this only hands it the levers.
+  const projectStorageMoveDeps = useMemo(
+    (): ProjectStorageMoveDeps => ({
+      setStoreInAppData: (id, on) => useProjects.getState().setProjectStoreInAppData(id, on),
+      persist: async () => (await persist()) === true,
+      release: (id, removeTracked) => api.workspace.releaseFolderFiles(id, removeTracked),
+      prepare: (id) => api.workspace.prepareFolderStorage(id),
+      confirm: (message, confirmLabel) =>
+        new Promise<boolean>((resolve) =>
+          setConfirm({
+            message,
+            confirmLabel,
+            danger: true,
+            onConfirm: () => {
+              setConfirm(null)
+              resolve(true)
+            },
+            onCancel: () => resolve(false)
+          })
+        ),
+      notice: (kind, text) => setNotice({ kind, text })
+    }),
+    [persist, setConfirm]
+  )
+
   const setProjectDefaultAccount = useCallback(
     (id: string, accountId: string | undefined) => {
       useProjects.getState().setProjectDefaultAccount(id, accountId)
@@ -17834,6 +17861,23 @@ export function Canvas() {
             }
           },
           { label: 'Set folder…', icon: <IconProject />, onClick: () => setProjectFolder(projectId) },
+          // Issue #1145: a local folder project only — an ssh project's file is on its host, and a
+          // relay tab is another machine's project.
+          ...(project.cwd && !project.ssh && !project.remote && !project.unavailable
+            ? [
+                project.storeInAppData
+                  ? {
+                      label: 'Store canvas in folder',
+                      icon: <IconProject />,
+                      onClick: () => void moveProjectToFolder(projectId, projectStorageMoveDeps)
+                    }
+                  : {
+                      label: 'Store canvas in app data',
+                      icon: <IconProject />,
+                      onClick: () => void moveProjectToAppData(projectId, projectStorageMoveDeps)
+                    }
+              ]
+            : []),
           {
             label: 'Project settings…',
             icon: <IconGear />,
@@ -17872,6 +17916,7 @@ export function Canvas() {
       switchProject,
       renameProject,
       setProjectFolder,
+      projectStorageMoveDeps,
       setProjectColor,
       closeProject,
       openProjectSettings,

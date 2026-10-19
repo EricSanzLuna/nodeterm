@@ -1982,6 +1982,11 @@ export interface Settings {
    *  (`$reponame` and `$defaultFolderName` aliases) plus `$branch`; both `$x` and `${x}` forms.
    *  A missing branch token is appended automatically. */
   worktreePathTemplate: string
+  /** Issue #1145. Where a folder project created from now on keeps its canvas: `'folder'` (the
+   *  default — `<cwd>/.nodeterm/project.json`, git-shareable) or `'appData'` (nothing written into
+   *  the folder; see `Project.storeInAppData`). A folder that already has a project.json is adopted
+   *  as it is, in its folder, whatever this says. Existing projects move from the tab menu. */
+  newProjectStorage: import('./project-storage').NewProjectStorage
   /** ms to dwell over a terminal before it takes pointer focus (pan-across guard). */
   panHoverDelay: number
   /** Issue #757. Whether a terminal node's keyboard focus follows the POINTER (the long-standing
@@ -2469,6 +2474,7 @@ export const DEFAULT_SETTINGS: Settings = {
   omniKanbanEnabled: false,
   omniKanbanAsDefault: false,
   worktreePathTemplate: DEFAULT_WORKTREE_PATH_TEMPLATE,
+  newProjectStorage: 'folder',
   panHoverDelay: 600,
   terminalFocusFollowsPointer: true,
   doubleClickFocus: true,
