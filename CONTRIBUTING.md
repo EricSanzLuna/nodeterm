@@ -629,6 +629,12 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   SSH node became a local shell in this machine's `$HOME`. CLAUDE.md, "A remote node is NEVER
   spawned locally".
 
+- **Relay backpressure is undone by a drain sweep, never by the next chunk of output.** A paused
+  pty produces no next chunk, so a resume that waits for one never comes: that froze the phone's
+  terminal for good after a single >8 MB burst. `host-service.ts` arms a 250 ms sweep while a stream
+  is paused, then repaints with a snapshot before it resumes; `core/ui-sink-registry.ts` does the same
+  for every other sink. A new paused path needs the same trigger. CLAUDE.md, "Remote access".
+
 - **An SSH project's node runs on the project's host — ask the project, not the node.** Node
   fields like `sshRemoteTmux` arrive through a shared `project.json` that the host's own desktop and
   teammates also write, so a node without them must still never become a local shell (issue #1186).

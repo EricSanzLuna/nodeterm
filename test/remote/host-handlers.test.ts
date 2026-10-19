@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest'
+import { afterEach, describe, it, expect, vi } from 'vitest'
 import {
   createHostHandlers,
   type HostPtyManager,
@@ -77,14 +77,17 @@ function fakePty() {
 function fakeSocket(sendOk = true) {
   const responses: { id: string; ok: boolean; body: unknown }[] = []
   const frames: { op: number; streamId: number; seq: number; payload: Uint8Array }[] = []
+  // `ok` / `buffered` are mutable so a test can stall the socket and then let it drain.
+  const state = { ok: sendOk, buffered: 0 }
   const socket: HostRelaySocket = {
     respond: (id, ok, body) => responses.push({ id, ok, body }),
     sendFrame: (op, streamId, seq, payload) => {
       frames.push({ op, streamId, seq, payload })
-      return sendOk
-    }
+      return state.ok
+    },
+    bufferedAmount: () => state.buffered
   }
-  return { socket, responses, frames }
+  return { socket, responses, frames, state }
 }
 
 const resizePayload = (cols: number, rows: number) => {
@@ -253,19 +256,124 @@ describe('createHostHandlers', () => {
     expect(pty.calls).toHaveLength(0)
   })
 
-  it('pauses the PTY on backpressure and resumes on the next successful send', async () => {
-    const pty = fakePty()
-    const sock = fakeSocket(false) // sendFrame returns false → backpressure
-    const h = createHostHandlers(pty.mgr, sock.socket)
-    await openViaAttach(h)
+  // Audit net-1 (REPORT §4.7): a paused node-pty emits NO further onData, so a resume that waits for
+  // "the next successful send" never comes and the phone's terminal froze for good after one >8 MB
+  // burst. These tests deliver nothing after the pause — the drain sweep alone must resume it.
+  describe('relay backpressure: the drain sweep resumes a paused stream', () => {
+    afterEach(() => {
+      vi.useRealTimers()
+    })
 
-    pty.sinks().onData('a') // send fails → pause
-    expect(pty.calls).toContainEqual({ method: 'setFlow', args: [null, 'pty-1', false] })
+    const resumes = (pty: ReturnType<typeof fakePty>) =>
+      pty.calls.filter((c) => c.method === 'setFlow' && c.args[2] === true)
 
-    // Flip the socket to succeed, then deliver more output → resume.
-    sock.socket.sendFrame = vi.fn(() => true)
-    pty.sinks().onData('b')
-    expect(pty.calls).toContainEqual({ method: 'setFlow', args: [null, 'pty-1', true] })
+    async function pausedStream(screen = 'SCREEN') {
+      const pty = fakePty()
+      pty.setSnapshot(screen)
+      const sock = fakeSocket()
+      const h = createHostHandlers(pty.mgr, sock.socket)
+      await openViaAttach(h)
+      vi.useFakeTimers()
+      sock.state.ok = false // the relay buffer is over 8 MB: sendFrame refuses (and drops)
+      sock.state.buffered = 9_000_000
+      pty.sinks().onData('a')
+      expect(pty.calls).toContainEqual({ method: 'setFlow', args: [null, 'pty-1', false] })
+      return { pty, sock, h }
+    }
+
+    it('resumes once drained, with no further pty output, and repaints BEFORE resuming', async () => {
+      const { pty, sock } = await pausedStream()
+      const order: string[] = []
+      sock.socket.sendFrame = (op) => {
+        order.push(`frame:${op}`)
+        return true
+      }
+      const realSetFlow = pty.mgr.setFlow
+      pty.mgr.setFlow = (...args) => {
+        order.push(`setFlow:${String(args[2])}`)
+        realSetFlow(...args)
+      }
+      sock.state.ok = true
+      sock.state.buffered = 0 // drained — and the paused pty delivers NOTHING
+
+      await vi.advanceTimersByTimeAsync(300)
+
+      expect(resumes(pty)).toEqual([{ method: 'setFlow', args: [null, 'pty-1', true] }])
+      // A fresh screen (the frame that crossed the line was dropped), and only then live output.
+      expect(order).toEqual([
+        `frame:${OP.SnapshotStart}`,
+        `frame:${OP.SnapshotChunk}`,
+        `frame:${OP.SnapshotEnd}`,
+        'setFlow:true'
+      ])
+      expect(vi.getTimerCount()).toBe(0) // the sweep disarms once nothing is paused
+    })
+
+    it('stays paused while the socket is above the low-water mark', async () => {
+      const { pty, sock } = await pausedStream()
+      sock.state.ok = true
+      sock.state.buffered = 1_000_000 // draining, but not below 256 KB yet
+
+      await vi.advanceTimersByTimeAsync(2_000)
+      expect(resumes(pty)).toEqual([])
+
+      sock.state.buffered = 100_000
+      await vi.advanceTimersByTimeAsync(300)
+      expect(resumes(pty)).toHaveLength(1)
+    })
+
+    it('drops output still queued after the pause instead of streaming a desynced screen', async () => {
+      const { pty, sock } = await pausedStream()
+      const outputs = () => sock.frames.filter((f) => f.op === OP.Output).length
+      const before = outputs()
+      pty.sinks().onData('late batch') // the one queueData batch already in flight
+      expect(outputs()).toBe(before)
+    })
+
+    it('an empty capture still resumes (no repaint) rather than staying frozen', async () => {
+      const { pty, sock } = await pausedStream('')
+      sock.state.ok = true
+      sock.state.buffered = 0
+      const framesBefore = sock.frames.length
+
+      await vi.advanceTimersByTimeAsync(300)
+
+      expect(resumes(pty)).toHaveLength(1)
+      expect(sock.frames.slice(framesBefore).some((f) => f.op === OP.SnapshotStart)).toBe(false)
+    })
+
+    it('a snapshot the socket refuses keeps the stream paused and retries with backoff', async () => {
+      const { pty, sock } = await pausedStream()
+      const captures = () => pty.calls.filter((c) => c.method === 'captureSnapshot').length
+      const capturesAtPause = captures()
+      // Reports drained, but every send fails — what a relay between transports looks like
+      // (bufferedAmount 0, state not ready). Must not become a capture per tick.
+      sock.state.buffered = 0
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(resumes(pty)).toEqual([])
+      // 250 ms ticks for 5 s would be 20 captures; the backoff (250, 500, 1 s, 2 s …) allows ~5.
+      expect(captures() - capturesAtPause).toBeLessThanOrEqual(6)
+
+      sock.state.ok = true
+      await vi.advanceTimersByTimeAsync(10_500)
+      expect(resumes(pty)).toHaveLength(1)
+    })
+
+    it('closeAll while paused disarms the sweep and never resumes the released pty', async () => {
+      const { pty, sock, h } = await pausedStream()
+      h.closeAll()
+      expect(vi.getTimerCount()).toBe(0)
+      sock.state.ok = true
+      sock.state.buffered = 0
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(resumes(pty)).toEqual([])
+    })
+
+    it('pty.kill while paused disarms the sweep', async () => {
+      const { h } = await pausedStream()
+      h.onRpc({ id: 'k', method: 'pty.kill', params: { streamId: 1 } })
+      expect(vi.getTimerCount()).toBe(0)
+    })
   })
 
   it('rejects unknown RPC methods', () => {

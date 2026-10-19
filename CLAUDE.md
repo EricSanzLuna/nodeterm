@@ -9359,6 +9359,20 @@ unix-socket forward and dev-server `-L` forward over it. POSIX keeps OpenSSH unt
   `POST /v1/relay/host-token` / `/v1/relay/device` must admit deviceId (no-entitlement) mints, and
   the relay server may rate-limit free hosts independently — a client-side gate must NOT be
   reintroduced to work around a backend refusal (fix the backend policy instead).
+- **A paused phone stream is resumed by a drain sweep, never by "the next chunk"**
+  (`main/remote/host-service.ts`, FLOW_SWEEP_MS). `sendFrame` refuses — and drops — a frame once the
+  relay socket holds >8 MB, and the host pauses the pty; a paused node-pty emits no `onData`, so the
+  old resume-on-next-successful-send never fired and the phone's terminal froze until it detached
+  (audit net-1). A 250 ms sweep, armed only while a stream is paused and cleared in
+  `dropStream`/`closeAll`, waits for `bufferedAmount() <= 256 KB`, then capture → `OP.Snapshot*` →
+  `setFlow(resume)`, in that order (the dropped frame desynced the phone; resuming first lets live
+  output race the repaint). A refused repaint retries with backoff (250 ms doubling to 10 s: a
+  reconnecting relay reads 0 buffered but refuses every send, so no backoff = a tmux capture per
+  tick). Output still queued after the pause is dropped, not streamed. An empty
+  capture resumes WITHOUT a repaint — unlike `ui-sink-registry`'s keep-desynced rule, staying here
+  means staying frozen. Same design as `core/ui-sink-registry.ts`; do not reintroduce a chunk-driven
+  resume. `~/.nodeterm/relay.json` is written only when its content changes or the file is missing
+  (`relay-advertise.ts`): the ~90 s listener cycle used to rewrite it identically (~960/day, net-5).
 - **The phone's Chat screen verbs** (`chat.page` / `chat.status` / `chat.send` / `agent.answer`,
   `host-service.ts` `handleChat` → `main/remote/host-chat.ts`, spec + exact error strings in
   `docs/mobile-chat-view.md` §3.2). Four rules a refactor must not undo: (1) **the phone sends only a
