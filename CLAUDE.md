@@ -603,6 +603,18 @@ interferes; status bar off, **mouse on**, 50k history, `set-clipboard on` + `ter
 sessions survive when no client is attached. `src/shared/ssh.ts`'s `remoteTmuxConf` is the same
 config for an SSH project's remote tmux.
 
+**Every synchronous tmux call on main is bounded (`TMUX_BOOT_CMD_TIMEOUT_MS`, 2 s, via
+`PtyManager.runTmuxSync`).** `ensureTmux`'s `source-file` runs before the first window exists, and
+`ensureUpdateEnvKeys`' `show-options` / `set-option` run on a spawn; unbounded, a server that accepts
+the connection and never answers held main for the wedge's whole lifetime (audit main-5: 4.05 s in
+the repro, i.e. forever against a server that never recovers). The bound kills only our short-lived
+client (SIGKILL, so one that ignores SIGTERM cannot keep `execFileSync` waiting), never the server.
+A timeout is `console.warn`ed and fails open (tmux stays resolved; the spawn goes ahead); "no server
+yet" stays silent, as it always was. A timeout also ends the rest of that call's tmux work — the
+next `set-option` would only wait out the same wedge. Proven against a real client in
+`pty-tmux-wedged.realtmux.test.ts`. A new sync tmux call goes through `runTmuxSync`, not a bare
+`execFileSync`.
+
 **Every REMOTE tmux invocation starts with `remoteTmuxPathPrologue()`** (`shared/ssh.ts` — PATH
 **append**: `/opt/homebrew/bin`, `/usr/local/bin`, `/opt/local/bin`, `$HOME/.local/bin`): an ssh
 exec channel gets a non-login shell, and on a macOS host Homebrew's `shellenv` lives in

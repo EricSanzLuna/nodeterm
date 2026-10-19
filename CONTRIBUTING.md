@@ -963,6 +963,11 @@ shipped: managed-account `CLAUDE_CONFIG_DIR` leaked into system-account sessions
 env either joins `ACCOUNT_SCOPE_UPDATE_ENV` / the gateway list, or rides `-e` — and gets a
 real-tmux test (`account-env.realtmux.test.ts` is the pattern).
 
+**A synchronous tmux call on main always has a timeout.** Use `PtyManager.runTmuxSync` (2 s,
+`TMUX_BOOT_CMD_TIMEOUT_MS`), never a bare `execFileSync` on the tmux socket: one runs before the
+first window exists, and a wedged server held an unbounded call for as long as it stayed wedged
+(4.05 s in the audit repro, main-5). Warn on a timeout and fail open; keep "no server yet" silent.
+
 **The same goes for the CWD: a tmux client never runs in the node's directory.** The server keeps
 the cwd of the client that started it, and from tmux 3.7 a new pane's `-c` is silently dropped once
 that directory is deleted — every new terminal then opens in the deleted dir (issue #1131, measured
