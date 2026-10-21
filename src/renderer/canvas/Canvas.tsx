@@ -197,6 +197,7 @@ import {
   BugReportDialog,
   PhonePairPopover,
   MobileLaunchCard,
+  LogPanel,
   KanbanView
 } from '../components/lazyPanels'
 import { WelcomeScreen } from '../components/WelcomeScreen'
@@ -19992,6 +19993,7 @@ export function Canvas() {
           }}
         />
       )}
+      {logPanelOpen && <LogPanel onClose={() => setLogPanelOpen(false)} />}
       {mobileLaunchOpen && (
         <MobileLaunchCard
           onClose={() => {
