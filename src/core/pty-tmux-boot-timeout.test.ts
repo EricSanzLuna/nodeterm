@@ -11,8 +11,9 @@ import { fakePlatform } from './platform-fake'
  * `execFileSync` with no timeout, so a tmux server that accepts the connection and never answers
  * held main for as long as it stayed wedged (4.05 s in the audit's repro — the listener's whole
  * lifetime). These pin the contract with an injected `execFileSync`: every call carries the bound,
- * a timeout is WARNED and fails open, and the ordinary "no server yet" failure stays as silent as
- * it always was. The real-tmux proof is `pty-tmux-wedged.realtmux.test.ts`.
+ * a timeout is WARNED and fails open and starts a cooldown with no further spawn-path probe, and
+ * the ordinary "no server yet" failure stays as silent as it always was. The real-tmux proof is
+ * `pty-tmux-wedged.realtmux.test.ts`.
  */
 
 type ExecCall = { args: string[]; opts: { timeout?: number; killSignal?: string } }
@@ -108,8 +109,9 @@ describe('boot-path tmux calls under a wedged server', () => {
     expect(warn).not.toHaveBeenCalled()
   })
 
-  it('a show-options timeout skips every set-option and re-probes on the next spawn', async () => {
-    const { ensureUpdateEnvKeys } = await boot()
+  it('a show-options timeout skips every set-option, then no spawn probes until the cooldown ends', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    const { ensureUpdateEnvKeys, TMUX_UPDATE_ENV_COOLDOWN_MS } = await bootWithCooldown()
     execState.reply.set('show-options', TIMED_OUT)
     ensureUpdateEnvKeys(['KEY_A', 'KEY_B', 'KEY_C'])
     // One stall, not 1 + 3: the set-options would only wait out the same wedge.
@@ -117,15 +119,28 @@ describe('boot-path tmux calls under a wedged server', () => {
     expect(callsFor('set-option')).toHaveLength(0)
     expect(warn).toHaveBeenCalledTimes(1)
 
-    // The server recovers: the cache was left unset, so the next spawn probes it properly.
+    // Every spawn passes the account-scope names, so a re-probe per spawn would stall main up to
+    // 2 s per terminal on a slow server. Inside the cooldown no sync tmux call runs at all.
+    for (let i = 0; i < 20; i++) {
+      vi.advanceTimersByTime(TMUX_UPDATE_ENV_COOLDOWN_MS / 25)
+      ensureUpdateEnvKeys(['KEY_A', 'KEY_B'])
+    }
+    expect(callsFor('show-options')).toHaveLength(1)
+    expect(callsFor('set-option')).toHaveLength(0)
+
+    // The server recovers and the cooldown ends: the cache was left unset, so the next spawn
+    // probes it properly.
+    vi.advanceTimersByTime(TMUX_UPDATE_ENV_COOLDOWN_MS)
     execState.reply.set('show-options', 'update-environment[0] KEY_A\n')
     ensureUpdateEnvKeys(['KEY_A', 'KEY_B'])
     expect(callsFor('show-options')).toHaveLength(2)
     expect(callsFor('set-option').map((c) => c.args[5])).toEqual(['KEY_B'])
+    vi.useRealTimers()
   })
 
-  it('a set-option timeout stops the loop after the first name', async () => {
-    const { ensureUpdateEnvKeys } = await boot()
+  it('a set-option timeout stops the loop after the first name and starts the same cooldown', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    const { ensureUpdateEnvKeys, TMUX_UPDATE_ENV_COOLDOWN_MS } = await bootWithCooldown()
     execState.reply.set('set-option', TIMED_OUT)
     ensureUpdateEnvKeys(['KEY_A', 'KEY_B', 'KEY_C'])
     expect(callsFor('set-option')).toHaveLength(1)
@@ -134,5 +149,21 @@ describe('boot-path tmux calls under a wedged server', () => {
       expect(c.opts.killSignal).toBe('SIGKILL')
     }
     expect(warn).toHaveBeenCalledTimes(1)
+
+    vi.advanceTimersByTime(TMUX_UPDATE_ENV_COOLDOWN_MS - 1)
+    ensureUpdateEnvKeys(['KEY_A', 'KEY_B', 'KEY_C'])
+    expect(callsFor('set-option')).toHaveLength(1)
+
+    vi.advanceTimersByTime(1)
+    execState.reply.delete('set-option')
+    ensureUpdateEnvKeys(['KEY_A', 'KEY_B', 'KEY_C'])
+    expect(callsFor('set-option').map((c) => c.args[5])).toEqual(['KEY_A', 'KEY_A', 'KEY_B', 'KEY_C'])
+    vi.useRealTimers()
   })
 })
+
+async function bootWithCooldown() {
+  const booted = await boot()
+  const { TMUX_UPDATE_ENV_COOLDOWN_MS } = await import('./pty-manager')
+  return { ...booted, TMUX_UPDATE_ENV_COOLDOWN_MS }
+}

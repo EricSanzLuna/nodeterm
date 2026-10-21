@@ -629,7 +629,10 @@ the repro, i.e. forever against a server that never recovers). The bound kills o
 client (SIGKILL, so one that ignores SIGTERM cannot keep `execFileSync` waiting), never the server.
 A timeout is `console.warn`ed and fails open (tmux stays resolved; the spawn goes ahead); "no server
 yet" stays silent, as it always was. A timeout also ends the rest of that call's tmux work — the
-next `set-option` would only wait out the same wedge. Proven against a real client in
+next `set-option` would only wait out the same wedge — and a `show-options` / `set-option` timeout
+starts `TMUX_UPDATE_ENV_COOLDOWN_MS` (60 s) in which `ensureUpdateEnvKeys` makes no tmux call at
+all: every spawn passes the account-scope names, so without it each later spawn on a slow server
+would stall main again (20 terminals ≈ 40 s). After it, the next spawn probes again. Proven against a real client in
 `pty-tmux-wedged.realtmux.test.ts`. A new sync tmux call goes through `runTmuxSync`, not a bare
 `execFileSync`.
 

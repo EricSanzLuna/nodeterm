@@ -973,6 +973,8 @@ real-tmux test (`account-env.realtmux.test.ts` is the pattern).
 `TMUX_BOOT_CMD_TIMEOUT_MS`), never a bare `execFileSync` on the tmux socket: one runs before the
 first window exists, and a wedged server held an unbounded call for as long as it stayed wedged
 (4.05 s in the audit repro, main-5). Warn on a timeout and fail open; keep "no server yet" silent.
+A call that runs on every spawn also needs a cooldown after a timeout
+(`TMUX_UPDATE_ENV_COOLDOWN_MS`), or each spawn waits out the same wedge again.
 
 **The same goes for the CWD: a tmux client never runs in the node's directory.** The server keeps
 the cwd of the client that started it, and from tmux 3.7 a new pane's `-c` is silently dropped once

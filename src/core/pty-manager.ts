@@ -313,6 +313,15 @@ const PROBE_TIMEOUT_MS = 6_000
  */
 export const TMUX_BOOT_CMD_TIMEOUT_MS = 2_000
 
+/**
+ * After a `show-options` / `set-option` in `ensureUpdateEnvKeys` times out, how long it runs no
+ * synchronous tmux call at all. Every spawn passes the account-scope names, so without it each
+ * later spawn on a slow-but-alive server would block main for up to TMUX_BOOT_CMD_TIMEOUT_MS
+ * again (a 20-terminal restore: about 40 s of stalls). Once it ends the next spawn probes again,
+ * so a server that recovered is still learned.
+ */
+export const TMUX_UPDATE_ENV_COOLDOWN_MS = 60_000
+
 /** Outcome of one bounded synchronous tmux call. `timeout` is a wedged server and is LOGGED;
  *  `failed` is the ordinary "no server running yet" exit and stays silent, as it always was.
  *  Callers fail open on both — neither is `ok: true` with empty output. */
@@ -2090,6 +2099,8 @@ export class PtyManager {
   /** `update-environment` names already pushed to the running server this app-run (plus the
    *  conf-baked set), so a custom agent's spawn costs at most one `set-option` per NEW key. */
   private updateEnvKeys: Set<string> | null = null
+  /** Epoch ms until which `ensureUpdateEnvKeys` makes no tmux call (a recent timeout). */
+  private updateEnvCooldownUntil = 0
 
   /** Make the shared tmux server copy these client-env names into new sessions. The conf bakes
    *  the fixed gateway list; a CUSTOM agent's env keys are user-defined and can only be appended
@@ -2104,12 +2115,16 @@ export class PtyManager {
       (n) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(n) && n !== 'PATH' && n !== 'LANG'
     )
     if (!wanted.length) return
+    if (Date.now() < this.updateEnvCooldownUntil) return
     if (!this.updateEnvKeys) {
       const shown = this.runTmuxSync(['show-options', '-g', 'update-environment'], true)
       // A wedged server: stop here. Every `set-option` below would wait out the same bound — one
-      // stall per new name on the spawn path (audit main-5) — and leaving the cache unset lets a
-      // later spawn probe a recovered server properly. The spawn itself goes ahead.
-      if (!shown.ok && shown.reason === 'timeout') return
+      // stall per new name on the spawn path — and leaving the cache unset lets a spawn after the
+      // cooldown probe a recovered server properly. The spawn itself goes ahead.
+      if (!shown.ok && shown.reason === 'timeout') {
+        this.updateEnvCooldownUntil = Date.now() + TMUX_UPDATE_ENV_COOLDOWN_MS
+        return
+      }
       this.updateEnvKeys = new Set(MODEL_GATEWAY_ENV_KEYS)
       // `failed` is "no server yet" — the conf list is what a fresh server will have.
       if (shown.ok) {
@@ -2123,7 +2138,10 @@ export class PtyManager {
       const set = this.runTmuxSync(['set-option', '-ga', 'update-environment', name], false)
       if (set.ok) this.updateEnvKeys.add(name)
       // One timeout per call, not per name: the rest would only wait out the same wedge.
-      else if (set.reason === 'timeout') break
+      else if (set.reason === 'timeout') {
+        this.updateEnvCooldownUntil = Date.now() + TMUX_UPDATE_ENV_COOLDOWN_MS
+        break
+      }
       /* `failed`: no server yet — fresh-server sessions inherit the client env directly */
     }
   }
