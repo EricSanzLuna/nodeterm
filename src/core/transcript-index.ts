@@ -154,7 +154,9 @@ export async function persistIndex(
 // One refresh at a time. A cold scan of a large tree can outlast the interval, and two overlapping
 // runs would race their persists (and the `dirty` flag) as well as reading every file twice.
 let refreshing: Promise<void> | undefined
-function refresh(): Promise<void> {
+/** Rescan and persist if owed — what launch and the 5-minute timer run. A call while a refresh is
+ *  in flight joins it rather than starting a second scan. */
+export function refreshTranscriptIndex(): Promise<void> {
   refreshing ??= refreshOnce().finally(() => {
     refreshing = undefined
   })
@@ -198,7 +200,7 @@ export function initTranscriptIndex(getAccounts?: () => ClaudeAccount[]): void {
   // a crash inside writeFileAtomic is deliberately NOT collected (fs-atomic cannot prove its writer
   // dead across PID namespaces), so such an orphan stays until removed by hand.
   void sweepStaleTempFiles(indexFilePath())
-  void refresh()
-  timer = setInterval(() => void refresh(), TRANSCRIPT_INDEX_REFRESH_MS)
+  void refreshTranscriptIndex()
+  timer = setInterval(() => void refreshTranscriptIndex(), TRANSCRIPT_INDEX_REFRESH_MS)
   if (timer.unref) timer.unref()
 }
