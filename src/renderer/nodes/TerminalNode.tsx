@@ -251,7 +251,7 @@ import { useTerminalSearch } from '../terminal/useTerminalSearch'
 import { useCopyFeedback } from '../terminal/useCopyFeedback'
 import { pasteWithImageReceipt } from '../terminal/image-paste-confirm'
 import { usePasteReceipt } from '../terminal/usePasteReceipt'
-import { installBoardRenderPause, type BoardRenderPause } from '../terminal/board-render-pause'
+import { createBoardPauseSlot } from '../terminal/board-render-pause'
 import { ContextMeter } from '../components/ContextMeter'
 import { isZoomModifierHeld } from '../lib/zoomModifier'
 import { HoverGuard } from './HoverGuard'
@@ -1560,11 +1560,11 @@ export function TerminalNode({
       viewFor(s, useProjects.getState().activeProjectId ?? '') === 'kanban'
   )
   const boardOpenRef = useRef(boardOpen)
-  // The live session's board render pause (set by the lifecycle effect): while the board covers
-  // this node, xterm stops DRAWING but keeps parsing (audit GT-6: 36.5 % GPU board-open over
-  // streaming terminals vs 0.0 % over silent ones). Synced from the two effects that already re-run
-  // on what "covered" reads — the board flag and focus mode. See `terminal/board-render-pause.ts`.
-  const boardPauseRef = useRef<BoardRenderPause | null>(null)
+  // The live session's board render pause (attached by the lifecycle effect): while the board
+  // covers this node, xterm stops DRAWING but keeps parsing. Synced from the two effects that
+  // already re-run on what "covered" reads — the board flag and focus mode. See
+  // `terminal/board-render-pause.ts`.
+  const [boardPauseSlot] = useState(createBoardPauseSlot)
   const dwellRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [showColors, setShowColors] = useState(false)
   const [armed, setArmed] = useState(true)
@@ -3422,12 +3422,14 @@ export function TerminalNode({
     // sits ABOVE the board (z 25), so a node focused before the board opened is still on screen.
     // Deliberately NOT folded into `reportVisible`: that verdict feeds the WebGL budget,
     // hibernation and the offscreen teardown, and the board must not hibernate the sessions it
-    // shows cards for (audit GT-6, refuted fix shapes).
-    const boardPause = installBoardRenderPause(term as unknown as Parameters<typeof installBoardRenderPause>[0], {
-      covered: () => boardOpenRef.current && focusedNodeId() !== id,
-      onUncover: fullRepaint
-    })
-    boardPauseRef.current = boardPause
+    // shows cards for.
+    const releaseBoardPause = boardPauseSlot.attach(
+      term as unknown as Parameters<typeof boardPauseSlot.attach>[0],
+      {
+        covered: () => boardOpenRef.current && focusedNodeId() !== id,
+        onUncover: fullRepaint
+      }
+    )
 
     // Cmd+C (mac) / Ctrl+Shift+C (Linux, Windows) / Ctrl+Insert copy the terminal selection — xterm
     // renders to a canvas, so the DOM-selection copy used elsewhere can't see it. Plain Ctrl+C is
@@ -5163,8 +5165,7 @@ export function TerminalNode({
       if (fullRepaintRef.current === fullRepaint) fullRepaintRef.current = null
       // Hand xterm its own pause back before the terminal is parked or disposed: a parked xterm
       // must not carry a wrapper whose `covered` reads a dead mount's refs.
-      boardPause?.dispose()
-      if (boardPauseRef.current === boardPause) boardPauseRef.current = null
+      releaseBoardPause()
       // Free the GPU context on unmount (park or teardown) either way, and unregister from the
       // budget coordinator (which releases any held grant + cancels its timers). The park path must
       // keep releasing it as it always has (contexts are capped ~16, and a parked terminal is
@@ -5630,7 +5631,7 @@ export function TerminalNode({
     boardOpenRef.current = boardOpen
     applyFitRef.current?.()
     // …and stop (or resume) drawing under it. After the ref write: the pause reads it.
-    boardPauseRef.current?.sync()
+    boardPauseSlot.sync()
   }, [boardOpen])
 
   // Focus mode engaged/exited anywhere on the canvas: re-run our size vote (applyFit reads
@@ -5641,7 +5642,7 @@ export function TerminalNode({
     () =>
       subscribeFocusedNode(() => {
         applyFitRef.current?.()
-        boardPauseRef.current?.sync()
+        boardPauseSlot.sync()
       }),
     []
   )

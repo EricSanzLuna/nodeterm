@@ -161,3 +161,39 @@ export function installBoardRenderPause(
   if (covered) apply()
   return controller
 }
+
+/**
+ * Where a terminal node keeps its live session's pause, so the wiring is one tested unit rather
+ * than three lines spread over TerminalNode. The lifecycle run `attach`es (the render service only
+ * exists once the terminal is open) and calls the release from its cleanup — per run, NOT through
+ * `cleanups`, because a park keeps the xterm while this run's closures die with it, so the
+ * adopting run must install its own. The board-flag and focus-mode effects only `sync`.
+ *
+ * The slot is the point: a node mounted while the board is already up is paused at install, and
+ * the board closing reaches it only through `sync`, so a controller that never landed in the slot
+ * leaves that node frozen on stale content until it is panned off screen and back.
+ */
+export interface BoardPauseSlot {
+  /** Install on `term` for this run and hold the controller. Returns the run's release: dispose,
+   *  and clear the slot unless a newer run has attached since. */
+  attach(term: PausableTerminal, opts: BoardRenderPauseOptions): () => void
+  /** Re-read `covered()` on whatever controller is attached now; nothing attached, nothing done. */
+  sync(): void
+}
+
+export function createBoardPauseSlot(): BoardPauseSlot {
+  let current: BoardRenderPause | null = null
+  return {
+    attach(term, opts) {
+      const pause = installBoardRenderPause(term, opts)
+      current = pause
+      return () => {
+        pause?.dispose()
+        if (current === pause) current = null
+      }
+    },
+    sync() {
+      current?.sync()
+    }
+  }
+}

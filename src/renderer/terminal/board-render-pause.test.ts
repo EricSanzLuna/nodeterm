@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  createBoardPauseSlot,
   installBoardRenderPause,
   renderPaused,
   type IntersectionVerdict,
@@ -189,5 +190,67 @@ describe('installBoardRenderPause', () => {
   it('returns null and changes nothing when the private method is missing', () => {
     expect(installBoardRenderPause({}, { covered: () => true })).toBeNull()
     expect(installBoardRenderPause({ _core: { _renderService: {} } }, { covered: () => true })).toBeNull()
+  })
+})
+
+/**
+ * The node's wiring, run with a fake terminal: TerminalNode's lifecycle run ATTACHES (and its
+ * cleanup releases), and the board-flag and focus-mode effects only SYNC the slot. A slot that
+ * never held the run's controller is the bug this pins: a node mounted while the board is up
+ * pauses at install, and the board closing must still reach it.
+ */
+describe('createBoardPauseSlot (TerminalNode wiring)', () => {
+  it('a node mounted under the board resumes and repaints when the board closes', () => {
+    const { term, rs } = fake()
+    const slot = createBoardPauseSlot()
+    let board = true
+    let repaints = 0
+    const release = slot.attach(term, { covered: () => board, onUncover: () => repaints++ })
+    expect(rs._isPaused).toBe(true)
+    rs.refreshRows()
+    expect(rs.painted).toBe(0)
+
+    board = false
+    slot.sync() // what the [boardOpen] effect does after writing the ref
+    expect(rs._isPaused).toBe(false)
+    expect(rs.painted).toBe(1) // the refresh owed while covered was flushed
+    expect(repaints).toBe(1)
+    release()
+  })
+
+  it('release hands xterm its own handler back and leaves nothing for a later sync', () => {
+    const { term, rs } = fake()
+    const slot = createBoardPauseSlot()
+    let board = true
+    const release = slot.attach(term, { covered: () => board })
+    release()
+    expect(Object.prototype.hasOwnProperty.call(rs, '_handleIntersectionChange')).toBe(false)
+    expect(rs._isPaused).toBe(false) // a covered pause is handed back, not left stuck
+    board = true
+    slot.sync()
+    rs.observe(true)
+    expect(rs._isPaused).toBe(false)
+  })
+
+  it('a stale run\'s release never detaches the controller a newer run attached', () => {
+    const a = fake()
+    const b = fake()
+    const slot = createBoardPauseSlot()
+    let board = false
+    const releaseOld = slot.attach(a.term, { covered: () => board })
+    slot.attach(b.term, { covered: () => board })
+    releaseOld()
+    board = true
+    slot.sync()
+    expect(b.rs._isPaused).toBe(true)
+  })
+
+  it('an xterm without the private method attaches nothing and release is still safe', () => {
+    const slot = createBoardPauseSlot()
+    const release = slot.attach({ _core: {} }, { covered: () => true })
+    expect(() => {
+      slot.sync()
+      release()
+    }).not.toThrow()
   })
 })
