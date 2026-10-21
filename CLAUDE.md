@@ -250,17 +250,19 @@ PTY output flows main → renderer over per-session channels (`pty:data:<session
 input flows renderer → main over `pty:write`. node-pty is kept **external** in the bundle
 (`externalizeDepsPlugin` in `electron.vite.config.ts`) because it's a native module.
 
-**Process death and hangs are telemetry, never triggers** (audit roadmap #6, tmux-2 / obs-5).
-Until then the only handler was `render-process-gone`, and it logged nothing, so a GPU-process
-crash or a renderer hang left no trace. Now app `child-process-gone` (`{type, reason, exitCode,
-name}`, per-type session count; `clean-exit` at info, every other reason at warn), the main window's
-`unresponsive` → `responsive` pair (one line per hang, duration measured from Electron's own hang
-timeout so it is a lower bound) and `render-process-gone` each write a `[process]` line to the
-debug log ring (`main/process-health-log.ts`, wired in `index.ts`). `child-process-gone` is
-registered before `ready` because the GPU process can die during boot. None of them reloads,
-relaunches or kills anything: Chromium respawns the GPU process itself, and repeated GPU deaths
-can trip its per-domain 3D-API block "until restart" (the audit's tmux-4), so provoking more of
-them degrades the session. In the renderer, `webgl-budget.ts` counts EXTERNAL WebGL losses by
+**Process death and hangs are telemetry, never NEW triggers.** Until then the only handler was
+`render-process-gone`, and it logged nothing, so a GPU-process crash or a renderer hang left no
+trace. Now app `child-process-gone` (`{type, reason, exitCode, name}`, per-type session count;
+`clean-exit` at info, every other reason at warn), the main window's `unresponsive` / `responsive`
+pair (two lines per hang: one when it is declared, one when it ends with the duration, measured
+from Electron's own hang timeout so it is a lower bound) and `render-process-gone` each write
+`[process]` lines to the debug log ring (`main/process-health-log.ts`, wired in `index.ts`).
+`child-process-gone` is registered before `ready` because the GPU process can die during boot.
+The logging adds no action: `render-process-gone` keeps the crash reload it already had
+(`createCrashReloadPolicy`, and it now also closes an open hang), while `child-process-gone` and a
+hang reload, relaunch or kill nothing. Chromium respawns the GPU process itself, and repeated GPU
+deaths can trip its per-domain 3D-API block "until restart", so provoking more of them degrades
+the session. In the renderer, `webgl-budget.ts` counts EXTERNAL WebGL losses by
 kind through `handle.contextLost(kind)` — `lost` (the addon's `onContextLoss`: still lost after
 its 3s window) and `restored` (a GPU reset the browser recovered, which `TerminalNode` rebuilds on
 a fresh addon) — and writes one `[webgl]` warn per loss carrying the session totals, which main's
@@ -624,8 +626,8 @@ config for an SSH project's remote tmux.
 **Every synchronous tmux call on main is bounded (`TMUX_BOOT_CMD_TIMEOUT_MS`, 2 s, via
 `PtyManager.runTmuxSync`).** `ensureTmux`'s `source-file` runs before the first window exists, and
 `ensureUpdateEnvKeys`' `show-options` / `set-option` run on a spawn; unbounded, a server that accepts
-the connection and never answers held main for the wedge's whole lifetime (audit main-5: 4.05 s in
-the repro, i.e. forever against a server that never recovers). The bound kills only our short-lived
+the connection and never answers held main for the wedge's whole lifetime (4.05 s in a repro, i.e.
+forever against a server that never recovers). The bound kills only our short-lived
 client (SIGKILL, so one that ignores SIGTERM cannot keep `execFileSync` waiting), never the server.
 A timeout is `console.warn`ed and fails open (tmux stays resolved; the spawn goes ahead); "no server
 yet" stays silent, as it always was. A timeout also ends the rest of that call's tmux work — the
@@ -2407,13 +2409,13 @@ raw-HTML tokens as escaped TEXT (a program's `<stdin>` is not markup; parsed as 
 stripped it) and trims capture-pane's trailing padding. The escape is on the `html` token, never a
 global pre-escape of `<`, which would double-escape code spans/fences.
 
-**The TS/JS worker is reaped, not idled** (`renderer/editor/tsWorkerReaper.ts`, audit #18). Monaco
-0.57 stops the css/html/json workers after 2 min idle but never the TypeScript one (separate TS and JS
-managers can pin two compiler isolates, order of 70-100 MB each). monaco-setup stops it with a no-op
-`setCompilerOptions` on `monaco.typescript.*Defaults` (`onDidChange` → `_stopWorker`; the next request
-restarts it lazily) 2 min after the last TS/JS model is disposed or changes language.
-`noSemanticValidation` does not stop it. This only works if every node **disposes its models on
-unmount**: one leaked `.ts` model pins the worker for the session.
+**The TS/JS worker is reaped, not idled** (`renderer/editor/tsWorkerReaper.ts`). Monaco 0.57 stops
+the css/html/json workers after 2 min idle but never the TypeScript one (separate TS and JS
+managers can pin two compiler isolates; their size has not been measured here). monaco-setup stops
+it with a no-op `setCompilerOptions` on `monaco.typescript.*Defaults` (`onDidChange` →
+`_stopWorker`; the next request restarts it lazily) 2 min after the last TS/JS model is disposed or
+changes language. This only works if every node **disposes its models on unmount**: one leaked
+`.ts` model pins the worker for the session.
 
 **The rendered-Markdown font is a setting** (`markdownFontFamily` / `markdownFontSize`, Settings →
 Appearance; `@shared/markdown-font`). App.tsx publishes it as `--md-font-family` / `--md-font-size`
@@ -6541,16 +6543,16 @@ about which machine they describe. Reading + parsing is `core/session-memory.ts`
   and a second copy is exactly the drift this file warns about elsewhere. `null` = could not read,
   never zero.
 - **The pill's swap figure and kernel-pressure tint live in `MemInfo.display`, and nothing but the
-  pill reads it** (audit roadmap #14). darwin: `sysctl vm.swapusage` and
+  pill reads it.** darwin: `sysctl vm.swapusage` and
   `kern.memorystatus_vm_pressure_level` (1/2/4 → normal/warn/critical), both in ONE
   `/usr/sbin/sysctl` run inside `darwinMemInfo`, each field optional on its own; Linux: copied from the same `/proc/meminfo` text. **Never fill
-  `swapTotalMb`/`swapFreeMb` on darwin** — `hostUnderMemoryPressure` reads them, and a Mac keeps
-  its swap ~85% used while healthy (the audited one: 7.7 of 9 GB, level flapping 1↔2), so the
-  reaper's swap term would fire all day. The level only RAISES the used-% tint, never lowers it;
+  `swapTotalMb`/`swapFreeMb` on darwin** — `hostUnderMemoryPressure` reads them, and a Mac can keep
+  most of its swap in use for hours (the measured one: 7.7 of 9 GB, its kernel level moving between
+  normal and warn), so the reaper's swap term would fire all day. The level only RAISES the used-% tint, never lowers it;
   a failed read omits its field (no "0 GB swap"). Not an input to the reaper, the pressure monitor
   or any lever — that is a separate, measured change.
 - **"nodeterm itself" is a separate group, never a session row and never in the header total**
-  (`SessionMemoryReport.app`, audit roadmap #4). The GPU helper's footprint was 1557-1845 MB while
+  (`SessionMemoryReport.app`). The GPU helper's footprint was 1557-1845 MB while
   `ps` rss said 96-153 MB, and no surface attributed it. The desktop shell injects
   `appProcesses` from `app.getAppMetrics()` for **pid, type and `cumulativeCPUUsage` only**: on
   macOS `memory.workingSetSize` is resident size (blind to IOSurfaces, like rss) and
@@ -6558,7 +6560,9 @@ about which machine they describe. Reading + parsing is `core/session-memory.ts`
   on darwin (`ProcEntry.footprint`; a pid `top` missed is "not measured", never its rss), VmRSS on
   Linux, working set on Windows. No second `top` (~0.5 s each). CPU is lifetime CPU TIME, not a
   rate: `percentCPUUsage` answers 0 on its first call. Local scope only; absent = not available
-  (Server Edition, SSH, relay); `ok:false` = tried and could not, rendered as such.
+  (Server Edition, SSH, relay); `ok:false` = tried and could not, rendered as such. Measured on
+  macOS only: the Linux (VmRSS) and Windows (working set) legs have unit tests but have not been
+  checked against a real machine.
 - **The local reader reads `/proc/<pid>/status`, never `statm`.** `status` carries `PPid` and `VmRSS`
   in one file, already in kB; `statm` reports RSS in **pages**, forcing a page-size assumption — a
   hard-coded 4096 under-reports **4×** on a 16 KiB-page arm64 kernel and **16×** on the 64 KiB-page
@@ -7530,17 +7534,17 @@ the Settings section and ShortcutsPanel start disagreeing about what a chord mea
     tab takes `onMarkdownToggle` from the local preload). macOS Chrome reserves ⌘M for minimize,
     so the default chord only reaches a Mac browser tab after a remap (docs/SERVER.md).
   - **A status-reading command builds its answer PER KEYPRESS, never from a subscription.**
-    `node.nextNeedingYou` (ships unbound, mirrored in ⌘K as "Go to next agent needing you"; audit
-    roadmap #19 — one chord instead of 3-5 sidebar clicks) builds `needsYouQueue`
-    (`lib/nextNeedingYou.ts`) from `useProjects`/`useAgentStatus` `getState()` on each press:
-    the status-mode sidebar's "Need attention" rows (`buildStatusList` over the non-closed
-    projects), re-sorted OLDEST wait first, minus rows `nodeTravel` reports `blocked`. Canvas must
-    never subscribe to `statusById` for it (every flip would re-render the canvas). Travel is
-    `travelToNodeRef` (keeps the hosted-team reopen guard), the cycle cursor is a ref (memory
-    only), the node the user is already in is skipped when another waits, and an empty queue is
-    CLAIMED with an info notice — xterm has already withheld the chord, so declining would only
-    make a deliberately bound chord silent. Its handler entry is pinned by
-    `keybindings-handler-parity.test.ts`.
+    `node.nextNeedingYou` (ships unbound, mirrored in ⌘K as "Go to next agent needing you") builds
+    `needsYouQueue` (`lib/nextNeedingYou.ts`) from `useProjects`/`useAgentStatus` `getState()` on
+    each press: the status-mode sidebar's "Need attention" rows (`buildStatusList` over the
+    non-closed projects), re-sorted OLDEST wait first, minus rows `nodeTravel` reports `blocked`.
+    Canvas must never subscribe to the status store's `byId` for it (every flip would re-render the
+    canvas). Travel is `travelToNodeRef` (keeps the hosted-team reopen guard), the cycle cursor is a
+    ref (memory only), the node the user is already in is skipped when another waits, and an empty
+    queue is CLAIMED with an info notice — xterm has already withheld the chord, so declining would
+    only make a deliberately bound chord silent. After a restart the notice counts agents whose
+    restored `lastSeen` last said waiting/blocked (`waitingBeforeRestart`). Its handler entry is
+    pinned by `keybindings-handler-parity.test.ts`, which checks only the ids in its `checkedIds`.
   - **ShortcutsPanel is DERIVED from the registry, never a hand-written list.**
     `buildShortcutSections` iterates `COMMAND_DEFINITIONS` — one section per `CommandGroup` in
     registry source order, the label from `def.title`, and EVERY one of the command's EFFECTIVE
@@ -9130,8 +9134,9 @@ that unmount erase the live view's claim.
 
 **The board gate does not stop xterm; `terminal/board-render-pause.ts` does.** CSS reaches the glows,
 not the terminals: xterm pauses only on its own GEOMETRIC IntersectionObserver, and a node under
-the board still intersects. MEASURED (audit GT-6, dev, 12 streaming terminals): board open 36.5 %
-GPU vs 0.0 % over silent terminals, and `visibility: hidden` on the canvas 35.5 % — no help. Each
+the board still intersects. MEASURED BEFORE the pause (dev, 12 streaming terminals): board open
+36.5 % GPU vs 0.0 % over silent terminals, and `visibility: hidden` on the canvas 35.5 % — no help.
+The number WITH the pause has not been measured. Each
 TerminalNode wraps its RenderService's `_handleIntersectionChange` so xterm is told "not
 intersecting" while `boardOpen` (Omni included) is up and the node is not the focus-mode node (the
 focus surface, z 40, sits above the board, z 25); uncovering replays the real entry through xterm's
@@ -9139,7 +9144,7 @@ own resume and then `fullRepaint`. Parsing never stops, so nothing is lost. Two 
 the board into `reportVisible` / the WebGL budget's visibility (that verdict drives hibernation and
 the offscreen teardown — the board would put the very sessions it shows to sleep), and any other
 "is the board up" predicate must OR in `isGlobalKanbanOpen()` (`boardCoversCanvas` missed the Omni
-board until GT-6, the same omission 12564a20 fixed for focus restore).
+board until this change, the same omission 12564a20 fixed for focus restore).
 
 **Specificity is the quiet failure mode in all of this, and it has already happened twice.** The
 three glows carry their own `animation:` shorthand, which RESETS `animation-play-state` — so
@@ -9172,20 +9177,23 @@ infinite): an unread node stays unread until someone looks, and a wait can last 
 canvas those three kept the frame loop open indefinitely. MEASURED (46-node SSH canvas, 14 unread
 nodes, 8 waiting ropes, FOCUSED window, dev build): idle renderer+GPU **~120% → ~25%**, and pausing
 every remaining animation no longer moves it. Pausing any ONE family alone saved far less (85–104%),
-which is the first-animation step above again. Only the attention glow (and its minimap beat) stays
-infinite — needs-you is the one state that must keep pulling the eye — and the idle gate covers the
-unfocused case. The driven-browser rope still flows (it lasts only while an agent drives the page).
+which is the first-animation step above again. Only the attention glow (and its minimap beat) and
+React Flow's animated edges (working subagent and loop edges, the driven-browser rope — see the
+`dashdraw` paragraph below) stay infinite — needs-you is the one state that must keep pulling the
+eye, and an edge animates only while its work runs — and the idle and covered gates pause all of
+them when nobody is looking. The driven-browser rope still flows (it lasts only while an agent
+drives the page).
 `styles.animation-gate.test.ts` pins the bounded shorthands, the resting values and the keyframe
 endpoints.
 
 **React Flow's `dashdraw` is gated in `styles.css`, not by xyflow.** Every `animated` edge (working
 subagent and loop edges, the driven-browser rope) and an animated connection line run xyflow's own
 `dashdraw 0.5s linear infinite`, from a vendor sheet that never reads `--nt-anim-state` — so until
-this rule it escaped BOTH the idle and the covered gate, and "the idle gate covers the unfocused
-case" above was false for edges. MEASURED (dev build, one synthetic edge with React Flow's real
-classes, idle gate set, 3 alternating 30 s rounds): Liquid Glass 79 % GPU + 36 % renderer and
-+340 MB GPU footprint; dark 31.5 % + 29 %; with the play-state rule, the 0.5 % / 3.3 % no-edge
-baseline. The rule repeats xyflow's selectors verbatim (same specificity, wins on order after the
+this rule it escaped BOTH the idle and the covered gate. MEASURED (dev build, one synthetic edge with
+React Flow's real classes, idle gate set, 3 alternating 30 s rounds): Liquid Glass 79 % GPU + 36 %
+renderer and +340 MB GPU footprint; dark 31.5 % + 29 %. With the play-state rule injected over CDP
+(not the shipped stylesheet) the edge fell to the no-edge baseline of that run, 0.5 % / 3.3 %; the
+shipped build has not been measured. The rule repeats xyflow's selectors verbatim (same specificity, wins on order after the
 `@import`), and `styles.animation-gate.test.ts` scans the vendor sheet for infinite animations, so an
 xyflow upgrade that adds one fails there. A FOCUSED window still pays the full per-edge cost while an
 edge works; a cheaper working-edge style is an open design call (the driven rope keeps flowing).
@@ -9295,7 +9303,7 @@ unix-socket forward and dev-server `-L` forward over it. POSIX keeps OpenSSH unt
 - **ssh2 is loaded on first use, never at module scope** (`ssh2()` in `native-mux.ts`; every other
   shipped import of it is `import type`). native-runtime → native-mux is on main's module-scope
   graph, which runs before Chromium's `ready`; a top-level import cost every launch 14–25 ms warm
-  (~680 ms in one cold-cache sample) on machines that never open an SSH project (audit startup-6).
+  (~680 ms in one cold-cache sample) on machines that never open an SSH project.
   Pinned by `native-mux.lazy.test.ts` (import does not evaluate ssh2) and
   `src/main/lazy-deps.source.test.ts` (no shipped value import).
 - **Tests run on every OS** against ssh2's own in-process `Server` (loopback, no sshd); the
@@ -9397,8 +9405,8 @@ unix-socket forward and dev-server `-L` forward over it. POSIX keeps OpenSSH unt
 - **A paused phone stream is resumed by a drain sweep, never by "the next chunk"**
   (`main/remote/host-service.ts`, FLOW_SWEEP_MS). `sendFrame` refuses — and drops — a frame once the
   relay socket holds >8 MB, and the host pauses the pty; a paused node-pty emits no `onData`, so the
-  old resume-on-next-successful-send never fired and the phone's terminal froze until it detached
-  (audit net-1). A 250 ms sweep, armed only while a stream is paused and cleared in
+  old resume-on-next-successful-send never fired and the phone's terminal froze until it detached.
+  A 250 ms sweep, armed only while a stream is paused and cleared in
   `dropStream`/`closeAll`, waits for `bufferedAmount() <= 256 KB`, then capture → `OP.Snapshot*` →
   `setFlow(resume)`, in that order (the dropped frame desynced the phone; resuming first lets live
   output race the repaint). The repaint is NOT the attach snapshot's bytes: the phone feeds a
@@ -9410,9 +9418,10 @@ unix-socket forward and dev-server `-L` forward over it. POSIX keeps OpenSSH unt
   reconnecting relay reads 0 buffered but refuses every send, so no backoff = a tmux capture per
   tick). Output still queued after the pause is dropped, not streamed. An empty
   capture resumes WITHOUT a repaint — unlike `ui-sink-registry`'s keep-desynced rule, staying here
-  means staying frozen. Same design as `core/ui-sink-registry.ts`; do not reintroduce a chunk-driven
+  means staying frozen. The same drain-sweep pattern as `core/ui-sink-registry.ts` (whose self-paced
+  sinks are never dropped at all); do not reintroduce a chunk-driven
   resume. `~/.nodeterm/relay.json` is written only when its content changes or the file is missing
-  (`relay-advertise.ts`): the ~90 s listener cycle used to rewrite it identically (~960/day, net-5).
+  (`relay-advertise.ts`): the ~90 s listener cycle used to rewrite it identically (~960/day).
 - **The phone's Chat screen verbs** (`chat.page` / `chat.status` / `chat.send` / `agent.answer`,
   `host-service.ts` `handleChat` → `main/remote/host-chat.ts`, spec + exact error strings in
   `docs/mobile-chat-view.md` §3.2). Four rules a refactor must not undo: (1) **the phone sends only a
@@ -10232,8 +10241,8 @@ update vX" item); on `update-downloaded` an OS notification also fires when the 
 unfocused. Exposed via `window.nodeTerminal.updates` (`UpdateApi`). macOS *silent* self-install
 requires a signed+notarized build; unsigned builds still surface the card for a manual download.
 Rules a refactor must not undo (pure + tested: `shared/update-gate.ts`, `renderer/lib/updateCardState.ts`):
-- **electron-updater is never imported at module scope** (audit startup-6: 32–47 ms warm before
-  `ready`, on every launch). `initUpdater` loads it through `UpdaterDeps.loadUpdater` (default: a
+- **electron-updater is never imported at module scope** (it cost 32–47 ms warm before `ready`, on
+  every launch). `initUpdater` loads it through `UpdaterDeps.loadUpdater` (default: a
   plain `require`) only where it is used — at init for a build with a feed, on a restart click in
   dev, never for `no-channel` — and only AFTER the `appGetVersion` / `appGetStagedUpdate` /
   `appRestartToUpdate` handlers are registered, which stay eager on every build (the renderer

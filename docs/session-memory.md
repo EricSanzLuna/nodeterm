@@ -263,7 +263,7 @@ against a real machine, not that fixture's specific numbers.
 
 ### Swap and kernel pressure in the pill (display only)
 
-Added from the 2026-10-19 performance audit (roadmap #14). The pill said 86% "warn" while 8.5 GB
+Added 2026-10-19, from a performance measurement on a Mac. The pill said 86% "warn" while 8.5 GB
 were swapped and the kernel sat at pressure level 2, and nothing on screen said either.
 
 - **Where.** `MemInfo.display` — `swapUsedMb`, `swapTotalMb`, `pressureLevel`. darwin reads
@@ -276,7 +276,7 @@ were swapped and the kernel sat at pressure level 2, and nothing on screen said 
   copies its swap from the `/proc/meminfo` text already parsed. Linux has no kernel level; PSI is
   not mapped to one because no threshold has been measured.
 - **Why a sub-object.** `hostUnderMemoryPressure` reads `swapTotalMb`/`swapFreeMb`. Filling those on
-  darwin would turn a healthy Mac (16% swap free on the audited one) into permanent "pressure" for the
+  darwin would turn a Mac that keeps most of its swap in use (16% free on the measured one) into permanent "pressure" for the
   reaper. The pill reads only `display`; nothing else does.
 - **The tint.** `max(used-% threshold, kernel level)`: the level can raise the colour, never lower it.
 - **No fake zero.** No `display` → no swap text. A measured 0 used is stated in the title only.
@@ -284,7 +284,7 @@ were swapped and the kernel sat at pressure level 2, and nothing on screen said 
 
 ### "nodeterm itself" in the panel
 
-Roadmap #4 of the same audit. The GPU helper's real footprint was 1557-1845 MB (window swap chain,
+From the same measurement. The GPU helper's real footprint was 1557-1845 MB (window swap chain,
 raster tiles, terminal WebGL buffers, driver memory) while `ps` rss said 96-153 MB; the pill counted
 it in the host total, but the panel never attributed it.
 
@@ -302,7 +302,8 @@ it in the host total, but the panel never attributed it.
 - **CPU** is lifetime CPU time per group, not a percentage (`percentCPUUsage` returns 0 on its
   first call, and the sweep takes one sample).
 - **Owed.** Panel GPU figure within 5% of `footprint <gpu pid>` and not equal to `ps rss`, on a
-  real build.
+  real build. The Linux (VmRSS) and Windows (working set) legs are unit-tested only; neither has
+  been checked on a real machine.
 
 ## 6. The SSH leg
 

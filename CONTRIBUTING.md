@@ -632,8 +632,9 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
 - **Relay backpressure is undone by a drain sweep, never by the next chunk of output.** A paused
   pty produces no next chunk, so a resume that waits for one never comes: that froze the phone's
   terminal for good after a single >8 MB burst. `host-service.ts` arms a 250 ms sweep while a stream
-  is paused, then repaints with a snapshot before it resumes; `core/ui-sink-registry.ts` does the same
-  for every other sink. A new paused path needs the same trigger. CLAUDE.md, "Remote access".
+  is paused, then repaints with a snapshot before it resumes — the same drain-sweep pattern as
+  `core/ui-sink-registry.ts` (whose self-paced sinks never drop). A new paused path needs the same
+  trigger. CLAUDE.md, "Remote access".
 
 - **An SSH project's node runs on the project's host — ask the project, not the node.** Node
   fields like `sshRemoteTmux` arrive through a shared `project.json` that the host's own desktop and
@@ -972,7 +973,7 @@ real-tmux test (`account-env.realtmux.test.ts` is the pattern).
 **A synchronous tmux call on main always has a timeout.** Use `PtyManager.runTmuxSync` (2 s,
 `TMUX_BOOT_CMD_TIMEOUT_MS`), never a bare `execFileSync` on the tmux socket: one runs before the
 first window exists, and a wedged server held an unbounded call for as long as it stayed wedged
-(4.05 s in the audit repro, main-5). Warn on a timeout and fail open; keep "no server yet" silent.
+(4.05 s in a repro). Warn on a timeout and fail open; keep "no server yet" silent.
 A call that runs on every spawn also needs a cooldown after a timeout
 (`TMUX_UPDATE_ENV_COOLDOWN_MS`), or each spawn waits out the same wedge again.
 
@@ -1000,12 +1001,9 @@ make it show up; a command with no effective binding is omitted rather than list
 replaced hand-listed 24 ids against a 45-command registry and had drifted four live chords behind
 — if you find yourself typing a command id into that file, that is the bug reappearing.
 
-**A command that reads agent status reads it per keypress, never by subscription.** Canvas must not
-subscribe to `useAgentStatus`'s `byId` (every working/waiting flip would re-render the whole
-canvas): `node.nextNeedingYou` builds its queue on demand (`lib/nextNeedingYou.ts`, over
-`buildStatusList`) from `getState()` and travels with `travelToNode`, keeping its cycle cursor in a
-ref. A new ships-unbound command also needs a `'<id>':` handler entry that
-`keybindings-handler-parity.test.ts` can see — the handlers map is `Partial`, so nothing else will.
+**`keybindings-handler-parity.test.ts` checks only the ids in its `checkedIds`.** Add a new
+ships-unbound command there, or nothing catches a missing `'<id>':` handler entry in Canvas.tsx
+(the handlers map is `Partial`).
 
 **Comments explain WHY, and name the failure they prevent.** The codebase is deliberately dense with
 reasoning. A comment that restates the code is noise; one that says "do not simplify this back,
@@ -1386,7 +1384,7 @@ bite most often:
   compiler isolate) is only stopped once no TS/JS model is left (`renderer/editor/tsWorkerReaper.ts`).
 
 **`ssh2` and `electron-updater` load on first use, never at main's module scope**, which runs
-before Chromium's `ready` (together ~50–70 ms warm on every launch, audit startup-6). Use `import
+before Chromium's `ready` (together ~50–70 ms warm on every launch). Use `import
 type` for their types; values come from `ssh2()` in `native-mux.ts` and `initUpdater`'s
 `loadUpdater`. `src/main/lazy-deps.source.test.ts` goes red on a value import. A `require()` is
 not reached by `vi.mock`, so a test injects its double (see the updater tests).
@@ -1405,13 +1403,9 @@ on a file it has no loader for). No CI job builds the server bundle, but
 `src/server/server-build.test.ts` builds it in both views and goes red. The server runs from a
 `node_modules` tree, so an external is resolved at runtime.
 
-**Session memory's display-only figures stay display-only.** The RAM pill's swap and kernel-pressure
-tint live in `MemInfo.display`, which the reaper and the pressure monitor never read; never fill
-`swapTotalMb`/`swapFreeMb` on darwin (a healthy Mac keeps swap ~85% used, so the reaper's swap term
-would fire all day). The panel's "nodeterm itself" group takes pids/types/CPU time from
-`app.getAppMetrics()` but memory from the sweep's own table (`top` footprint on macOS) — never
-`workingSetSize`, which on macOS misses the GPU helper's IOSurfaces (≈1.6 GB footprint vs ≈120 MB
-rss). It is local-only and never part of the session total. CLAUDE.md, Session memory.
+**Never fill `swapTotalMb`/`swapFreeMb` on darwin.** The reaper's swap term reads them, and a Mac
+can keep most of its swap in use for hours, so it would fire all day; the RAM pill's swap figure
+lives in `MemInfo.display`, which nothing else reads. CLAUDE.md, Session memory.
 
 ## Testing
 
