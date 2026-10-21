@@ -99,6 +99,20 @@ describe('searchEntries matching (RegExp iu, audit #5)', () => {
     expect(hit('Deseret \u{10400}', 't \u{10428}')).toBe(true) // astral case pair
   })
 
+  it('Turkish İ: an i in the query still matches the dotted capital, as toLowerCase did', () => {
+    // 'İ'.toLowerCase() is 'i' + U+0307, so the old lowered copy matched 'türki' inside 'TÜRKİYE';
+    // under `iu` İ folds only to itself, so the query's i/I are widened to also take İ.
+    expect(hit('Merhaba TÜRKİYE', 'türki')).toBe(true)
+    expect(hit('İstanbul trafiği', 'istanbul')).toBe(true)
+    expect(hit('İSTANBUL', 'ISTANBUL')).toBe(true)
+    // A whole word now matches too (the old copy had U+0307 between the i and the rest).
+    expect(hit('TÜRKİYE', 'türkiye')).toBe(true)
+    // …and nothing that was a miss before turns into a hit on a different letter.
+    expect(hit('TÜRKAYE', 'türki')).toBe(false)
+    const [h] = searchEntries(one('z'.repeat(400) + ' TÜRKİYE ' + 'z'.repeat(400)), 'türki')
+    expect(h.snippet).toContain('TÜRKİYE')
+  })
+
   it('treats regex metacharacters in the query literally', () => {
     expect(hit('axb', 'a.b')).toBe(false)
     expect(hit('see a.b here', 'A.B')).toBe(true)

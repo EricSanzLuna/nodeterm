@@ -53,11 +53,15 @@ export function extractEntryFields(rawText: string): { cwd: string; title: strin
 // match the old code found is lost". Over every BMP case pair, plain `i` disagreed 160 times and
 // LOST hits (Kelvin sign K, Ångström Å, ẞ, Ohm Ω all stopped matching k/å/ß/ω); `iu` disagreed 94
 // times, every one an EXTRA hit (ſ~s, µ~μ, Greek symbol variants, final ς~σ), and also folds astral
-// pairs (Deseret) that `i` misses. Turkish İ (one char lowering to two) diverges under all three.
+// pairs (Deseret) that `i` misses. Turkish İ (U+0130) is the one LOST hit `iu` still has: it
+// lowers to `i` + U+0307, so the old copy matched `türki` in `TÜRKİYE`, while case folding maps İ
+// only to itself. Every i/I of the escaped query is therefore widened to `[iİ]` (safe: the escape
+// below never emits a letter, so each i/I in its output is a literal one).
 // The escape set is exactly SyntaxCharacter plus `/` — the only identity escapes `u` mode accepts;
 // escaping anything else (`-`, say) is a SyntaxError there. No `g`: `test` would turn stateful.
 export function queryRegExp(query: string): RegExp {
-  return new RegExp(query.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'), 'iu')
+  const escaped = query.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
+  return new RegExp(escaped.replace(/[iI]/g, '[iİ]'), 'iu')
 }
 
 export function makeSnippet(text: string, query: string | RegExp): string {

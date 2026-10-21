@@ -9247,7 +9247,9 @@ script (`fetch('http://localhost:9333/json')`, then a WebSocket to the page):
   lowered every entry per keystroke: 20-52 ms and 7-15 MB garbage per search on a 16 MB index,
   vs 2-13 ms and 0 MB as one `RegExp(escaped, 'iu')`. A stored lowered copy would retain +32 MB.
   `iu`, not `i`: `i` loses hits `toLowerCase` found (Kelvin K, Å, ẞ); escape only SyntaxCharacters
-  and `/` (`\-` is a SyntaxError in `u` mode). The snippet uses the same matcher. The index file
+  and `/` (`\-` is a SyntaxError in `u` mode). Even `iu` loses Turkish İ (it lowers to `i` +
+  U+0307, so `türki` matched `TÜRKİYE`), so each i/I of the escaped query is widened to `[iİ]`.
+  The snippet uses the same matcher. The index file
   persists through `writeFileAtomic` (0600), only when a `dirty` flag says the file is behind.
 
 ## SSH projects on Windows: the in-process transport
