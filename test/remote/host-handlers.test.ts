@@ -5,6 +5,7 @@ import {
   type HostRelaySocket
 } from '../../src/main/remote/host-service'
 import { OP } from '../../src/main/remote/framing'
+import { RESUME_REPAINT_PREFIX } from '../../src/shared/capture-paint'
 import type { DetachedSinks } from '../../src/main/pty-manager'
 import type { PtyCreateOptions } from '../../src/shared/types'
 
@@ -307,6 +308,75 @@ describe('createHostHandlers', () => {
         'setFlow:true'
       ])
       expect(vi.getTimerCount()).toBe(0) // the sweep disarms once nothing is paused
+    })
+
+    const resumePayload = (sock: ReturnType<typeof fakeSocket>, from: number): string => {
+      const start = sock.frames.findIndex((f, i) => i >= from && f.op === OP.SnapshotStart)
+      expect(start).toBeGreaterThanOrEqual(0)
+      const chunks: string[] = []
+      for (let i = start + 1; i < sock.frames.length && sock.frames[i].op === OP.SnapshotChunk; i++) {
+        chunks.push(Buffer.from(sock.frames[i].payload).toString('utf8'))
+      }
+      return chunks.join('')
+    }
+
+    it('the resume repaint clears and homes first and paints with CRLF line endings', async () => {
+      // The phone feeds a snapshot into its emulator as-is, with no reset, and the frame that
+      // crossed the 8 MB line was dropped: written raw, the capture lands at the phone's current
+      // cursor over the old screen, and its bare LFs staircase (SwiftTerm runs convertEol off).
+      const { sock } = await pausedStream('row one\nrow two\n')
+      sock.state.ok = true
+      sock.state.buffered = 0
+      const from = sock.frames.length
+      await vi.advanceTimersByTimeAsync(300)
+      const payload = resumePayload(sock, from)
+      expect(payload.startsWith(RESUME_REPAINT_PREFIX)).toBe(true)
+      expect(RESUME_REPAINT_PREFIX).toContain('\x1b[H\x1b[2J')
+      // One trailing newline dropped (it would scroll the top row away), every LF made CRLF.
+      expect(payload).toBe(RESUME_REPAINT_PREFIX + 'row one\r\nrow two')
+    })
+
+    it('the resume repaint puts the cursor where the pane has it when the capture says', async () => {
+      const pty = fakePty()
+      pty.setSnapshot('ATTACH SCREEN\n')
+      const visible: string[] = []
+      ;(pty.mgr as HostPtyManager).captureVisible = async (sessionId) => {
+        visible.push(sessionId)
+        return { screen: 'prompt $ \nstatus\n', cursor: { x: 9, y: 0 } }
+      }
+      const sock = fakeSocket()
+      const h = createHostHandlers(pty.mgr, sock.socket)
+      await openViaAttach(h)
+      // The attach snapshot is byte-identical to before: the raw capture, no prefix, no cursor.
+      expect(Buffer.from(sock.frames[1].payload).toString('utf8')).toBe('ATTACH SCREEN\n')
+      vi.useFakeTimers()
+      sock.state.ok = false
+      sock.state.buffered = 9_000_000
+      pty.sinks().onData('a')
+      sock.state.ok = true
+      sock.state.buffered = 0
+      const from = sock.frames.length
+      await vi.advanceTimersByTimeAsync(300)
+      expect(visible).toEqual(['pty-1'])
+      expect(resumePayload(sock, from)).toBe(RESUME_REPAINT_PREFIX + 'prompt $ \r\nstatus' + '\x1b[1;10H')
+    })
+
+    it('an unavailable visible capture falls back to the attach capture, with no cursor', async () => {
+      const pty = fakePty()
+      pty.setSnapshot('FALLBACK\n')
+      ;(pty.mgr as HostPtyManager).captureVisible = async () => ({ screen: '', cursor: null, unavailable: true })
+      const sock = fakeSocket()
+      const h = createHostHandlers(pty.mgr, sock.socket)
+      await openViaAttach(h)
+      vi.useFakeTimers()
+      sock.state.ok = false
+      sock.state.buffered = 9_000_000
+      pty.sinks().onData('a')
+      sock.state.ok = true
+      sock.state.buffered = 0
+      const from = sock.frames.length
+      await vi.advanceTimersByTimeAsync(300)
+      expect(resumePayload(sock, from)).toBe(RESUME_REPAINT_PREFIX + 'FALLBACK')
     })
 
     it('stays paused while the socket is above the low-water mark', async () => {

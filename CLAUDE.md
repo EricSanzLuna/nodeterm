@@ -9399,7 +9399,12 @@ unix-socket forward and dev-server `-L` forward over it. POSIX keeps OpenSSH unt
   (audit net-1). A 250 ms sweep, armed only while a stream is paused and cleared in
   `dropStream`/`closeAll`, waits for `bufferedAmount() <= 256 KB`, then capture → `OP.Snapshot*` →
   `setFlow(resume)`, in that order (the dropped frame desynced the phone; resuming first lets live
-  output race the repaint). A refused repaint retries with backoff (250 ms doubling to 10 s: a
+  output race the repaint). The repaint is NOT the attach snapshot's bytes: the phone feeds a
+  snapshot into its emulator with no reset, over the old screen, so the resume payload
+  (`resumeRepaintText`, `@shared/capture-paint`) is SGR reset + home + clear, the screen with CRLF
+  line endings (SwiftTerm runs convertEol off) and one trailing newline dropped, then the pane's
+  cursor when `PtyManager.captureVisible` read it (else the attach's own capture, no cursor). The
+  attach snapshot, painted into an empty emulator, stays the raw capture. A refused repaint retries with backoff (250 ms doubling to 10 s: a
   reconnecting relay reads 0 buffered but refuses every send, so no backoff = a tmux capture per
   tick). Output still queued after the pause is dropped, not streamed. An empty
   capture resumes WITHOUT a repaint — unlike `ui-sink-registry`'s keep-desynced rule, staying here

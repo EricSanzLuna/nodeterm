@@ -58,6 +58,8 @@ import { parseRelayKeys } from '../../core/relay-keys'
 import { parseRelayLaunch, type RelayLaunchRequest } from '../../core/relay-launch'
 import { browseHostDirectory, isWithinRootsFor, type BrowseFs } from '../../core/remote/host-fs-rpc'
 import { stripAnsi } from '../../core/transcript-reader'
+import type { VisibleCapture } from '../../core/watch-link/capture-route'
+import { resumeRepaintText } from '../../shared/capture-paint'
 
 // Default relay endpoint; `NODETERM_RELAY_URL` overrides it (mirrors license.ts's API_BASE /
 // CHECKOUT_URL env-override pattern — used both as the dev gate and for local testing).
@@ -106,6 +108,10 @@ export interface HostPtyManager {
   /** Where a `pty.scroll` wheel for this stream goes (`PtyManager.scrollRoute`). Optional so a
    *  pre-feature fake keeps today's tmux-only behaviour. */
   scrollRoute?(sessionId: string): Promise<'tmux' | 'app-mouse' | 'local'>
+  /** The stream's VISIBLE screen and cursor in one capture (`PtyManager.captureVisible`), for the
+   *  backpressure resume's repaint. Optional: absent, or `unavailable`, the resume repaints from the
+   *  attach's own capture with no cursor. */
+  captureVisible?(sessionId: string): Promise<VisibleCapture>
   /** The node's recent output as plain text (`PtyManager.captureSession`) — `pty.capture`. */
   captureSession?(persistKey: string, full?: boolean): Promise<string>
   /** Does a session for this node id exist RIGHT NOW? (The destroy path's outcome check.) */
@@ -262,8 +268,9 @@ interface Stream {
   resumeAttempts?: number
   resumeNotBefore?: number
   /** The current-screen capture for this stream (the attach's own `prep.snapshot`), kept so a
-   *  resume after backpressure can repaint the phone: the frame that crossed the 8 MB line was
-   *  dropped, so the phone's emulator is desynced and only a fresh screen can fix it. */
+   *  resume after backpressure can repaint the phone when no visible capture is available: the
+   *  frame that crossed the 8 MB line was dropped, so the phone's emulator is desynced and only a
+   *  fresh screen can fix it. */
   snapshot?: () => Promise<string>
 }
 
@@ -389,6 +396,22 @@ export function createHostHandlers(
     flowSweep = null
   }
 
+  /**
+   * The repaint a resumed stream gets, '' for none. Unlike the attach snapshot (painted into an
+   * EMPTY emulator), this lands on a phone that still shows the old screen and feeds a snapshot in
+   * with no reset of its own — so it clears and homes first, uses CRLF (SwiftTerm runs with
+   * convertEol off; bare LFs staircase), and puts the cursor back when the capture read it. The
+   * visible capture is preferred (screen + cursor in one tmux call); without one the attach's own
+   * capture is used, with the cursor left where the paint ends.
+   */
+  async function resumeRepaint(stream: Stream): Promise<string> {
+    const visible =
+      stream.sessionId && pty.captureVisible ? await pty.captureVisible(stream.sessionId).catch(() => null) : null
+    if (visible && !visible.unavailable) return visible.screen ? resumeRepaintText(visible.screen, visible.cursor) : ''
+    const screen = stream.snapshot ? await stream.snapshot() : ''
+    return screen ? resumeRepaintText(screen, null) : ''
+  }
+
   /** Resume a paused stream IF its socket has drained: capture → snapshot → resume, in that order.
    *  While paused no `onData` can fire, so nothing interleaves with the repaint; resuming first
    *  would let live output race ahead of a now-stale snapshot. */
@@ -400,7 +423,7 @@ export function createHostHandlers(
     void (async () => {
       let screen = ''
       try {
-        screen = stream.snapshot ? await stream.snapshot() : ''
+        screen = await resumeRepaint(stream)
       } catch {
         screen = ''
       }
