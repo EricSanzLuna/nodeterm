@@ -1,10 +1,13 @@
 // What the RPC surface DECIDES: which machine a query is answered from. The sweeps themselves are
 // covered by session-memory.test.ts / session-memory-remote.test.ts — here the only question is
 // routing, and the only dangerous answer is attributing one host's memory to another.
+import fs from 'fs'
+import path from 'path'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { IPC } from '../shared/ipc'
 import { initPlatform, resetPlatformForTests } from './platform'
 import { fakePlatform, type FakePlatform } from './platform-fake'
+import { testTmpDir } from './test-tmp'
 import { mergeLocalLegs, startSessionMemoryService, sshScopePredicate } from './session-memory-service'
 import type { MemInfo, SessionMemoryReport, SessionMemoryQuery } from '../shared/types'
 
@@ -429,6 +432,29 @@ describe('startSessionMemoryService — "nodeterm itself" (roadmap #4)', () => {
     })
     expect((await read({ projectId: 'p1' })).app).toEqual({ ok: false, groups: [] })
   })
+
+  // macOS and Linux reach the group through the TMUX path (`sessionHost` answers undefined there),
+  // not the Windows session-host leg every test above uses. The sweep reads this machine's real
+  // process table; tmux is a stub that lists no panes, so nothing touches a real tmux server.
+  it.skipIf(process.platform === 'win32')(
+    'the tmux path (macOS / Linux) carries the group too',
+    async () => {
+      const dir = testTmpDir('nt-sessmem-tmux-')
+      const tmux = path.join(dir, 'tmux')
+      fs.writeFileSync(tmux, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+      startSessionMemoryService({
+        tmuxBin: () => tmux,
+        readMem: () => MEM,
+        sessionHost: () => undefined,
+        appProcesses: () => [{ pid: process.pid, type: 'Browser', cpuSeconds: 3 }]
+      })
+      const r = await read({ projectId: 'p1' })
+      expect(r.ok).toBe(true)
+      expect(r.app?.ok).toBe(true)
+      expect(r.app?.groups.map((g) => [g.kind, g.count, g.cpuSeconds])).toEqual([['main', 1, 3]])
+    },
+    60_000
+  )
 
   it('no reader injected (Server Edition) → no field: not available, not "could not measure"', async () => {
     startSessionMemoryService({ tmuxBin: () => null, readMem: () => MEM, sessionHost: async () => listing, sessionHostTable: table })
