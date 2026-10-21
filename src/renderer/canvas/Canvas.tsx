@@ -6201,7 +6201,11 @@ export function Canvas() {
           scmCwd(scopeCwd),
           viewCenter(),
           prompt,
-          undefined,
+          // An SSH project's agent runs on the HOST, like the history it explains. Without the
+          // binding the node was local, rooted at a remote path that does not exist here, so the
+          // pty fell back to $HOME and `git show` ran outside any checkout. The scope is always
+          // the project's own in an SSH project (no worktrees), so the root is the right cwd.
+          nodeSshFor(project?.ssh),
           account,
           activePermissionMode(),
           // The owning project, for its own `.nodeterm/settings.json` launch command — the same
@@ -9416,7 +9420,10 @@ export function Canvas() {
         source.data.cwd,
         undefined,
         prompt,
-        source.data.sshRemoteTmux ? projectSsh : undefined,
+        // `nodeSshFor`, not the project's binding as-is: the factory reads a remote node's cwd out
+        // of `remoteCwd`, so passing `projectSsh` unchanged moved a source running in a subfolder
+        // of the project (canvas-control `--cwd`) back to the project root.
+        source.data.sshRemoteTmux ? nodeSshFor(projectSsh, source.data.cwd) : undefined,
         // Inherit the source's Claude account (dropped by the factory unless the target is claude),
         // so a claude→claude transfer resumes the transcript from the right account dir.
         source.data.accountId,
