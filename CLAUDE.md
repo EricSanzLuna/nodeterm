@@ -6542,8 +6542,8 @@ about which machine they describe. Reading + parsing is `core/session-memory.ts`
   never zero.
 - **The pill's swap figure and kernel-pressure tint live in `MemInfo.display`, and nothing but the
   pill reads it** (audit roadmap #14). darwin: `sysctl vm.swapusage` and
-  `kern.memorystatus_vm_pressure_level` (1/2/4 → normal/warn/critical), each a separate optional
-  read inside `darwinMemInfo`; Linux: copied from the same `/proc/meminfo` text. **Never fill
+  `kern.memorystatus_vm_pressure_level` (1/2/4 → normal/warn/critical), both in ONE
+  `/usr/sbin/sysctl` run inside `darwinMemInfo`, each field optional on its own; Linux: copied from the same `/proc/meminfo` text. **Never fill
   `swapTotalMb`/`swapFreeMb` on darwin** — `hostUnderMemoryPressure` reads them, and a Mac keeps
   its swap ~85% used while healthy (the audited one: 7.7 of 9 GB, level flapping 1↔2), so the
   reaper's swap term would fire all day. The level only RAISES the used-% tint, never lowers it;

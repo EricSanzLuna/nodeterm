@@ -593,15 +593,42 @@ describe('parsePressureLevel (darwin, roadmap #14)', () => {
 })
 
 describe('darwinMemInfo display extras', () => {
-  const sysctl = (answers: Record<string, string | Error>) => (name: string): string => {
-    const a = answers[name]
-    if (a === undefined || a instanceof Error) throw a ?? new Error(`unknown oid ${name}`)
-    return a
+  /** One `sysctl <names…>` run: the known oids print their `name: value` lines, in order; an
+   *  unknown one makes the run exit non-zero, which the caller hands over as the partial stdout
+   *  (`readMemInfo`'s runner) — so here a run with no known oid at all throws. */
+  const sysctl = (answers: Record<string, string>) => (names: string[]): string => {
+    const lines = names.filter((n) => answers[n] !== undefined).map((n) => answers[n])
+    if (lines.length === 0) throw new Error(`unknown oid ${names.join(' ')}`)
+    return lines.join('\n') + '\n'
   }
+
+  it('reads swap and pressure in ONE sysctl run, never one per field', () => {
+    const runs: string[][] = []
+    const both = sysctl({
+      'vm.swapusage': SWAPUSAGE.trimEnd(),
+      'kern.memorystatus_vm_pressure_level': 'kern.memorystatus_vm_pressure_level: 4'
+    })
+    const m = darwinMemInfo(() => VM_STAT, TOTAL_BYTES, (names) => {
+      runs.push(names)
+      return both(names)
+    })
+    expect(runs).toEqual([['vm.swapusage', 'kern.memorystatus_vm_pressure_level']])
+    expect(m?.display).toEqual({ swapUsedMb: 7854, swapTotalMb: 9216, pressureLevel: 'critical' })
+  })
+
+  it('the one run answers each field from its own line, in either order', () => {
+    const reversed = (): string =>
+      'kern.memorystatus_vm_pressure_level: 1\n' + SWAPUSAGE
+    expect(darwinMemInfo(() => VM_STAT, TOTAL_BYTES, reversed)?.display).toEqual({
+      swapUsedMb: 7854,
+      swapTotalMb: 9216,
+      pressureLevel: 'normal'
+    })
+  })
 
   it('adds swap and pressure under `display` and NEVER fills the reaper pair', () => {
     const m = darwinMemInfo(() => VM_STAT, TOTAL_BYTES, sysctl({
-      'vm.swapusage': SWAPUSAGE,
+      'vm.swapusage': SWAPUSAGE.trimEnd(),
       'kern.memorystatus_vm_pressure_level': 'kern.memorystatus_vm_pressure_level: 2'
     }))
     expect(m).toEqual({
@@ -615,12 +642,12 @@ describe('darwinMemInfo display extras', () => {
   })
 
   it('a failed sysctl omits only its own field; both failing leaves the vm_stat reading untouched', () => {
-    const swapOnly = darwinMemInfo(() => VM_STAT, TOTAL_BYTES, sysctl({ 'vm.swapusage': SWAPUSAGE }))
+    const swapOnly = darwinMemInfo(() => VM_STAT, TOTAL_BYTES, sysctl({ 'vm.swapusage': SWAPUSAGE.trimEnd() }))
     expect(swapOnly?.display).toEqual({ swapUsedMb: 7854, swapTotalMb: 9216 })
     const none = darwinMemInfo(() => VM_STAT, TOTAL_BYTES, sysctl({}))
     expect(none).toEqual({ availableMb: 8951, totalMb: 24576 })
     // vm_stat failing still wins: no reading at all, never a display-only one.
-    expect(darwinMemInfo(() => { throw new Error('no vm_stat') }, TOTAL_BYTES, sysctl({ 'vm.swapusage': SWAPUSAGE }))).toBeNull()
+    expect(darwinMemInfo(() => { throw new Error('no vm_stat') }, TOTAL_BYTES, sysctl({ 'vm.swapusage': SWAPUSAGE.trimEnd() }))).toBeNull()
   })
 
   it.skipIf(process.platform !== 'darwin')('reads this Mac\'s real swap and pressure (darwin-only: sysctl oids)', () => {

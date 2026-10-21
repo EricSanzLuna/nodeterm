@@ -269,8 +269,10 @@ were swapped and the kernel sat at pressure level 2, and nothing on screen said 
 - **Where.** `MemInfo.display` — `swapUsedMb`, `swapTotalMb`, `pressureLevel`. darwin reads
   `sysctl vm.swapusage` (`total = 9216.00M  used = 7853.62M  free = 1362.38M  (encrypted)`, parsed by
   `parseSwapUsage`; K/M/G only) and `kern.memorystatus_vm_pressure_level` (`parsePressureLevel`:
-  1 normal, 2 warn, 4 critical, anything else omitted). Each is its own optional read in
-  `darwinMemInfo`; a failure omits that one field and leaves the `vm_stat` reading untouched. Linux
+  1 normal, 2 warn, 4 critical, anything else omitted). Both come from ONE `/usr/sbin/sysctl` run
+  in `darwinMemInfo` (one more synchronous process per 30 s pill read, beside `vm_stat`); each field
+  is still optional on its own — an oid with no line omits that field, and a failed run leaves the
+  `vm_stat` reading untouched. Linux
   copies its swap from the `/proc/meminfo` text already parsed. Linux has no kernel level; PSI is
   not mapped to one because no threshold has been measured.
 - **Why a sub-object.** `hostUnderMemoryPressure` reads `swapTotalMb`/`swapFreeMb`. Filling those on

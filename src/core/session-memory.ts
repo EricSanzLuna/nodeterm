@@ -187,10 +187,14 @@ export function parseTopFootprint(stdout: string): Map<number, number> {
  * degrade correctly on null: `planReap` treats it as "no pressure" (absence of evidence never
  * triggers a kill) and the pill pulses instead of printing a number it has not earned.
  */
+/** The oids `darwinMemInfo` reads, in ONE `sysctl` run. Without `-n`, so each answer carries its
+ *  own `name:` prefix and is matched by name rather than by line position. */
+export const DARWIN_DISPLAY_SYSCTLS = ['vm.swapusage', 'kern.memorystatus_vm_pressure_level'] as const
+
 export function darwinMemInfo(
   runVmStat: () => string,
   totalBytes: number,
-  runSysctl?: (name: string) => string
+  runSysctl?: (names: string[]) => string
 ): MemInfo | null {
   let base: MemInfo | null
   try {
@@ -199,22 +203,46 @@ export function darwinMemInfo(
     return null
   }
   if (!base || !runSysctl) return base
-  // The pill's display extras (roadmap #14). Each is a SEPARATE optional read, the same shape as
-  // PSI on Linux: a failed sysctl omits its one field and costs the vm_stat reading nothing. Never
-  // `swapTotalMb`/`swapFreeMb` — see MemInfo.display for why darwin must not fill those.
+  // The pill's display extras. Both oids come from ONE `sysctl` run, and each field is still
+  // optional on its own, the same shape as PSI on Linux: an oid with no line (or a line that does
+  // not parse) omits its one field, and a run that fails outright costs the vm_stat reading
+  // nothing. Never `swapTotalMb`/`swapFreeMb` — see MemInfo.display for why darwin must not fill
+  // those.
   const display: MemDisplay = {}
+  let out = ''
   try {
-    Object.assign(display, parseSwapUsage(runSysctl('vm.swapusage')))
+    out = runSysctl([...DARWIN_DISPLAY_SYSCTLS])
   } catch {
-    // no swap figure
+    // no swap figure, no pressure tint
   }
-  try {
-    const level = parsePressureLevel(runSysctl('kern.memorystatus_vm_pressure_level'))
-    if (level) display.pressureLevel = level
-  } catch {
-    // no pressure tint
+  for (const line of out.split('\n')) {
+    if (line.startsWith('vm.swapusage:')) Object.assign(display, parseSwapUsage(line))
+    else if (line.startsWith('kern.memorystatus_vm_pressure_level:')) {
+      const level = parsePressureLevel(line)
+      if (level) display.pressureLevel = level
+    }
   }
   return Object.keys(display).length > 0 ? { ...base, display } : base
+}
+
+/**
+ * One bounded `sysctl` run for `darwinMemInfo`, by absolute path (a GUI app's PATH is not the
+ * shell's). An oid the kernel does not know makes sysctl exit non-zero while still printing the
+ * others, so a failure hands over whatever stdout it has: each field stays optional on its own.
+ * stderr is discarded rather than inherited into main's.
+ */
+function runDarwinSysctl(names: string[]): string {
+  try {
+    return execFileSync('/usr/sbin/sysctl', names, {
+      encoding: 'utf8',
+      timeout: 5_000,
+      stdio: ['ignore', 'pipe', 'ignore']
+    })
+  } catch (e) {
+    const partial = (e as { stdout?: unknown } | null)?.stdout
+    if (typeof partial === 'string' && partial) return partial
+    throw e
+  }
 }
 
 /**
@@ -392,12 +420,13 @@ export function readMemInfo(): MemInfo | null {
   // (the 30 s pill poll and the reaper's 10 min sweep) are far apart, and keeping ONE signature
   // means the reaper's watermark is fixed by the same change.
   if (process.platform === 'darwin') {
-    // The two sysctls are sub-millisecond reads; they ride on every caller (the reaper too), which
-    // only ever ignores `display`.
+    // The display extras cost one more synchronous process per call (both oids in one `sysctl`),
+    // a fork/exec on main beside `vm_stat`. Their caller is the 30 s pill read: on darwin the
+    // reaper's `hostMemReader` is null, so it never reaches this.
     return darwinMemInfo(
       () => execFileSync('vm_stat', { encoding: 'utf8', timeout: 5_000 }),
       os.totalmem(),
-      (name) => execFileSync('sysctl', [name], { encoding: 'utf8', timeout: 5_000 })
+      runDarwinSysctl
     )
   }
   try {
