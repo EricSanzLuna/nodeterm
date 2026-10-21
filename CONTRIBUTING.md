@@ -271,6 +271,13 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
 
 ## House rules
 
+- **Check `src/shared` before writing a two-line helper.** A JSON-object guard (`isRecord`), an
+  error's message (`errorText`), `sleep`, the root-space parent walk (`rootPositionWith`) and the
+  credential-store temp sweep (`sweepForeignTempFiles` in `core/fs-atomic.ts`) each existed in five
+  to twenty-one hand-typed copies until #1252's follow-up, and the parent walk's copies had already
+  drifted apart on corrupt canvases. A local helper that shares a name but behaves differently
+  (zellij's `errorText`, windows-conpty's array-accepting guard) is not a copy; leave it alone.
+
 - **Typing into a pane by node id goes through `PtyManager.sendPaneKeys`, and an SSH-project node
   is never read or typed into on the local tmux socket.** An unmounted remote node resolves through
   `remoteNodeOwner` or is refused (`not-connected`); `paneCommand` / `paneOwner` resolve unmounted
