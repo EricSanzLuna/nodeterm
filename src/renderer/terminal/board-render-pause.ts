@@ -4,7 +4,7 @@
  * WHY. The canvas stays mounted under the board on purpose (`display: none` would 0x0-resize every
  * terminal into a tmux SIGWINCH — see the kanban section of CLAUDE.md), and nothing told xterm it
  * was covered: its only pause is its own GEOMETRIC IntersectionObserver (`RenderService`), and a
- * node under an opaque overlay still intersects the viewport. MEASURED (audit GT-6, dev build, 12
+ * node under an opaque overlay still intersects the viewport. MEASURED (dev build, 12
  * streaming terminals, glass on, 60 s windows): board open over streaming terminals 36.5 % GPU /
  * 15.8 % renderer — no better than the canvas itself (30-32 %) — against 0.0 % / 2.4 % with the same
  * board over SILENT terminals, so essentially all of it was xterm painting output nobody could see
@@ -27,7 +27,7 @@
  * WHAT THIS DOES NOT DO, ON PURPOSE. It never feeds the app's own visibility verdict
  * (`reportVisible` / the WebGL budget's `setVisible` / hibernation / the offscreen teardown):
  * folding the board into that verdict would let the board hibernate or tear down the sessions it
- * is showing cards for (audit GT-6, "refuted fix shapes"). The WebGL context stays held while the
+ * is showing cards for. The WebGL context stays held while the
  * board is up; only the draws stop.
  *
  * Private xterm API (`_core._renderService`), exactly as TerminalNode's renderer-swap net and
@@ -110,8 +110,8 @@ export function installBoardRenderPause(
   // (if any) handed its real verdict back. Not a blanket `true`: a terminal re-adopted after a park
   // was detached, so its observer already delivered not-intersecting (`_isPaused = true`); reattached
   // still off screen, the observer has nothing new to report, and a `true` seed made the next board
-  // cover/uncover UNPAUSE it — streaming output painted off screen until a pan in and out (review
-  // of the GT-6 fix, reproduced against xterm 5.5's handler). A fresh xterm starts unpaused with no
+  // cover/uncover UNPAUSE it — streaming output painted off screen until a pan in and out (found in
+  // review, reproduced against xterm 5.5's handler). A fresh xterm starts unpaused with no
   // delivery yet, so the same read gives intersecting there. A build without the field: `true`.
   const pausedNow = (rs as { _isPaused?: unknown })._isPaused
   let geometric = typeof pausedNow === 'boolean' ? !pausedNow : true

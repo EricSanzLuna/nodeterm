@@ -101,7 +101,7 @@ describe('shouldPollScreen — reading the pane for the agent\'s own dialogs', (
   })
 })
 
-describe('screenPollTickAllowed — one tick of the screen poll (audit main-6)', () => {
+describe('screenPollTickAllowed — one tick of the screen poll', () => {
   it('runs while the window is visible and focused', () => {
     expect(screenPollTickAllowed({ hidden: false, focused: true })).toBe(true)
   })

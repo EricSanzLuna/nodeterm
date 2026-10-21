@@ -360,7 +360,7 @@ export function loseWebglContexts(canvases: ArrayLike<HTMLCanvasElement> | null)
 }
 
 /**
- * Per-session WebGL loss telemetry (audit roadmap #6, tmux-2 / obs-5). Before this a GPU reset
+ * Per-session WebGL loss telemetry. Before this a GPU reset
  * left no trace: the terminals silently fell back to the DOM renderer and were re-granted, and
  * the only evidence was a user saying "the text went soft for a second". Each EXTERNAL loss now
  * writes one `[webgl]` warn — which main's `console-message` mirror carries into the debug log

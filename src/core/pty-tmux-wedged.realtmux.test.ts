@@ -1,9 +1,9 @@
-// A WEDGED tmux SERVER NO LONGER HOLDS BOOT (audit main-5), PROVEN AGAINST A REAL tmux CLIENT.
+// A WEDGED tmux SERVER NO LONGER HOLDS BOOT, PROVEN AGAINST A REAL tmux CLIENT.
 //
 // The unit suite (`pty-tmux-boot-timeout.test.ts`) pins that every boot-path call carries the
 // bound; whether the bound actually ends a real client stuck on a server that never answers is a
 // property of tmux and the kernel, so it is measured here. The "server" is a unix listener bound
-// where `-L node-terminal` resolves that accepts and then says nothing — the audit's repro, which
+// where `-L node-terminal` resolves that accepts and then says nothing — the original repro, which
 // held an unbounded client 4.05 s (the listener's whole lifetime). It works with main blocked in
 // `execFileSync`: the kernel completes the connect from the listen backlog, no JS has to run.
 //

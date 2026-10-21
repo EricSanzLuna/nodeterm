@@ -291,7 +291,7 @@ export function SessionMemoryPanel({
         nodeterm itself.
       </div>
 
-      {/* nodeterm's OWN processes (audit roadmap #4), below the attribution line on purpose: they
+      {/* nodeterm's OWN processes, below the attribution line on purpose: they
           are not a session and are NOT in the header total. The GPU helper is the reason this
           exists — `ps` said 96-153 MB while its footprint was 1557-1845 MB, mostly IOSurfaces (the
           window's swap chain and raster tiles, and the terminals' WebGL buffers), and no surface

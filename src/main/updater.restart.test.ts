@@ -75,7 +75,7 @@ vi.mock('./notifications', () => ({ retainUntilDismissed: () => {} }))
 
 import { initUpdater as initUpdaterReal, PREPARE_TIMEOUT_MS, type UpdaterHooks } from './updater'
 
-// electron-updater is loaded lazily with `require` (startup-6), which `vi.mock` does not reach, so
+// electron-updater is loaded lazily with `require`, which `vi.mock` does not reach, so
 // the double goes in through the loader seam instead of a module mock.
 const initUpdater = (hooks?: UpdaterHooks) =>
   initUpdaterReal(hooks, { loadUpdater: () => autoUpdater as unknown as import('electron-updater').AppUpdater })

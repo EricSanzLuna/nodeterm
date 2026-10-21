@@ -48,8 +48,8 @@ import { addKeyToAgent, type AgentAddResult } from './agent-add'
 /**
  * ssh2, loaded on first use. This module sits on main's module-scope import graph (via
  * native-runtime / native-invoke), so a top-level `import { Client } from 'ssh2'` evaluated ssh2 on
- * every launch, before Chromium's `ready`: 14–25 ms warm, ~680 ms in one cold-cache sample (audit startup-6 /
- * roadmap #34) — for a transport that only runs on Windows or with `NODETERM_NATIVE_SSH=1`. A plain
+ * every launch, before Chromium's `ready`: 14–25 ms warm, ~680 ms in one cold-cache sample — for a
+ * transport that only runs on Windows or with `NODETERM_NATIVE_SSH=1`. A plain
  * `require` stays a runtime require in both bundles: electron-vite externalises dependencies, and
  * `server:build` passes `--external:ssh2` (server-build.test.ts). Pinned by native-mux.lazy.test.ts.
  */

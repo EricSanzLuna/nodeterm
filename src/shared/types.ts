@@ -3159,11 +3159,11 @@ export interface MemInfo {
   psiFullAvg60?: number
   /**
    * What the RAM pill SHOWS beyond used/total. **Display only: never an input to the reaper, the
-   * memory-pressure monitor or a reclaim lever** (audit §5b invariant 1). It is a separate object,
+   * memory-pressure monitor or a reclaim lever**. It is a separate object,
    * rather than more top-level fields, so that rule is structural: `hostUnderMemoryPressure` reads
    * `swapTotalMb`/`swapFreeMb`, and filling THOSE on darwin would fire the reaper's swap term all
-   * day on a Mac that keeps its swap ~85% used as a matter of course (audit agent-trees-2/3: 16%
-   * swap free while healthy). Absent field = not measured, never zero.
+   * day on a Mac that can keep most of its swap in use for hours (16% swap free on the measured
+   * one). Absent field = not measured, never zero.
    */
   display?: MemDisplay
 }
@@ -3252,7 +3252,7 @@ export interface AppSelfGroup {
 }
 
 /**
- * The audit's roadmap #4: the GPU helper's real footprint (1557-1845 MB live, mostly IOSurfaces)
+ * The GPU helper's real footprint (1557-1845 MB live, mostly IOSurfaces)
  * was invisible because `ps` RSS says 96-153 MB and nothing attributed it. `ok:false` (no groups)
  * when the process list or the table could not be read, or no pid of ours was in it.
  */

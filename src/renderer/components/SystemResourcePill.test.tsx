@@ -230,13 +230,13 @@ describe('SystemResourcePill', () => {
     expect(panel?.classList.contains('sessmem-panel')).toBe(true)
   })
 
-  describe('swap and kernel pressure (roadmap #14, display-only)', () => {
+  describe('swap and kernel pressure (display-only)', () => {
     const pillText = (): string => host.querySelector('.sysres-pill')?.textContent ?? ''
     const title = (): string => host.querySelector('.sysres-pill')?.getAttribute('title') ?? ''
     const icon = (): string => host.querySelector<HTMLElement>('.sysres-pill__icon')?.style.color ?? ''
 
     it('shows swap in use beside the RAM figure, and used-of-total in the title', () => {
-      // The audited Mac: 7.7 GB of 9 GB swapped while the pill read only "86%".
+      // A measured Mac: 7.7 GB of 9 GB swapped while the pill read only "86%".
       mount({ ...MEM, display: { swapUsedMb: 7854, swapTotalMb: 9216 } })
       expect(pillText()).toContain('7.7 GB swap')
       expect(title()).toContain('swap 7.7 GB of 9.0 GB used')

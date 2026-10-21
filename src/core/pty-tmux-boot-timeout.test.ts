@@ -4,12 +4,12 @@ import { initPlatform, resetPlatformForTests } from './platform'
 import { fakePlatform } from './platform-fake'
 
 /**
- * THE BOOT-PATH tmux CALLS ARE BOUNDED (audit main-5).
+ * THE BOOT-PATH tmux CALLS ARE BOUNDED.
  *
  * `ensureTmux`'s `source-file` runs on the main thread before the first window exists, and
  * `ensureUpdateEnvKeys`' `show-options` / `set-option` run on a spawn. All three were
  * `execFileSync` with no timeout, so a tmux server that accepts the connection and never answers
- * held main for as long as it stayed wedged (4.05 s in the audit's repro — the listener's whole
+ * held main for as long as it stayed wedged (4.05 s in a repro — the listener's whole
  * lifetime). These pin the contract with an injected `execFileSync`: every call carries the bound,
  * a timeout is WARNED and fails open and starts a cooldown with no further spawn-path probe, and
  * the ordinary "no server yet" failure stays as silent as it always was. The real-tmux proof is

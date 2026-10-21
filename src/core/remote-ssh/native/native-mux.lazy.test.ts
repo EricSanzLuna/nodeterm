@@ -1,4 +1,4 @@
-// ssh2 must not load when the native transport is merely IMPORTED (audit startup-6 / roadmap #34).
+// ssh2 must not load when the native transport is merely IMPORTED.
 // native-runtime → native-mux sits on main's module-scope import graph, and main's module scope runs
 // before Chromium's `ready`: a top-level ssh2 import cost every launch 14–25 ms warm (~680 ms in one
 // cold-cache sample) for a transport that only runs on Windows or with NODETERM_NATIVE_SSH=1.

@@ -4,7 +4,7 @@ import { createTsWorkerReaper, TS_WORKER_STOP_GRACE_MS, type TsWorkerLanguage } 
 // The reaper's decision, driven the way monaco-setup.ts drives it: `live` stands in for
 // `editor.getModels()`, and — like Monaco's `onWillDisposeModel` — a model is still in `live`
 // when `modelLeft` fires and only removed after.
-describe('tsWorkerReaper (audit #18: stop the TS/JS worker once no TS/JS model remains)', () => {
+describe('tsWorkerReaper (stop the TS/JS worker once no TS/JS model remains)', () => {
   let live: string[]
   let stopped: TsWorkerLanguage[]
   let reaper: ReturnType<typeof createTsWorkerReaper>

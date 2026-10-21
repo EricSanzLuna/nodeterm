@@ -10,13 +10,13 @@
 // RSS at 63-200 MB against a 4096 MB threshold, the two legs above never fire on macOS, so the
 // renderer's reclaim levers (`releaseAllHiddenGrants` + the park drop) never ran while the window
 // was visible — #179 removed the timed hidden-context release on the promise that these would.
-// Measured (2026-10 GPU audit, dev build): the lever pair on 12 hidden warm terminals took the GPU
+// Measured (2026-10, dev build): the lever pair on 12 hidden warm terminals took the GPU
 // process footprint 331 → 152 MB and IOSurface 235 → 91 MB; panning back re-granted all 12.
 // This leg is deliberately NOT part of check()/onPressure:
 //  - it fires on TRANSITIONS into warn/critical only, never on a held level. The 60 s re-fire
 //    floor above at a held WARN (which a Mac can sit in for hours) would be #179's timed release
 //    again, pan-back flicker included. A level that FLAPS (normal, warn, normal, warn — the
-//    audited Mac moved between 1 and 2) is the same timed release by another route, so a run at
+//    measured Mac moved between 1 and 2) is the same timed release by another route, so a run at
 //    the same or a lower severity as the last one also waits out KERNEL_LEVER_GAP_MS; only an
 //    escalation above the last run's severity (warning → critical) fires inside the gap;
 //  - it never goes through hostMemReader/MemInfo, which the reaper's planReap shares — a kernel

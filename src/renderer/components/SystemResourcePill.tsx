@@ -134,12 +134,12 @@ export function SystemResourcePill({
     // The ICON carries the pressure reading now that the bar is gone: it tints as memory is
     // consumed, so a glance still says "this machine is tight" without the pill claiming a row of
     // the canvas. Same thresholds the bar used, raised (never lowered) by the kernel's pressure
-    // level where the OS reports one (audit roadmap #14).
+    // level where the OS reports one.
     const color = TINT[Math.max(percentSeverity(usedPercent), pressureSeverity(mem)) as Severity]
     const swap = mem.display
     // Swap is shown only when BOTH halves were measured (`display` is display-only: the reaper never
-    // reads it). On the audited Mac the pill said 86% "warn" with 8.5 GB swapped and nothing on
-    // screen said so (audit agent-trees-3). No figure when the read failed or the OS has none —
+    // reads it). On a measured Mac the pill said 86% "warn" with 8.5 GB swapped and nothing on
+    // screen said so. No figure when the read failed or the OS has none —
     // never "+0 GB"; a measured 0 with swap provisioned is a fact and only goes in the title.
     const swapShown =
       swap?.swapUsedMb !== undefined && swap.swapTotalMb !== undefined && swap.swapUsedMb > 0

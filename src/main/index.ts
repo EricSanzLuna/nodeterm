@@ -22,7 +22,7 @@ import { IPC } from '../shared/ipc'
 // in-memory and redacted at its push boundary; the panel/IPC side is gated on the setting.
 const logBuffer = new LogBuffer()
 installLogSink(logBuffer)
-// Process-death telemetry (audit roadmap #6, tmux-2 / obs-5): a GPU-process crash used to leave
+// Process-death telemetry: a GPU-process crash used to leave
 // no trace at all. Registered here, before 'ready', because the GPU process launches during boot
 // and can die there. LOG ONLY — Chromium respawns the GPU process itself; see process-health-log.ts.
 const childProcessGoneLine = createChildProcessGoneLog()
@@ -1398,8 +1398,8 @@ function createWindow(): BrowserWindow {
     })
   }
   const crashReload = createCrashReloadPolicy()
-  // Renderer hangs (audit roadmap #6): Electron declares one after its own input-ack timeout and
-  // clears it on the next ack. Paired into one line with a duration; logged, never acted on.
+  // Renderer hangs: Electron declares one after its own input-ack timeout and clears it on the
+  // next ack. One line when declared, one with the duration when it ends; logged, never acted on.
   const hangs = createHangTracker()
   win.on('unresponsive', () => {
     const line = hangs.unresponsive(Date.now())
@@ -3609,7 +3609,7 @@ app.whenReady().then(async () => {
     unmeasuredSessions: () => ptyManager.zellijSessionCount(),
     // Windows (no tmux): the session host's sessions; undefined where it is not the backend.
     sessionHost: () => ptyManager.sessionHostListing(),
-    // The panel's "nodeterm itself" group (audit roadmap #4): pids, types and CPU time only. Memory
+    // The panel's "nodeterm itself" group: pids, types and CPU time only. Memory
     // is NOT taken from here — on macOS `memory.workingSetSize` is resident size and misses the GPU
     // helper's IOSurfaces (footprint 1557-1845 MB vs 96-153 MB), and `privateBytes` is Windows-only;
     // core looks each pid up in the sweep's own footprint table instead. Called once per panel

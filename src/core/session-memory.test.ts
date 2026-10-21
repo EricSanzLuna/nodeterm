@@ -561,10 +561,10 @@ import {
   type AppProcessSample
 } from './session-memory'
 
-/** Captured live on the audited Mac, 2026-10-19 (`sysctl vm.swapusage`). */
+/** Captured live on a Mac, 2026-10-19 (`sysctl vm.swapusage`). */
 const SWAPUSAGE = 'vm.swapusage: total = 9216.00M  used = 7853.62M  free = 1362.38M  (encrypted)\n'
 
-describe('parseSwapUsage (darwin, roadmap #14)', () => {
+describe('parseSwapUsage (darwin)', () => {
   it('reads used and total from the live string, prefixed or not', () => {
     expect(parseSwapUsage(SWAPUSAGE)).toEqual({ swapUsedMb: 7854, swapTotalMb: 9216 })
     expect(parseSwapUsage(SWAPUSAGE.replace('vm.swapusage: ', ''))).toEqual({ swapUsedMb: 7854, swapTotalMb: 9216 })
@@ -582,7 +582,7 @@ describe('parseSwapUsage (darwin, roadmap #14)', () => {
   })
 })
 
-describe('parsePressureLevel (darwin, roadmap #14)', () => {
+describe('parsePressureLevel (darwin)', () => {
   it('maps xnu levels 1/2/4 and nothing else', () => {
     expect(parsePressureLevel('1')).toBe('normal')
     expect(parsePressureLevel('kern.memorystatus_vm_pressure_level: 2\n')).toBe('warn')
@@ -659,7 +659,7 @@ describe('darwinMemInfo display extras', () => {
   })
 })
 
-describe('appSelfMemory — "nodeterm itself" (roadmap #4)', () => {
+describe('appSelfMemory — "nodeterm itself"', () => {
   const S = (pid: number, type: string, cpuSeconds?: number): AppProcessSample => ({
     pid,
     type,

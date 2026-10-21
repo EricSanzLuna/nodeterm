@@ -444,7 +444,7 @@ export class SessionHostClient {
       /** The pause between connect polls (the pre-launch publication retries and the post-launch
        *  wait for the host). Absent = a real timer. Tests inject an immediate one: each failing
        *  connect waited out 30 × 150 ms = 4.5 s of real time, and the staged/startup-wait suites
-       *  spent ~35 s of CI doing nothing else (audit code-devx-4). Not fake timers: 94005975. */
+       *  spent ~35 s of CI doing nothing else. Not fake timers: 94005975. */
       connectPollSleep?: (ms: number) => Promise<void>
     }
   ) {}

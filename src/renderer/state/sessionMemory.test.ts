@@ -154,7 +154,7 @@ describe('failure semantics', () => {
   })
 })
 
-describe('"nodeterm itself" group (roadmap #4)', () => {
+describe('"nodeterm itself" group', () => {
   const APP = { ok: true, groups: [{ kind: 'gpu', count: 1, mb: 1600 }], totalMb: 1600 }
 
   it('carries the group from an answered sweep, and drops it when the sweep failed or the scope changed', async () => {

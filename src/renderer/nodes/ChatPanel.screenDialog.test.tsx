@@ -71,7 +71,7 @@ async function typeAndEnter(text: string): Promise<void> {
 }
 
 // jsdom's `hasFocus()` is false (nothing focused the test window), and the poll skips unfocused
-// windows (audit main-6) — so every test starts with a focused window, and the focus tests flip it.
+// windows — so every test starts with a focused window, and the focus tests flip it.
 let focused = true
 
 beforeEach(() => {

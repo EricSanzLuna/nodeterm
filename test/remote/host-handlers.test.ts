@@ -257,7 +257,7 @@ describe('createHostHandlers', () => {
     expect(pty.calls).toHaveLength(0)
   })
 
-  // Audit net-1 (REPORT §4.7): a paused node-pty emits NO further onData, so a resume that waits for
+  // A paused node-pty emits NO further onData, so a resume that waits for
   // "the next successful send" never comes and the phone's terminal froze for good after one >8 MB
   // burst. These tests deliver nothing after the pause — the drain sweep alone must resume it.
   describe('relay backpressure: the drain sweep resumes a paused stream', () => {

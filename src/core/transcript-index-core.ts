@@ -46,8 +46,8 @@ export function extractEntryFields(rawText: string): { cwd: string; title: strin
 // One case-insensitive matcher per query, shared by the filter and the snippet. The previous
 // `e.text.toLowerCase().includes(q)` built a lowered copy of every entry on every debounced
 // keystroke: on the user's 16 MB / 235-entry index that measured 20-52 ms and 7-15 MB of garbage
-// per search on the main thread; this RegExp measured 2-13 ms and 0 MB (audit #5, main-2/agents-2,
-// `main-process-bench/search.ts`). Storing a lowered copy instead would retain +32 MB — don't.
+// per search on the main thread; this RegExp measured 2-13 ms and 0 MB.
+// Storing a lowered copy instead would retain +32 MB — don't.
 //
 // `iu`, not `i`: neither flag reproduces `toLowerCase().includes` exactly, so the criterion is "no
 // match the old code found is lost". Over every BMP case pair, plain `i` disagreed 160 times and

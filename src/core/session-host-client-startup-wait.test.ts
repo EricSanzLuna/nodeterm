@@ -28,7 +28,7 @@ const emptyLock = (): never => {
 const tempDir = (): string => testTmpDir('nt-host-wait-')
 
 // The client's poll pause, injected so the 45- and 35-poll waits below cost no wall-clock: on the
-// real 150 ms timer this file took 12 s on CI (audit code-devx-4). Only the pause is replaced, not
+// real 150 ms timer this file took 12 s on CI. Only the pause is replaced, not
 // the loop, so the attempt counts these tests pin are exactly what production runs.
 const connectPollSleep = vi.fn(async (_ms: number) => {})
 const newClient = (): SessionHostClient =>

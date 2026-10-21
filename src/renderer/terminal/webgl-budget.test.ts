@@ -819,7 +819,7 @@ describe('loseWebglContexts', () => {
   })
 })
 
-describe('WebGL loss telemetry (audit roadmap #6)', () => {
+describe('WebGL loss telemetry', () => {
   let warn: ReturnType<typeof vi.spyOn>
   beforeEach(() => {
     vi.useFakeTimers()

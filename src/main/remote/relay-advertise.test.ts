@@ -1,4 +1,4 @@
-// Audit net-5 (REPORT §4.7): the standing host rewrote ~/.nodeterm/relay.json with identical
+// The standing host used to rewrite ~/.nodeterm/relay.json with identical
 // content on every ~90 s listener cycle. The advertiser now skips an unchanged write, but must still
 // rewrite when the content changes, when the file has gone, and after a remove. Every test runs
 // against a temp dir through the factory — never the live ~/.nodeterm.

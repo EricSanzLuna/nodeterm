@@ -71,7 +71,7 @@ export function shouldPollScreen(s: {
  * while the window is unfocused: a nodeterm window left visible on a second monitor is not hidden
  * by Chromium's definition, so the hidden gate alone kept every chat view spawning a `tmux
  * capture-pane` every 2 s — ~30 spawns a minute per open chat view — for a composer nobody could
- * type into (perf audit 2026-10, main-6 / roadmap #21). The panel re-ticks on `focus`, so the
+ * type into. The panel re-ticks on `focus`, so the
  * screen is re-read the moment someone can act on it, and a send re-checks the screen in core
  * (`pty.sendChatPrompt`) regardless, so skipping a tick never weakens dialog safety.
  *

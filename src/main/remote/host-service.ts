@@ -79,7 +79,7 @@ const FRESH_PROBE_BUDGET_MS = 750
  * Relay backpressure recovery for a paused phone stream. `sendFrame` refuses (and DROPS) a frame
  * once the socket holds more than 8 MB (`MAX_BINARY_BUFFERED_AMOUNT`); the host then pauses the
  * pty. A paused node-pty emits no `onData`, so a resume driven off "the next successful send" can
- * never happen — the audit (REPORT §4.7 net-1) found exactly that: after one >8 MB burst the phone's
+ * never happen — and it did not: after one >8 MB burst the phone's
  * terminal froze until it detached. The sweep is the drain trigger instead, mirroring
  * `core/ui-sink-registry.ts` (RESYNC_SWEEP_MS / WS_LOW_WATER: "never the next chunk as the drain
  * trigger"). It exists only while some stream is paused, so the healthy path pays nothing.

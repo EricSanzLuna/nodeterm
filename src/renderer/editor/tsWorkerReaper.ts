@@ -1,6 +1,6 @@
 // Stop Monaco's TypeScript / JavaScript worker once no model of that language is left.
 //
-// Why (audit roadmap #18, startup-4): in monaco-editor 0.57 the css/html/json WorkerManagers stop
+// Why: in monaco-editor 0.57 the css/html/json WorkerManagers stop
 // their worker after 2 min idle, but the TypeScript WorkerManager has NO idle path — it only stops
 // when its defaults fire `onDidChange` (or on dispose), and it is created with `keepIdleModels`.
 // So the first .ts/.tsx/.js file opened in an EditorNode or DiffNode starts a worker isolate holding
@@ -9,7 +9,6 @@
 // unmeasured). The supported way to stop one is a no-op `setCompilerOptions(getCompilerOptions())`:
 // `onDidChange` -> `WorkerManager._stopWorker()`, and the next request lazily starts a fresh worker
 // with the same options and extra libs (both live on the defaults, not the worker).
-// `noSemanticValidation` does NOT stop the worker (REPORT §4.9) — don't reach for it here.
 //
 // The decision is kept Monaco-free so it is testable in node: monaco-setup.ts passes the real
 // model list and the real stop; tests pass fakes and fake timers.

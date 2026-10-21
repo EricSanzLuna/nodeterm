@@ -246,8 +246,8 @@ function runDarwinSysctl(names: string[]): string {
 }
 
 /**
- * Parse `sysctl vm.swapusage` (with or without the `vm.swapusage:` prefix). Live shape on the
- * audited Mac (2026-10-19):
+ * Parse `sysctl vm.swapusage` (with or without the `vm.swapusage:` prefix). Live shape on a
+ * measured Mac (2026-10-19):
  *   vm.swapusage: total = 9216.00M  used = 7853.62M  free = 1362.38M  (encrypted)
  * `K`/`M`/`G` are accepted; an unknown suffix or a missing half yields NOTHING rather than a guessed
  * scale. `total = 0.00M` is a real answer (no swap file yet) and passes through as 0.
@@ -270,7 +270,7 @@ export function parseSwapUsage(text: string): Pick<MemDisplay, 'swapUsedMb' | 's
 }
 
 /** `kern.memorystatus_vm_pressure_level`: 1 NORMAL, 2 WARN, 4 CRITICAL (xnu's
- *  kVMPressureNormal/Warning/Critical; 2 observed live while the audit's Mac had 7.5-8.7 GB
+ *  kVMPressureNormal/Warning/Critical; 2 observed live while a measured Mac had 7.5-8.7 GB
  *  swapped). Anything else is undefined — never mapped to "normal". */
 export function parsePressureLevel(text: string): MemDisplay['pressureLevel'] {
   const m = /(?:^|:\s*)(\d+)\s*$/.exec(text.trim())
@@ -682,7 +682,7 @@ export function hostOverhead(
  *
  * Memory is DELIBERATELY not taken from `getAppMetrics()`. On macOS neither field tracks
  * phys_footprint: `memory.workingSetSize` is resident size, as blind to IOSurfaces as `ps` rss
- * (audit tmux-2/obs-1 — the GPU helper's 1557-1845 MB footprint shows as 96-153 MB there), and
+ * (the GPU helper's 1557-1845 MB footprint shows as 96-153 MB there), and
  * `memory.privateBytes` is Windows-only. The pid is looked up in the panel sweep's own process
  * table instead, so the group uses exactly the accounting the session rows use, with no extra
  * `top` (~0.5 s per call, measured).
@@ -708,7 +708,7 @@ export function appProcessKind(type: string): AppProcessKind {
 const APP_KIND_ORDER: readonly AppProcessKind[] = ['gpu', 'renderer', 'main', 'helper']
 
 /**
- * Build the "nodeterm itself" group from the sweep's table. Rules (audit §5b invariants 2 and 3):
+ * Build the "nodeterm itself" group from the sweep's table. Rules:
  *  - a null process list or table → `ok:false`, never an empty-but-ok group;
  *  - darwin: a pid counts as measured only if `top` gave its footprint (`ProcEntry.footprint`).
  *    The rss fallback the session rows tolerate is the very number this group exists to replace;
@@ -917,7 +917,7 @@ export async function collectSessionMemory(
   if (answered === 0) return { ok: false, rows: [], mem }
   const report = buildReport([...bySession.values()], table, mem)
   // Same table, no second read: on darwin it already carries `top`'s footprint for EVERY pid,
-  // Electron's included (audit §5b: reuse the sweep, the pill never polls `top`).
+  // Electron's included (reuse the sweep; the pill never polls `top`).
   if (!deps.appProcesses) return report
   return { ...report, app: appSelfMemory(sampleApp(deps.appProcesses), table, process.platform) }
 }

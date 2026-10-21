@@ -307,7 +307,7 @@ const PROBE_TIMEOUT_MS = 6_000
  * `ensureUpdateEnvKeys`' `show-options` / `set-option`). They block the main thread, and one runs
  * before `createWindow`: against a tmux server that accepts the connection but never answers
  * (stuck on a blocked client write, or SIGSTOPped) an unbounded call froze main with no window
- * and no error — the 2026-10 audit (main-5) reproduced a client held 4.05 s, exactly the wedged
+ * and no error — a 2026-10 repro held a client 4.05 s, exactly the wedged
  * listener's lifetime, i.e. forever against a server that never recovers. A healthy server
  * answers these in milliseconds, so 2 s only ever fires on a wedge. `vm_stat` already has 5 s.
  */
@@ -2055,7 +2055,7 @@ export class PtyManager {
     // The tmux server outlives the app, so it won't re-read `-f` on relaunch. Push the
     // (possibly updated) config into a running server now so new bindings apply immediately;
     // a no-op error when no server exists yet (the next session loads it fresh via `-f`).
-    // Bounded: this runs before the first window exists (audit main-5). A timeout keeps tmux
+    // Bounded: this runs before the first window exists. A timeout keeps tmux
     // resolved — only the config push is skipped, and runTmuxSync has already logged it.
     this.runTmuxSync(['source-file', this.confPath], false)
   }

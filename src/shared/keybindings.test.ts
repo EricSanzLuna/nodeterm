@@ -151,7 +151,7 @@ describe('registry invariants', () => {
         darwin: ['Cmd+ArrowUp'], other: ['Ctrl+Shift+ArrowUp'], allowInTerminal: true },
       { id: 'node.focusDown', title: 'Focus node below', group: 'Nodes', scope: 'canvas',
         darwin: ['Cmd+ArrowDown'], other: ['Ctrl+Shift+ArrowDown'], allowInTerminal: true },
-      // Pool only (audit roadmap #19): no default chord on either platform.
+      // Pool only: no default chord on either platform.
       { id: 'node.nextNeedingYou', title: 'Go to next agent needing you', group: 'Nodes',
         scope: 'canvas', darwin: [], other: [], allowInTerminal: true },
       { id: 'node.maximize', title: 'Maximize / restore node', group: 'Nodes', scope: 'canvas',

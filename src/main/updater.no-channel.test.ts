@@ -65,7 +65,7 @@ vi.mock('./notifications', () => ({ retainUntilDismissed: () => {} }))
 
 import { describeCheckFailure, initUpdater as initUpdaterReal, lastUpdateCheck, type UpdaterHooks } from './updater'
 
-// electron-updater is loaded lazily with `require` (startup-6), which `vi.mock` does not reach, so
+// electron-updater is loaded lazily with `require`, which `vi.mock` does not reach, so
 // the double goes in through the loader seam instead of a module mock.
 const initUpdater = (hooks?: UpdaterHooks) =>
   initUpdaterReal(hooks, { loadUpdater: () => autoUpdater as unknown as import('electron-updater').AppUpdater })
@@ -336,7 +336,7 @@ describe('restart-to-update elsewhere', () => {
 })
 
 /**
- * Audit startup-6 / roadmap #34: electron-updater is no longer required at main's module scope
+ * electron-updater is no longer required at main's module scope
  * (32–47 ms warm, before Chromium's `ready`, on every launch). It is loaded only on a path that uses
  * it, and the IPC handlers stay registered first whatever the build: the renderer invokes them on
  * mount, and an invoke with no handler rejects.

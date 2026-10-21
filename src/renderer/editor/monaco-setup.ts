@@ -19,7 +19,7 @@ self.MonacoEnvironment = {
   }
 }
 
-// The TS/JS worker never idles out on its own (audit #18, startup-4): stop it once the last
+// The TS/JS worker never idles out on its own: stop it once the last
 // TS/JS model is gone. `monaco.typescript` is the 0.57 namespace; `monaco.languages.typescript`
 // is a deprecated stub there. See tsWorkerReaper.ts for the mechanism and the grace period.
 const tsDefaults = {

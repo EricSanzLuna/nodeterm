@@ -34,7 +34,7 @@ export interface SessionMemoryServiceOptions {
   /** Host RAM reader, injectable for tests. Defaults to the real `/proc/meminfo` read. */
   readMem?: () => MemInfo | null
   /**
-   * nodeterm's own processes, for the panel's "nodeterm itself" group (audit roadmap #4). Only the
+   * nodeterm's own processes, for the panel's "nodeterm itself" group. Only the
    * desktop shell has them (`app.getAppMetrics()`); the Server Edition omits it, and its reports
    * then carry no `app` — "not available", which is not "could not measure". Consulted for LOCAL
    * sweeps only: an SSH host's report must never include this machine's processes.

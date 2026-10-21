@@ -1,4 +1,4 @@
-// Source-level pin (audit startup-6 / roadmap #34): `ssh2` and `electron-updater` are never
+// Source-level pin: `ssh2` and `electron-updater` are never
 // VALUE-imported by shipped main/core/shared/server code. Main's module scope runs before Chromium's
 // `ready`, and the two used to cost every launch 14–25 ms (ssh2) + 32–47 ms (electron-updater) warm
 // there. Each now loads at first use — `ssh2()` in native-mux.ts, `UpdaterDeps.loadUpdater` in

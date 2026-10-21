@@ -686,7 +686,7 @@ export function ChatPanel({
   // Re-read the pane's screen while the view is visible (see `screenBlock`). A read that fails or
   // finds a blank screen changes nothing: unknown is not evidence either way.
   // Ticks are skipped while the window is unfocused (`screenPollTickAllowed`: ~30 tmux spawns a
-  // minute per chat view otherwise, audit main-6), and coming back — `focus`, or the page turning
+  // minute per chat view otherwise), and coming back — `focus`, or the page turning
   // visible — re-reads at once, so a dialog that opened meanwhile is on screen before anyone types.
   useEffect(() => {
     if (!pollScreen) {

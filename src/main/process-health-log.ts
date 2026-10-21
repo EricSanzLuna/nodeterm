@@ -1,4 +1,4 @@
-// Process-death and hang telemetry for the debug log ring (audit roadmap #6, tmux-2 / obs-5).
+// Process-death and hang telemetry for the debug log ring.
 //
 // Before this, the only process-death handler was the main window's `render-process-gone`, and
 // it logged nothing: a GPU-process crash, a utility-process OOM or a multi-second renderer hang
@@ -9,7 +9,7 @@
 //
 // OBSERVE, NEVER ACT. Nothing here reloads, relaunches or kills anything. Chromium respawns a
 // dead GPU process itself; relaunching on top of that would turn a recoverable GPU reset into a
-// lost session (and the audit's tmux-4 note: repeated GPU deaths can trip Chromium's per-domain
+// lost session (and repeated GPU deaths can trip Chromium's per-domain
 // 3D-API block "until restart", so anything that provokes more of them degrades the session).
 //
 // Electron-free on purpose (structural types only) so it unit-tests without an Electron runtime.
@@ -34,7 +34,7 @@ export interface ChildProcessGoneDetails {
  * Format app 'child-process-gone' and count it per process type for the session. Returns a
  * stateful formatter so the count lives with the app, not in a module global a test would leak.
  *
- * Only `{type, reason, exitCode, name}` — the audit's field list. `name` / `serviceName` are
+ * Only `{type, reason, exitCode, name}`. `name` / `serviceName` are
  * Chromium's fixed service labels ("Audio Service", "Network Service"), never a path or argv.
  *
  * Level: a `clean-exit` is Chromium tearing down a utility process it no longer needs — routine,

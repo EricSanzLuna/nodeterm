@@ -80,7 +80,7 @@ describe('searchEntries', () => {
   })
 })
 
-describe('searchEntries matching (RegExp iu, audit #5)', () => {
+describe('searchEntries matching (RegExp iu)', () => {
   const one = (text: string, title = 'x'): TranscriptIndexEntry[] => [
     { sessionId: 's', transcriptPath: '/p/s.jsonl', cwd: '/c', mtime: 1, title, text }
   ]

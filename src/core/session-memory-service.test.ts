@@ -394,7 +394,7 @@ describe('mergeLocalLegs', () => {
   })
 })
 
-describe('startSessionMemoryService — "nodeterm itself" (roadmap #4)', () => {
+describe('startSessionMemoryService — "nodeterm itself"', () => {
   const MEM = { availableMb: 8000, totalMb: 16000 }
   const listing = {
     running: true,

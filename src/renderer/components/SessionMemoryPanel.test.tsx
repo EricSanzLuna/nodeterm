@@ -483,7 +483,7 @@ describe('SessionMemoryPanel', () => {
     })
   })
 
-  describe('"nodeterm itself" (roadmap #4)', () => {
+  describe('"nodeterm itself"', () => {
     const APP = {
       ok: true,
       groups: [

@@ -8,7 +8,7 @@
 import { app, autoUpdater as nativeUpdater, ipcMain, Notification } from 'electron'
 import fs from 'fs'
 import path from 'path'
-// electron-updater is NOT imported at module scope (audit startup-6 / roadmap #34): main's module
+// electron-updater is NOT imported at module scope: main's module
 // scope runs before Chromium's `ready`, and requiring electron-updater there measured 32–47 ms warm
 // on every launch — including dev and `no-channel` builds that never touch it. It is loaded by
 // `initUpdater` (after createWindow) only on a path that uses it; see `UpdaterDeps`. Type-only here.

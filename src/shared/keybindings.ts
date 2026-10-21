@@ -246,8 +246,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     defaultBindings: { darwin: ['Cmd+ArrowDown'], other: ['Ctrl+Shift+ArrowDown'] },
     allowInTerminal: true },
   // Travel to the agent that has waited longest for you (waiting/blocked), across projects; each
-  // press steps to the next one (audit roadmap #19 / qol-2: one chord instead of 3-5 clicks
-  // through the sidebar). Ships UNBOUND — every obvious chord already has an owner, and a default
+  // press steps to the next one, without going through the sidebar. Ships UNBOUND — every obvious chord already has an owner, and a default
   // would steal it from a user who never asked. Scope 'canvas' + allowInTerminal for the
   // node.focus* reason: the hand that wants to move is in a terminal, and over the kanban board
   // there is no canvas to land on. The queue is built on demand per press (lib/nextNeedingYou).

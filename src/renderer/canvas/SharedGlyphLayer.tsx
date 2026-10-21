@@ -1551,7 +1551,7 @@ export function setSharedGlyphCamera(cam: Camera): void {
  * Including the OMNI board (`isGlobalKanbanOpen`, which already folds in the feature flag): it is
  * the same opaque full-page overlay, and Canvas's `kanbanOpen` is `globalKanbanOpen ||
  * perProjectKanbanOpen`. Leaving it out kept the shared canvas drawing under the all-projects
- * board — the same omission 12564a20 fixed for the window-activation focus restore (audit GT-6).
+ * board — the same omission 12564a20 fixed for the window-activation focus restore.
  * Like Canvas's own term, Omni needs no active project.
  */
 export function boardCoversCanvas(): boolean {

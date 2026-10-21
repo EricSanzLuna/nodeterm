@@ -87,7 +87,7 @@ describe('totalMb', () => {
   })
 })
 
-describe('"nodeterm itself" labels (roadmap #4)', () => {
+describe('"nodeterm itself" labels', () => {
   it('names each group, with a count only when there is more than one', () => {
     expect(appGroupLabel({ kind: 'gpu', count: 1 })).toBe('GPU')
     expect(appGroupLabel({ kind: 'renderer', count: 2 })).toBe('Renderers ×2')

@@ -27,8 +27,8 @@ export interface RelayAdvertisement {
 
 /**
  * The advertisement writer for one file. The standing host calls `write` on EVERY successful
- * listener open — every ~90 s, 24/7, with byte-identical content (audit REPORT §4.7 net-5 measured
- * the mtime refreshing each cycle: ~960 mkdir + temp-write + rename a day for nothing). So an
+ * listener open — every ~90 s, 24/7, with byte-identical content (measured: the mtime
+ * refreshing each cycle, ~960 mkdir + temp-write + rename a day for nothing). So an
  * unchanged advertisement is skipped: the last string we wrote is kept in memory, and the file is
  * rewritten only when the content changes or the file has gone (a user or another tool deleted it —
  * one stat per cycle is what that costs). `remove` forgets it, so the next start always writes.

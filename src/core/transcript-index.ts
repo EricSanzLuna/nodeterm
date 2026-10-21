@@ -135,7 +135,7 @@ export function loadPersistedIndex(file: string): TranscriptIndexEntry[] {
  *
  * It was a bare `writeFile` of ~16 MB every 5 minutes while agents are active. A crash or power
  * loss mid-write left truncated JSON, which loads as an empty index and forces a cold rescan —
- * measured at ~779 MB read and ~3.2 s (audit #7, main-3/agents-3/persistence-io-2). Temp + rename
+ * measured at ~779 MB read and ~3.2 s. Temp + rename
  * means a reader sees the old index or the new one, never half of either. Mode 0600 because the
  * file holds transcript text (it was 0644).
  */

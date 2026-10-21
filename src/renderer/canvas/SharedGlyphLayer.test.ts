@@ -1244,7 +1244,7 @@ describe('createPixelRatioWatcher', () => {
  */
 describe('boardCoversCanvas', () => {
   // The predicate the board frame gate and the blink clock read. It must say "covered" for BOTH
-  // full-page boards, because Canvas's `kanbanOpen` does: the Omni board was missing (audit GT-6),
+  // full-page boards, because Canvas's `kanbanOpen` does: the Omni board was missing,
   // so the shared canvas kept drawing under the all-projects board.
   const setOmni = (enabled: boolean): void => {
     useSettings.setState((s) => ({ settings: { ...s.settings, omniKanbanEnabled: enabled } }))

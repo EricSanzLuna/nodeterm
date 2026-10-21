@@ -24,7 +24,7 @@ beforeEach(() => {
 })
 
 // Each failing connect polls 30 × 150 ms for a host that never appears (the launcher is mocked).
-// On the real clock that was 4.5 s per connect and 22.6 s for this file on CI (audit code-devx-4);
+// On the real clock that was 4.5 s per connect and 22.6 s for this file on CI;
 // the pause is injected instead, so the loop still runs every attempt of its budget.
 const connectPollSleep = vi.fn(async (_ms: number) => {})
 const newClient = (
