@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import { needsYouQueue, nextNeedingYou, type NeedsYouProject } from './nextNeedingYou'
+import {
+  needsYouQueue,
+  nextNeedingYou,
+  noAgentWaitingNotice,
+  waitingBeforeRestart,
+  type NeedsYouProject
+} from './nextNeedingYou'
 import type { AgentNodeStatus } from '../state/agentStatus'
 
 const node = (id: string, title = id) => ({ id, kind: 'terminal' as const, title, color: '#888' })
@@ -83,5 +89,47 @@ describe('nextNeedingYou', () => {
 
   it('is null on an empty queue', () => {
     expect(nextNeedingYou([], 'x', 'x')).toBeNull()
+  })
+})
+
+describe('after a restart: agents last seen waiting, with nothing reported since', () => {
+  // Live state is transient: right after a relaunch every agent reads unknown, and one already
+  // sitting at a prompt sends no new hook. Only the persisted `lastSeen` clock comes back.
+  const restored = (state: AgentNodeStatus['state']): AgentNodeStatus => ({
+    unread: false,
+    lastSeen: { at: 1000, state, restored: true }
+  })
+
+  it('counts the restored waiting/blocked clocks, not the queue', () => {
+    const status: Record<string, AgentNodeStatus> = {
+      a1: restored('waiting'),
+      a2: restored('blocked'),
+      a3: restored('done'),
+      b1: restored('working'),
+      c1: restored('waiting')
+    }
+    expect(needsYouQueue(projects(), null, 'p1', status)).toEqual([])
+    expect(waitingBeforeRestart(projects(), null, 'p1', status)).toBe(3)
+  })
+
+  it('a clock from THIS run, a live state, or a closed project does not count', () => {
+    const ps = projects()
+    ps[2].closed = true
+    const status: Record<string, AgentNodeStatus> = {
+      a1: { unread: false, lastSeen: { at: 5, state: 'waiting' } }, // seen this run, not restored
+      a2: { ...restored('waiting'), state: 'working', lastEventAt: 9 }, // it reported since
+      c1: restored('waiting') // its project is closed, like the queue's membership
+    }
+    expect(waitingBeforeRestart(ps, null, 'p1', status)).toBe(0)
+  })
+
+  it('says why the queue is empty instead of "no agent is waiting"', () => {
+    expect(noAgentWaitingNotice(0)).toBe('No agent is waiting for you.')
+    expect(noAgentWaitingNotice(1)).toBe(
+      'No agent has reported waiting since the restart (1 was waiting before it).'
+    )
+    expect(noAgentWaitingNotice(4)).toBe(
+      'No agent has reported waiting since the restart (4 were waiting before it).'
+    )
   })
 })

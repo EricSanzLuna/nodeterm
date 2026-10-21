@@ -1,10 +1,9 @@
-// "Go to next agent needing you" (`node.nextNeedingYou`, audit roadmap #19 / qol-2): one chord
-// instead of the 3-5 clicks it took to reach a waiting agent in another project (open the sidebar,
-// find the project, find the row, click; more when the project is collapsed).
+// "Go to next agent needing you" (`node.nextNeedingYou`): one chord to reach a waiting agent in
+// another project, instead of opening the sidebar, finding the project and the row, and clicking.
 //
 // Pure, so the ordering and the cycle are unit-tested here (vitest runs in the node environment,
 // no jsdom). Canvas calls this ON DEMAND, once per keypress or palette open, reading the stores
-// with `getState()` — it must NEVER subscribe to `statusById` for this: every working/waiting flip
+// with `getState()` — it must NEVER subscribe to the status store's `byId` for this: every working/waiting flip
 // would re-render the whole canvas (see `StatusAwareMiniMap`'s header in Canvas.tsx).
 
 import type { AgentNodeStatus } from '../state/agentStatus'
@@ -51,6 +50,38 @@ export function needsYouQueue(
       return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
     })
     .map((r) => r.id)
+}
+
+/**
+ * Agents the queue cannot claim but the user may expect to find in it: live state UNKNOWN (no hook
+ * event since the app started) with a restored `lastSeen` clock that last said `waiting` or
+ * `blocked`. Right after a restart that is every agent still sitting at its prompt — it sends no
+ * new hook until answered — so the honest empty-queue answer counts them rather than saying no
+ * agent is waiting. Same membership as `needsYouQueue` (non-closed projects, travelable rows).
+ */
+export function waitingBeforeRestart(
+  projects: readonly NeedsYouProject[],
+  liveActiveNodes: SessionNodeInput[] | null,
+  activeProjectId: string,
+  statusById: Record<string, AgentNodeStatus>
+): number {
+  const open = projects.filter((p) => !p.closed)
+  return buildStatusList(open, liveActiveNodes, activeProjectId, statusById, '')
+    .flatMap((s) => s.rows)
+    .filter(
+      (r) =>
+        r.statusKind === 'unknown' &&
+        r.statusClock === 'restored' &&
+        (r.lastSeenState === 'waiting' || r.lastSeenState === 'blocked') &&
+        nodeTravel(projects, activeProjectId, r.id).kind !== 'blocked'
+    ).length
+}
+
+/** The notice for an empty queue; `beforeRestart` is `waitingBeforeRestart`'s count. */
+export function noAgentWaitingNotice(beforeRestart: number): string {
+  if (beforeRestart === 0) return 'No agent is waiting for you.'
+  const verb = beforeRestart === 1 ? 'was' : 'were'
+  return `No agent has reported waiting since the restart (${beforeRestart} ${verb} waiting before it).`
 }
 
 /**

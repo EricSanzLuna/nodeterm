@@ -300,7 +300,12 @@ import { conductorPrompt } from '../lib/spawnTeamPrompt'
 import { NotifyConsentDialog } from '../components/NotifyConsentDialog'
 import { SessionsSidebar } from '../components/SessionsSidebar'
 import type { SessionNodeInput } from '../lib/sessionList'
-import { needsYouQueue, nextNeedingYou } from '../lib/nextNeedingYou'
+import {
+  needsYouQueue,
+  nextNeedingYou,
+  noAgentWaitingNotice,
+  waitingBeforeRestart
+} from '../lib/nextNeedingYou'
 import { liveProjectJumpTarget, projectJumpDigit } from '../lib/projectJump'
 import {
   liveZoomShortcutAction,
@@ -10494,16 +10499,16 @@ export function Canvas() {
   }, [sessionsPinned, sessionsDismissed, explorerOpen, explorer.pinned, fitMaximizedToUsableArea])
 
   /**
-   * "Go to next agent needing you" (`node.nextNeedingYou`, ⌘K; audit roadmap #19 / qol-2): one
-   * chord instead of the 3-5 sidebar clicks a waiting agent in another project took. The queue is
-   * built ON DEMAND from `getState()` reads — Canvas never subscribes to `statusById` (every
-   * working/waiting flip would re-render the whole canvas; see StatusAwareMiniMap). The cycle
+   * "Go to next agent needing you" (`node.nextNeedingYou`, ⌘K): one chord to a waiting agent in
+   * another project. The queue is built ON DEMAND from `getState()` reads — Canvas never
+   * subscribes to the status store's `byId` (every working/waiting flip would re-render the whole
+   * canvas; see StatusAwareMiniMap). The cycle
    * cursor is memory only: a restart starts again at the oldest wait, which is the right answer.
    * Travel is `travelToNodeRef` (declared above this point; the callback itself is defined much
    * further down) so a closed-project hop keeps travelToNode's hosted-team reopen guard.
    */
   const needsYouCursorRef = useRef<string | null>(null)
-  const needsYouQueueNow = useCallback((): string[] => {
+  const needsYouInputs = useCallback(() => {
     const { projects, activeProjectId: active } = useProjects.getState()
     // The live canvas only when it is the ACTIVE project's (the epoch pair): mid-switch nodesRef
     // still holds the outgoing project's nodes. Live adds a just-created node the store has not
@@ -10519,8 +10524,9 @@ export function Canvas() {
               color: n.data.color ?? '#888'
             }))
         : null
-    return needsYouQueue(projects, live, active, useAgentStatus.getState().byId)
+    return [projects, live, active, useAgentStatus.getState().byId] as const
   }, [nodesRef, nodesProjectIdRef])
+  const needsYouQueueNow = useCallback((): string[] => needsYouQueue(...needsYouInputs()), [needsYouInputs])
   const goToNextNeedingYou = useCallback((): void => {
     const target = nextNeedingYou(
       needsYouQueueNow(),
@@ -10530,13 +10536,14 @@ export function Canvas() {
     if (!target) {
       // Claimed even when empty: from a focused terminal xterm has already withheld the chord
       // (terminalChordBubbles), so declining would not hand it back — it would only make a chord
-      // the user bound on purpose do nothing, silently.
-      setNotice({ kind: 'info', text: 'No agent is waiting for you.' })
+      // the user bound on purpose do nothing, silently. After a restart an agent already at its
+      // prompt sends no new hook, so the notice says how many were waiting before it.
+      setNotice({ kind: 'info', text: noAgentWaitingNotice(waitingBeforeRestart(...needsYouInputs())) })
       return
     }
     needsYouCursorRef.current = target
     travelToNodeRef.current(target)
-  }, [needsYouQueueNow])
+  }, [needsYouQueueNow, needsYouInputs])
 
   /**
    * Zone snap (issue #394 v1): place `nodeId` (or the placement target, for the keyboard chords)
