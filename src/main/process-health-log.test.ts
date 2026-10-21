@@ -73,6 +73,17 @@ describe('createHangTracker', () => {
     expect(t.responsive(4000)).toBeNull()
   })
 
+  it('a renderer that died while hung closes the hang: its successor\'s hang is a new one', () => {
+    const t = createHangTracker()
+    t.unresponsive(1000)
+    t.reset() // render-process-gone: the hung page is gone, and the reload is a fresh renderer
+    // No 'responsive' will ever answer the dead page; one that arrives is not its duration.
+    expect(t.responsive(9000)).toBeNull()
+    // The new page hanging is logged, not swallowed as a repeat of the dead page's hang.
+    expect(t.unresponsive(10_000)?.msg).toContain('hang #2')
+    expect(t.responsive(12_000)?.msg).toContain('after 2000 ms')
+  })
+
   it('numbers successive hangs, and never reports a negative duration on a clock step back', () => {
     const t = createHangTracker()
     t.unresponsive(1000)

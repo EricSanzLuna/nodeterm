@@ -68,6 +68,9 @@ export interface HangTracker {
   unresponsive(now: number): HealthLine | null
   /** BrowserWindow 'responsive'. Returns the line to log, or null if we never saw it hang. */
   responsive(now: number): HealthLine | null
+  /** The renderer died ('render-process-gone'): an open hang ends unmeasured. The session's hang
+   *  count is kept. */
+  reset(): void
 }
 
 /**
@@ -98,6 +101,12 @@ export function createHangTracker(): HangTracker {
         level: 'warn',
         msg: `window responsive again after ${ms} ms (counted from Electron's hang timeout, so the real stall was longer) — hang #${hangs}`
       }
+    },
+    reset() {
+      // A hung page that dies never acks again, so without this the reloaded page's first hang
+      // would read as a repeat of the dead one, and its 'responsive' would report a duration
+      // spanning the crash.
+      since = null
     }
   }
 }

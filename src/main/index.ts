@@ -1413,6 +1413,8 @@ function createWindow(): BrowserWindow {
     // The ring's only record that the page died — the reload below wipes the renderer's own console.
     const gone = formatRenderProcessGone(details)
     console[gone.level](`[process] ${gone.msg}`)
+    // A hang open on the dead page ends with it; the reloaded page's first hang is a new one.
+    hangs.reset()
     ptyManager.dropClient(presenceId)
     // A dead renderer sends no disarm and no focus-lost report. The reloaded page mounts no
     // recorder and no terminal, so without this the user would come back to an app where ⌘W does
