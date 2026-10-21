@@ -3,6 +3,7 @@ import type { BridgeLink, CanvasNodeState, ProjectKanban } from '@shared/types'
 import { AGENT_CONFIG, BUILTIN_AGENT_IDS, type AgentId } from '@shared/agents/config'
 import { useProjects } from '../../state/projects'
 import { useSettings } from '../../state/settings'
+import { useAgentStatus } from '../../state/agentStatus'
 import { useBoardWallpaperStyle } from '../../state/wallpaper'
 import {
   addColumn, assignNode, assignedTo, boardLabels, cardMatchesLabelFilter, cardMeta, columnForNode,
@@ -424,7 +425,11 @@ export const GlobalKanbanView = memo(function GlobalKanbanView({ live = null, on
     setModal(nodeId ? { projectId, nodeId, view } : null)
   }, [])
   const modalNodeId = modal?.nodeId ?? null
-  useEffect(() => { onModalNodeChange?.(modalNodeId) }, [modalNodeId, onModalNodeChange])
+  // Same rule as the per-project board: opening a card marks its completion read.
+  useEffect(() => {
+    onModalNodeChange?.(modalNodeId)
+    if (modalNodeId) useAgentStatus.getState().clearUnread(modalNodeId)
+  }, [modalNodeId, onModalNodeChange])
   // Closing the overview with a card open must not leave the node "watched" forever.
   const onModalNodeChangeRef = useRef(onModalNodeChange)
   onModalNodeChangeRef.current = onModalNodeChange
