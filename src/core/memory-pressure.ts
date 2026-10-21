@@ -15,7 +15,10 @@
 // This leg is deliberately NOT part of check()/onPressure:
 //  - it fires on TRANSITIONS into warn/critical only, never on a held level. The 60 s re-fire
 //    floor above at a held WARN (which a Mac can sit in for hours) would be #179's timed release
-//    again, pan-back flicker included;
+//    again, pan-back flicker included. A level that FLAPS (normal, warn, normal, warn — the
+//    audited Mac moved between 1 and 2) is the same timed release by another route, so a run at
+//    the same or a lower severity as the last one also waits out KERNEL_LEVER_GAP_MS; only an
+//    escalation above the last run's severity (warning → critical) fires inside the gap;
 //  - it never goes through hostMemReader/MemInfo, which the reaper's planReap shares — a kernel
 //    WARN must not become a byte watermark the reaper culls detached sessions on (#135/#136/#137);
 //  - it reports through its own callback, so a shell decides separately whether a kernel CRITICAL
@@ -31,6 +34,10 @@ export const PRESSURE_INTERVAL_MS = 30_000
 export const RE_FIRE_FLOOR_MS = 60_000
 export const SELF_RSS_WARN_MB = 4096
 export const SELF_RSS_CRIT_MB = 8192
+/** Minimum time between two kernel-leg lever runs at the same or a lower severity. Each fall to
+ *  `normal` re-arms the leg, so without it a level alternating normal/warn would release every
+ *  hidden WebGL context and drop the parks about once a minute. */
+export const KERNEL_LEVER_GAP_MS = 10 * 60_000
 
 /** macOS's own pressure level, as `kern.memorystatus_vm_pressure_level` reports it. */
 export type KernelPressureLevel = 'normal' | 'warn' | 'critical'
@@ -113,8 +120,9 @@ export function createMemoryPressureMonitor(opts: {
   /** The kernel-level reader; defaults to `kernelPressureReader()` (absent off darwin). `null`
    *  switches the leg off. */
   readKernelLevel?: (() => KernelPressureLevel | null) | null
-  /** Fired once per ESCALATION of the kernel level (normal→warn, →critical), never on a held or
-   *  falling level. No callback ⇒ the leg is not sampled at all. */
+  /** Fired on an ESCALATION of the kernel level (normal→warn, →critical), never on a held or
+   *  falling level, and at the same or a lower severity than the last run only once
+   *  KERNEL_LEVER_GAP_MS has passed since it. No callback ⇒ the leg is not sampled at all. */
   onKernelPressure?: (s: PressureSeverity) => void
   log?: (m: string) => void
 }): MemoryPressureMonitor {
@@ -134,6 +142,9 @@ export function createMemoryPressureMonitor(opts: {
   // Starting at `normal` is what makes a healthy Mac silent (no transition to report) and what
   // makes a launch INTO an already-pressured machine fire once.
   let kernelHeld: KernelPressureLevel = 'normal'
+  // The last kernel-leg lever run: when, and at which level. Only a run moves these.
+  let kernelRanAt: number | null = null
+  let kernelRanLevel: KernelPressureLevel = 'normal'
 
   const check = (): PressureSeverity | null => {
     const rss = selfRss()
@@ -158,6 +169,17 @@ export function createMemoryPressureMonitor(opts: {
     // Escalations only. A falling level runs nothing: the levers already ran on the way up, and
     // whatever has re-granted since is warmth the user just panned back to.
     if (KERNEL_RANK[level] <= KERNEL_RANK[from]) return
+    const now = Date.now()
+    if (
+      kernelRanAt !== null &&
+      KERNEL_RANK[level] <= KERNEL_RANK[kernelRanLevel] &&
+      now - kernelRanAt < KERNEL_LEVER_GAP_MS
+    ) {
+      log(`[memory-pressure] kernel ${level}: levers ran ${Math.round((now - kernelRanAt) / 1000)} s ago, skipping`)
+      return
+    }
+    kernelRanAt = now
+    kernelRanLevel = level
     const severity: PressureSeverity = level === 'critical' ? 'critical' : 'warning'
     log(`[memory-pressure] kernel ${level}: running reclaim levers (${severity})`)
     try {

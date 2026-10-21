@@ -3561,8 +3561,9 @@ app.whenReady().then(async () => {
   // try/catch is the backstop, not the primary.
   //
   // The kernel leg (macOS only — absent elsewhere) is the one that actually fires there: the byte
-  // leg is silent on darwin and main's RSS never nears 4 GB. It runs the renderer levers ONLY, once
-  // per escalation of `kern.memorystatus_vm_pressure_level`; a kernel CRITICAL deliberately does
+  // leg is silent on darwin and main's RSS never nears 4 GB. It runs the renderer levers ONLY, on an
+  // escalation of `kern.memorystatus_vm_pressure_level` (at most once per KERNEL_LEVER_GAP_MS at
+  // the same severity, so a flapping level does not re-run them); a kernel CRITICAL deliberately does
   // NOT sweep the reaper yet — that is a separate, separately measured step (#211).
   createMemoryPressureMonitor({
     onPressure: (severity) => {

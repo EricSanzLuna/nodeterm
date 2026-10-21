@@ -1371,8 +1371,9 @@ bite most often:
   every frame through React Flow's ResizeObserver).
 - Work done per terminal on a project switch must be coalesced and on-screen-first.
 - macOS memory pressure comes from the kernel's level (`onKernelPressure` in
-  `core/memory-pressure.ts`), fired on escalations only. Never re-fire it on a held level, and
-  never route it through `hostMemReader`/`MemInfo`: the session reaper shares that reader.
+  `core/memory-pressure.ts`), fired on escalations only, and at the same severity at most once per
+  `KERNEL_LEVER_GAP_MS` (a level flapping normal/warn re-arms it every fall). Never re-fire it on a
+  held level, and never route it through `hostMemReader`/`MemInfo`: the session reaper shares that reader.
 - A terminal under the kanban board must not draw. CSS can't stop xterm; its render pause is
   `terminal/board-render-pause.ts`. Every "is the board up" check includes the Omni board
   (`isGlobalKanbanOpen()`), and the board never feeds the visibility verdict that drives

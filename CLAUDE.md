@@ -6696,10 +6696,13 @@ byte leg (`hostMemReader`) stays `null` on darwin and main's RSS never nears the
 until this leg the renderer's reclaim levers never ran on a visible Mac window — the safety net #179
 counted on was dead. `core/memory-pressure.ts` now samples `kern.memorystatus_vm_pressure_level`
 (1 normal / 2 warn / 4 critical; async `sysctl` per 30 s tick, last landed value) and calls
-`onKernelPressure` once per ESCALATION (normal→warn, →critical). Measured lever effect (dev, 12
+`onKernelPressure` on an ESCALATION (normal→warn, →critical). Measured lever effect (dev, 12
 hidden warm terminals): GPU footprint 331 → 152 MB, IOSurface 235 → 91 MB, all 12 re-granted on
 pan-back. Three rules: never re-fire a HELD kernel level (the 60 s floor at a held WARN is #179's
-timed release and its pan-back flicker again); never feed the level through `hostMemReader` /
+timed release and its pan-back flicker again), and never let a FLAPPING one do the same: each fall
+to normal re-arms the leg, so a run at the same or a lower severity than the last one waits out
+`KERNEL_LEVER_GAP_MS` (10 min) and only an escalation above it (warning → critical) fires inside the
+gap; never feed the level through `hostMemReader` /
 `MemInfo` (`planReap` shares it — that would be a new reaper trigger); a kernel CRITICAL runs the
 levers only, no reaper sweep, until that step is measured on its own (#211). A failed read is no
 information: it neither fires nor resets the held level.

@@ -4,6 +4,7 @@ import {
   hostMemReader,
   kernelPressureReader,
   parseKernelPressureLevel,
+  KERNEL_LEVER_GAP_MS,
   RE_FIRE_FLOOR_MS,
   type KernelLevelExec,
   type KernelPressureLevel
@@ -115,7 +116,8 @@ describe('memory pressure monitor: darwin kernel-level leg', () => {
     vi.useFakeTimers()
     const onKernel = vi.fn()
     const onPressure = vi.fn()
-    // The extra tick primed at start() consumes the first entry.
+    // The extra tick primed at start() consumes the first entry. The second normal -> warn lands
+    // seconds after the critical run, inside the gap and below its severity, so it runs nothing.
     const m = createMemoryPressureMonitor({
       ...quiet,
       onPressure,
@@ -124,8 +126,49 @@ describe('memory pressure monitor: darwin kernel-level leg', () => {
     })
     m.start()
     vi.advanceTimersByTime(7000)
-    expect(onKernel.mock.calls).toEqual([['warning'], ['critical'], ['warning']])
+    expect(onKernel.mock.calls).toEqual([['warning'], ['critical']])
     expect(onPressure).not.toHaveBeenCalled()
+    m.stop()
+    vi.useRealTimers()
+  })
+
+  it('a level flapping normal/warn every tick runs the levers once per gap (#179: no timed release)', () => {
+    vi.useFakeTimers()
+    const onKernel = vi.fn()
+    let tick = 0
+    const m = createMemoryPressureMonitor({
+      ...quiet,
+      intervalMs: 30_000,
+      onPressure: vi.fn(),
+      // start() primes with 'normal'; every tick after it alternates warn, normal, warn, …
+      readKernelLevel: () => (tick++ % 2 === 1 ? 'warn' : 'normal'),
+      onKernelPressure: onKernel
+    })
+    m.start()
+    vi.advanceTimersByTime(10 * 60_000)
+    expect(onKernel).toHaveBeenCalledTimes(1)
+    // The gap bounds the rate; it does not switch the leg off. Past it, the next escalation runs.
+    vi.advanceTimersByTime(KERNEL_LEVER_GAP_MS)
+    expect(onKernel).toHaveBeenCalledTimes(2)
+    m.stop()
+    vi.useRealTimers()
+  })
+
+  it('an escalation ABOVE the last run fires at once, even inside the gap', () => {
+    vi.useFakeTimers()
+    const onKernel = vi.fn()
+    const m = createMemoryPressureMonitor({
+      ...quiet,
+      intervalMs: 30_000,
+      onPressure: vi.fn(),
+      readKernelLevel: script(['normal', 'warn', 'normal', 'warn', 'normal', 'critical', 'normal', 'critical']),
+      onKernelPressure: onKernel
+    })
+    m.start()
+    vi.advanceTimersByTime(7 * 30_000)
+    // warn runs; the second warn is inside the gap; critical outranks the last run (warning) and
+    // fires; the second critical is inside the gap at the same severity.
+    expect(onKernel.mock.calls).toEqual([['warning'], ['critical']])
     m.stop()
     vi.useRealTimers()
   })

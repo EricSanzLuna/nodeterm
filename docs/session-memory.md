@@ -555,7 +555,9 @@ macOS (the ps path never runs on Linux)
     rather than a byte watermark — the same capture showed 82% used with AM's pressure graph GREEN.
     **Code DONE 2026-10-19** — a separate darwin kernel-level leg in `core/memory-pressure.ts`
     (`onKernelPressure`): renderer levers on escalations into warn/critical only, never on a held
-    level, never through `hostMemReader`, no reaper sweep on kernel CRITICAL yet (#211). Owed: a
+    level, at most once per `KERNEL_LEVER_GAP_MS` (10 min) at the same or a lower severity so a
+    flapping level does not re-run them, never through `hostMemReader`, no reaper sweep on kernel
+    CRITICAL yet (#211). Owed: a
     firing log under induced pressure on a dev build (`memory_pressure -S -l warn`), plus the GPU
     process `footprint` / IOSurface count before and 60 s after the lever run.
     RE-VERIFIED independently 2026-08-12 (second session, shipping function imported via esbuild
