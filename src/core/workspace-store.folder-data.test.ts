@@ -457,3 +457,32 @@ describe('a move into a folder never loses the canvas', () => {
     expect(ids(loaded.nodes)).toEqual(['term-1'])
   })
 })
+
+describe('deleting a folder project kept in app data', () => {
+  it('removes its data file and its app-data side files, and leaves the folder alone', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project()]))
+    await store.writeProjectSettings('project-p1', { terminal: { shell: '/bin/fish' } })
+    const side = path.join(userData, 'project-files', 'project-p1')
+    await fs.writeFile(path.join(side, '.nodeterm', 'board-log.jsonl'), '{}\n')
+    await fs.writeFile(path.join(folder, 'README.md'), 'mine')
+
+    await store.save(ws([]))
+
+    expect(await exists(dataFile('project-p1'))).toBe(false)
+    expect(await exists(side)).toBe(false)
+    expect(await fs.readdir(folder)).toEqual(['README.md'])
+  })
+
+  it('a project that only moved back into its folder keeps its app-data board log', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project()]))
+    const log = path.join(userData, 'project-files', 'project-p1', '.nodeterm', 'board-log.jsonl')
+    await fs.mkdir(path.dirname(log), { recursive: true })
+    await fs.writeFile(log, '{}\n')
+
+    await store.save(ws([project({ storeInAppData: undefined })]))
+    expect(await exists(dataFile('project-p1'))).toBe(false)
+    expect(await exists(log)).toBe(true)
+  })
+})

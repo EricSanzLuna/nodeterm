@@ -114,9 +114,10 @@ export function deleteConfirmCopy(project: ProjectLike): DeleteConfirmCopy {
         ? `ends its ${n} terminal session${plural(n)} on ${sshHostLabel(project)} and `
         : `ends its ${n} terminal session${plural(n)} and `
   const where = project.ssh ? 'on the server' : 'on disk'
-  // A project stored in app data (#1145) has no copy in its folder: removing it deletes the canvas.
+  // A project stored in app data (#1145) has no copy in its folder: removing it deletes the canvas
+  // and its app-data side files (WorkspaceStore's data-file sweep).
   const tail = project.storeInAppData && !project.ssh
-    ? `The folder ${where} is not deleted, but the canvas is: it was stored in app data, not in the folder.`
+    ? `The folder ${where} is not deleted, but the canvas, its project settings and its board log are: they were stored in app data, not in the folder.`
     : `The folder ${where} (including .nodeterm/project.json) is not deleted.`
   return {
     message: `Delete “${name}”? This ${sessions}removes the project from nodeterm. ${tail}`,

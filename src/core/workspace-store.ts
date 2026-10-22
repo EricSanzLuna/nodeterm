@@ -1831,6 +1831,13 @@ export class WorkspaceStore {
       // A project that only moved its canvas keeps its rev: it continues in the new location, and
       // resetting it would send the folder's next write out as rev 1 over the rev N just written.
       if (!nextById.has(e.id)) this.revs.delete(e.id)
+      // A DELETED folder project kept in app data takes its app-data side files with it (settings,
+      // board log: `appDataProjectRoot`), as a folder ref's would go with its folder if the user
+      // deleted that. One that only moved back into its folder keeps them: its board log history
+      // stays there rather than vanish with a move.
+      if (!nextById.has(e.id) && isFolderDataRef(e)) {
+        await fs.rm(appDataProjectRoot(e.id), { recursive: true, force: true }).catch(() => undefined)
+      }
       // A folder-data-ref that moved back into its folder: its app-data settings were carried into
       // the folder by `prepareFolderStorage`. Removed only once the folder demonstrably has them —
       // a move that skipped the carry must not lose the project's settings.
