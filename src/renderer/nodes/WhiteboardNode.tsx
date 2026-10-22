@@ -9,7 +9,9 @@ import { useAppTheme } from '../state/useAppTheme'
 import { useProjects } from '../state/projects'
 import { markWorkspaceDirty } from '../state/workspaceDirty'
 import { useSession } from '../session/session'
+import { useHostedReadOnly } from '../state/hostedTeams'
 import { MaximizeButton, useNodeMaximize } from './MaximizeButton'
+import type { WhiteboardEditorControl } from '../whiteboard/WhiteboardEditor'
 
 // Excalidraw (~1.7 MB of JS + CSS) loads the first time a board is opened for editing, never at
 // startup and never for a board that is only being looked at. The asset path must be set before
@@ -60,7 +62,11 @@ const pngDataUrl = (base64: string): string => `data:image/png;base64,${base64}`
  */
 export function WhiteboardNode({ id, data, selected, positionAbsoluteX, positionAbsoluteY, width, height }: NodeProps<CanvasNode>) {
   const { updateNodeData, deleteElements } = useReactFlow()
-  const { api } = useSession()
+  const session = useSession()
+  const { api } = session
+  // A hosted-team Viewer or Commenter: the host refuses their saves, so the board opens view-only
+  // rather than letting them draw what can never be written.
+  const readOnly = useHostedReadOnly(session.id)
   const theme = useAppTheme()
   const setMaximized = useNodeMaximize(id)
   // A node renders only inside its own project, and a project switch unmounts it — after the
@@ -76,6 +82,9 @@ export function WhiteboardNode({ id, data, selected, positionAbsoluteX, position
   const [mode, setMode] = useState<null | 'edit' | 'present'>(null)
   const [geom, setGeom] = useState<Geometry | null>(null)
   const [thumb, setThumb] = useState<string>()
+  // Bumped when editing ends, so the resting picture is read again: after "Discard my changes" the
+  // board on disk may be someone else's newer version, which no node-data change announces here.
+  const [pictureTick, setPictureTick] = useState(0)
   const sceneRef = useRef<string | undefined>(undefined)
   // The revision of the board file this editing session started from, then of each save it made —
   // what every save sends, so the core can refuse one made over somebody else's newer board
@@ -86,6 +95,9 @@ export function WhiteboardNode({ id, data, selected, positionAbsoluteX, position
   const [loadState, setLoadState] = useState<'loading' | 'ready' | 'unreadable'>('loading')
   // `conflict`: the core refused the last save because someone else saved this board meanwhile.
   const [saveState, setSaveState] = useState<'saved' | 'failed' | 'conflict'>('saved')
+  // The revision on disk when the last save was refused: "Keep mine" saves over exactly that one.
+  const conflictRevRef = useRef<string | null>(null)
+  const editorControl = useRef<WhiteboardEditorControl | null>(null)
   const [copied, setCopied] = useState(false)
   const maximizedByPresentRef = useRef(false)
   const viewKey = useStore(transformKey)
@@ -112,7 +124,7 @@ export function WhiteboardNode({ id, data, selected, positionAbsoluteX, position
     return () => {
       live = false
     }
-  }, [api, id, data.whiteboardSource, data.boardRev])
+  }, [api, id, data.whiteboardSource, data.boardRev, pictureTick])
 
   const measure = useCallback(() => {
     const body = bodyRef.current
@@ -154,6 +166,7 @@ export function WhiteboardNode({ id, data, selected, positionAbsoluteX, position
         return false
       }
       if (typeof res === 'object' && !res.ok) {
+        conflictRevRef.current = res.currentRev
         setSaveState('conflict')
         return false
       }
@@ -219,6 +232,8 @@ export function WhiteboardNode({ id, data, selected, positionAbsoluteX, position
       if (maximizedByPresentRef.current && dataRef.current.premaxRect) setMaximized(true)
       maximizedByPresentRef.current = false
       setMode(null)
+      setSaveState('saved')
+      setPictureTick((t) => t + 1)
       // Read again on the next open; a board at rest keeps only its picture.
       sceneRef.current = undefined
       if (changed) {
@@ -265,11 +280,38 @@ export function WhiteboardNode({ id, data, selected, positionAbsoluteX, position
               title={
                 saveState === 'conflict'
                   ? 'Someone else saved this board while it was open here (another tab, another computer on this folder, or a teammate). Their version was kept; your changes are not saved.'
-                  : 'The last change could not be written. The board stays open; it retries on the next change.'
+                  : 'The last change could not be written. The board stays open and finishing waits until a save succeeds; it retries on the next change.'
               }
             >
               {saveState === 'conflict' ? 'Changed elsewhere' : 'Not saved'}
             </span>
+          )}
+          {mode && saveState === 'conflict' && (
+            <Tooltip label="Save your version over the one saved elsewhere">
+              <button
+                className="whiteboard-node__save-action nodrag"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  revRef.current = conflictRevRef.current
+                  void editorControl.current?.saveNow()
+                }}
+              >
+                Keep mine
+              </button>
+            </Tooltip>
+          )}
+          {mode && saveState !== 'saved' && (
+            <Tooltip label="Stop editing without your unsaved changes; the board on disk is kept as it is">
+              <button
+                className="whiteboard-node__save-action nodrag"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  editorControl.current?.discard()
+                }}
+              >
+                Discard my changes
+              </button>
+            </Tooltip>
           )}
           <span className="term-node__spacer" />
           <Tooltip label={copied ? 'Copied' : 'Copy as image'}>
@@ -343,6 +385,8 @@ export function WhiteboardNode({ id, data, selected, positionAbsoluteX, position
                   theme={theme}
                   canvasZoom={canvasZoom}
                   present={mode === 'present'}
+                  readOnly={readOnly}
+                  controlRef={editorControl}
                   geometryKey={`${geom.board.left},${geom.board.top},${geom.board.width},${geom.board.height},${geom.clip.left},${geom.clip.top}`}
                   overlayRef={overlayRef}
                   frameRef={frameRef}

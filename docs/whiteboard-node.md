@@ -7,7 +7,8 @@ pasted images, undo and export. It embeds [Excalidraw](https://github.com/excali
 
 Add one from right-click → **New view → New whiteboard**, the sessions-sidebar "+", the Dock, or
 ⌘K "New whiteboard" (`node.newWhiteboard`, unbound by default). A new board opens ready to draw.
-Double-click (or Enter on) a board to draw on it again; Esc or a click outside finishes. The header
+Double-click (or Enter on) a board to draw on it again; Esc or a click outside finishes — once the
+board is saved (see "When a save does not land" below). The header
 has **Present** (maximize + Excalidraw's zen mode, restored on Esc) and **Copy as image** (the board
 as a PNG on the clipboard). Its default size is a Settings → Behavior → Default node size entry.
 
@@ -86,6 +87,18 @@ Saves of one board are serialized inside one core, so two saves racing there can
 check; two cores writing one folder (a desktop and a Server Edition) can still interleave in the
 moment between the check and the rename. A core on an older build ignores the revision and answers
 the bare path, and the save is then unchecked, as before.
+
+**When a save does not land, the board stays open.** Finishing (Esc, a press outside) waits for a
+save that succeeded; a failed or refused one keeps the editor open, because once editing ends the
+unsaved strokes have nowhere to go. The header says why — **Not saved** (the save could not be
+written: a full disk, a board over the Server Edition's 8 MiB frame, a core that went away) or
+**Changed elsewhere** (above) — and offers the way forward: **Keep mine** after a conflict saves
+over the other version knowingly (it sends that version's revision), and **Discard my changes**
+ends editing without the unsaved strokes, leaving the board on disk as it is. A project switch or
+deleting the node still flushes what it can on the way out; a failure there is not reported.
+
+**A hosted-team Viewer or Commenter opens the board view-only** (Excalidraw's view mode): the host
+refuses their saves, so the editor never offers drawing that cannot be written.
 
 **The project folder is bound by its real path.** `.nodeterm/` is git-shared, so a repository can
 commit `.nodeterm` or `.nodeterm/whiteboards` as a symlink to any directory on this machine. Each

@@ -1,5 +1,5 @@
 import '@excalidraw/excalidraw/index.css'
-import { useCallback, useEffect, useMemo, useRef, type RefObject } from 'react'
+import { useCallback, useEffect, useMemo, useRef, type MutableRefObject, type RefObject } from 'react'
 import {
   Excalidraw,
   MainMenu,
@@ -66,6 +66,15 @@ const serialize = (s: Snapshot, canvasZoom: number): string => {
   return serializeAsJSON(s.elements, appState, s.files, 'local')
 }
 
+/** What the node can ask of a live editor (its header's "Keep mine" and "Discard my changes"). */
+export interface WhiteboardEditorControl {
+  /** Write the pending changes now. Resolves whether the board on disk is now up to date. */
+  saveNow: () => Promise<boolean>
+  /** Stop editing WITHOUT writing the pending changes: the explicit way out of a board whose save
+   *  keeps failing, which finishing otherwise refuses to close. */
+  discard: () => void
+}
+
 export default function WhiteboardEditor({
   initialScene,
   theme,
@@ -75,7 +84,9 @@ export default function WhiteboardEditor({
   overlayRef,
   frameRef,
   onSave,
-  onExit
+  onExit,
+  readOnly = false,
+  controlRef
 }: {
   /** The board's `.excalidraw` JSON as read from its file; undefined for a new board. */
   initialScene: string | undefined
@@ -91,11 +102,16 @@ export default function WhiteboardEditor({
   frameRef: RefObject<HTMLDivElement | null>
   onSave: (scene: string, thumbnailBase64?: string) => Promise<boolean>
   onExit: (changed: boolean) => void
+  /** View only (a hosted-team Viewer, whose saves the host refuses): Excalidraw's view mode, and
+   *  nothing is ever written — so there is never unsaved work to lose. */
+  readOnly?: boolean
+  controlRef?: MutableRefObject<WhiteboardEditorControl | null>
 }): React.JSX.Element {
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null)
   const canvasZoomRef = useRef(canvasZoom)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const exitingRef = useRef(false)
+  const discardedRef = useRef(false)
   const changedThisSessionRef = useRef(false)
   const onSaveRef = useRef(onSave)
   onSaveRef.current = onSave
@@ -135,35 +151,66 @@ export default function WhiteboardEditor({
    * flag an onChange had to set. `unmounting` reads the kept snapshot instead of the api (see
    * `latestRef`) and writes no picture — exporting one needs the live editor.
    */
-  const flush = useCallback(async (withThumbnail: boolean, unmounting = false): Promise<void> => {
+  const readOnlyRef = useRef(readOnly)
+  readOnlyRef.current = readOnly
+
+  /** Resolves whether the board on disk is up to date afterwards: true when there was nothing to
+   *  write (or the board is read-only, where nothing ever is), false when the save failed. */
+  const flush = useCallback(async (withThumbnail: boolean, unmounting = false): Promise<boolean> => {
     if (timerRef.current) clearTimeout(timerRef.current)
     timerRef.current = null
+    if (readOnlyRef.current || discardedRef.current) return true
     const api = apiRef.current
     if (!unmounting && api) latestRef.current = fromApi(api)
     const snap = latestRef.current
     const version = versionOf(snap.elements, snap.files)
     const needScene = version !== savedVersionRef.current
     const needThumb = !unmounting && !!api && withThumbnail && version !== thumbVersionRef.current
-    if (!needScene && !needThumb) return
+    if (!needScene && !needThumb) return true
     // '' = "the board is empty now": the core removes the old picture rather than keep showing it.
     const thumb = needThumb && api ? ((await thumbnailBase64(api).catch(() => undefined)) ?? '') : undefined
-    if (await onSaveRef.current(serialize(snap, canvasZoomRef.current), thumb)) {
-      savedVersionRef.current = version
-      if (needThumb) thumbVersionRef.current = version
-      changedThisSessionRef.current = true
-    }
+    if (!(await onSaveRef.current(serialize(snap, canvasZoomRef.current), thumb))) return false
+    savedVersionRef.current = version
+    if (needThumb) thumbVersionRef.current = version
+    changedThisSessionRef.current = true
+    return true
   }, [])
 
+  // Finishing (Esc, a press outside) waits for a save that SUCCEEDED. A failed one keeps the board
+  // open — the node's header says why ("Not saved", "Changed elsewhere") and offers the way out
+  // (`discard`) — because closing it here would drop the unsaved strokes with no second chance:
+  // the unmount flush below is skipped once an exit has begun. A later Esc or press tries again.
   const exit = useCallback(async () => {
     if (exitingRef.current) return
     exitingRef.current = true
-    await flush(true)
+    if (!(await flush(true))) {
+      exitingRef.current = false
+      return
+    }
     onExit(changedThisSessionRef.current)
   }, [flush, onExit])
 
-  // Leaving without an exit (a project switch, the node deleted, the app quitting): write whatever
-  // is unsaved. The api is still readable synchronously here; the write itself is async and the
-  // core finishes it after this component is gone.
+  useEffect(() => {
+    if (!controlRef) return
+    controlRef.current = {
+      saveNow: () => flush(false),
+      discard: () => {
+        if (exitingRef.current) return
+        exitingRef.current = true
+        discardedRef.current = true
+        if (timerRef.current) clearTimeout(timerRef.current)
+        timerRef.current = null
+        onExit(changedThisSessionRef.current)
+      }
+    }
+    return () => {
+      controlRef.current = null
+    }
+  }, [controlRef, flush, onExit])
+
+  // Leaving without an exit (a project switch, the node deleted): write whatever is unsaved. The
+  // api is still readable synchronously here; the write itself is async and the core finishes it
+  // after this component is gone.
   useEffect(
     () => () => {
       if (!exitingRef.current) void flush(false, true)
@@ -233,12 +280,13 @@ export default function WhiteboardEditor({
       initialData={initialData}
       onChange={(elements, appState, files) => {
         latestRef.current = { elements, appState, files }
-        if (versionOf(elements, files) === savedVersionRef.current) return
+        if (readOnlyRef.current || versionOf(elements, files) === savedVersionRef.current) return
         if (timerRef.current) clearTimeout(timerRef.current)
         timerRef.current = setTimeout(() => void flush(false), AUTOSAVE_MS)
       }}
       theme={theme}
       zenModeEnabled={present}
+      viewModeEnabled={readOnly}
       autoFocus
       aiEnabled={false}
       UIOptions={{

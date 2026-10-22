@@ -18335,6 +18335,21 @@ body.focus-mode .dock:hover {
   font-size: 11px;
   font-weight: 600;
 }
+/* "Keep mine" / "Discard my changes": the way forward from a save that did not land. */
+.whiteboard-node__save-action {
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text);
+  font-size: 11px;
+  cursor: pointer;
+}
+.whiteboard-node__save-action:hover {
+  background: var(--panel-2);
+  color: var(--text-strong);
+}
 /* The canvas area, in .canvas-root coordinates: clips the live editor to the canvas and stacks it
    under the sessions sidebar (z 12) and the Dock (z 20), which sit beside .flow-wrap. */
 .whiteboard-clip {

@@ -2179,7 +2179,10 @@ number: change the table in that one module, never in one emulator.
   saved, not with disk. The unmount flush writes a snapshot kept from `onChange` — Excalidraw's api
   is empty by cleanup time, and reading it there once erased a board; (5) the project folder is
   bound by its REAL path — a `.nodeterm` or `.nodeterm/whiteboards` symlink leading out of the
-  project is not followed (the board falls back to the app folder). Excalidraw loads lazily; fonts
+  project is not followed (the board falls back to the app folder); (6) finishing (Esc, a press
+  outside) waits for a save that SUCCEEDED — a failed or refused one keeps the editor open with
+  "Keep mine" / "Discard my changes" in the header, since after the exit there is no flush left to
+  retry — and a hosted-team Viewer opens the board view-only. Excalidraw loads lazily; fonts
   come from `scripts/excalidraw-assets-plugin.ts`; mermaid is aliased to a stub.
 - **Run node** (a `terminal` node carrying `data.runConfig`, NOT a new NodeKind;
   `@shared/run-config`, `core/run-service.ts`, `nodes/RunBar.tsx`) — VS Code's "Run Without

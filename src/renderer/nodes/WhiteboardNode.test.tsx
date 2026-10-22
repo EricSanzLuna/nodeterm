@@ -24,11 +24,21 @@ interface EditorProps {
   readOnly?: boolean
   onSave: (scene: string, thumbnailBase64?: string) => Promise<boolean>
   onExit: (changed: boolean) => void
+  controlRef?: { current: { saveNow: () => Promise<boolean>; discard: () => void } | null }
 }
-const editor: { props: EditorProps | null } = { props: null }
+const editor: { props: EditorProps | null; discarded: number } = { props: null, discarded: 0 }
 vi.mock('../whiteboard/WhiteboardEditor', () => ({
   default: (props: EditorProps) => {
     editor.props = props
+    if (props.controlRef) {
+      props.controlRef.current = {
+        saveNow: () => props.onSave(JSON.stringify({ type: 'excalidraw', elements: [] })),
+        discard: () => {
+          editor.discarded++
+          props.onExit(false)
+        }
+      }
+    }
     return <div data-testid="editor" />
   }
 }))
@@ -43,6 +53,7 @@ vi.mock('../session/session', () => ({
 
 import { WhiteboardNode } from './WhiteboardNode'
 import { useProjects } from '../state/projects'
+import { useHostedTeams } from '../state/hostedTeams'
 
 const SCENE = JSON.stringify({ type: 'excalidraw', elements: [] })
 
@@ -95,6 +106,8 @@ async function openEditor(): Promise<EditorProps> {
 
 beforeEach(() => {
   editor.props = null
+  editor.discarded = 0
+  useHostedTeams.getState().forget('local')
   files.readWhiteboard.mockReset()
   files.saveWhiteboard.mockReset()
   useProjects.setState({ activeProjectId: 'p1' })
@@ -153,5 +166,57 @@ describe('saving sends the revision the editor started from', () => {
     expect(saved).toBe(true)
     expect(files.saveWhiteboard.mock.calls[0]?.[4]).toBeUndefined()
     expect(host.querySelector('.whiteboard-node__save-failed')).toBeNull()
+  })
+})
+
+const button = (label: RegExp): HTMLButtonElement | undefined =>
+  [...host.querySelectorAll('button')].find((b) => label.test(b.textContent ?? '') || label.test(b.getAttribute('aria-label') ?? ''))
+
+describe('a save that did not land offers a way forward instead of losing the work', () => {
+  it('"Keep mine" after a conflict saves over the other version, knowingly (its revision)', async () => {
+    files.readWhiteboard.mockResolvedValue({ scene: SCENE, updatedAt: 1, rev: 'r1', fromSource: false })
+    files.saveWhiteboard
+      .mockResolvedValueOnce({ ok: false, conflict: true, currentRev: 'r9' })
+      .mockResolvedValueOnce({ ok: true, path: '/p/whiteboard-1.excalidraw', rev: 'r10' })
+    mount()
+    const props = await openEditor()
+    await act(async () => void (await props.onSave(SCENE)))
+    const keep = button(/keep mine/i)
+    expect(keep).toBeDefined()
+    await act(async () => keep!.click())
+    await settle()
+    expect(files.saveWhiteboard.mock.calls[1]?.[4]).toBe('r9')
+    expect(host.querySelector('.whiteboard-node__save-failed')).toBeNull()
+  })
+
+  it('"Discard my changes" appears while a save keeps failing and ends editing without them', async () => {
+    files.readWhiteboard.mockResolvedValue({ scene: SCENE, updatedAt: 1, rev: 'r1', fromSource: false })
+    files.saveWhiteboard.mockResolvedValue(null)
+    mount()
+    const props = await openEditor()
+    expect(button(/discard my changes/i)).toBeUndefined()
+    await act(async () => void (await props.onSave(SCENE)))
+    const discard = button(/discard my changes/i)
+    expect(discard).toBeDefined()
+    await act(async () => discard!.click())
+    expect(editor.discarded).toBe(1)
+  })
+})
+
+describe('a hosted-team Viewer', () => {
+  it('opens the board read-only (the host refuses their saves)', async () => {
+    useHostedTeams.getState().set('local', { role: 'viewer', teamLabel: 'Team' })
+    files.readWhiteboard.mockResolvedValue({ scene: SCENE, updatedAt: 1, rev: 'r1', fromSource: false })
+    mount()
+    const props = await openEditor()
+    expect(props.readOnly).toBe(true)
+  })
+
+  it('an Editor does not', async () => {
+    useHostedTeams.getState().set('local', { role: 'editor', teamLabel: 'Team' })
+    files.readWhiteboard.mockResolvedValue({ scene: SCENE, updatedAt: 1, rev: 'r1', fromSource: false })
+    mount()
+    const props = await openEditor()
+    expect(props.readOnly).toBeFalsy()
   })
 })
