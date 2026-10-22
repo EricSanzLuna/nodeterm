@@ -908,6 +908,11 @@ interface Session {
   /** True when this node had an `accountId` but its config dir was gone at spawn, so we fell back
    *  to the system account. `create()` surfaces it to the renderer (warning chip). */
   accountFallback?: boolean
+  /** Set once `join` has warned that this session holds a remote-only node's id somewhere other
+   *  than that node's host (`held-elsewhere`). A watcher retries its join every 2/4/8/15 s for as
+   *  long as the link lives, and every retry is refused the same way, so the warning is logged once
+   *  for the life of this held session; a later session under the same id warns again. */
+  heldElsewhereWarned?: boolean
   /**
    * This session is backed by the session-host process (docs/windows-session-host.md), not a
    * local tmux — selected only when no local tmux was found (primarily Windows). `session.proc`
@@ -2687,9 +2692,12 @@ export class PtyManager {
       (!existing.sshRemote ||
         (options.sshRemote && !sameSshEndpoint(options.sshRemote.conn, existing.sshRemote.conn)))
     ) {
-      console.warn(
-        `[pty] ${sessionName(persistKey)} is held ${existing.sshRemote ? 'on another host' : 'on this machine'} but node ${persistKey} must run on its remote host; not joined, and the held session was left untouched`
-      )
+      if (!existing.heldElsewhereWarned) {
+        existing.heldElsewhereWarned = true
+        console.warn(
+          `[pty] ${sessionName(persistKey)} is held ${existing.sshRemote ? 'on another host' : 'on this machine'} but node ${persistKey} must run on its remote host; not joined, and the held session was left untouched`
+        )
+      }
       return Promise.resolve({ sessionId: '', fresh: false, unavailable: 'held-elsewhere' })
     }
     // The joining VIEW's composite key: a second client, OR the SAME client's second view (the

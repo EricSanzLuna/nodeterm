@@ -165,6 +165,18 @@ describe('requireRemote create vs a live session of the same node id', () => {
     expect(spawned[0].killed).toBe(false)
   })
 
+  it('warns once for the held session, however often the refused join is retried', async () => {
+    // A live-link watcher retries its join every 2/4/8/15 s for as long as the link lives, and each
+    // retry is refused the same way: one warning for the held session, not one per retry.
+    const local = await localHeld()
+    const retry = () => create(MODAL_OR_SECOND_VIEW, { agentId: 'claude', requireRemote: true })
+    const results = [await retry(), await retry(), await retry()]
+
+    expect(results.map((r) => r.unavailable)).toEqual(['held-elsewhere', 'held-elsewhere', 'held-elsewhere'])
+    expect(warnedAbout()).toHaveLength(1)
+    expect(subscribersOf(local.sessionId)).toBe(1)
+  })
+
   it('a create WITHOUT requireRemote still joins the local session (local nodes unchanged)', async () => {
     const local = await localHeld()
     const res = await create(MODAL_OR_SECOND_VIEW, { agentId: 'claude', cwd: '/home/e2e/proj-alpha' })
@@ -223,6 +235,32 @@ describe('requireRemote create vs a live session of the same node id', () => {
       expect(otherPort.unavailable).toBe('held-elsewhere')
       expect(spawned).toHaveLength(1)
       expect(subscribersOf(first.sessionId)).toBe(1)
+    })
+
+    it('joins when one side names no user and the other an empty one', async () => {
+      // `user` is typed as a string but arrives from hand-editable JSON, so a create can carry none
+      // at all while the held session spells it ''. Both mean "ssh's default user": same endpoint.
+      // (The other way round cannot be held: a spawn refuses a user that is not a string.)
+      const first = await create(RENDERER, {
+        agentId: 'claude',
+        requireRemote: true,
+        sshRemote: remoteFor({ host: HOST.host, user: '' })
+      })
+      expect(first.unavailable).toBeUndefined()
+      expect(spawned).toHaveLength(1)
+      expect(spawned[0].file).toBe('/usr/bin/ssh')
+
+      const res = await create(MODAL_OR_SECOND_VIEW, {
+        agentId: 'claude',
+        requireRemote: true,
+        sshRemote: remoteFor({ host: HOST.host, user: undefined as unknown as string, port: 22 })
+      })
+
+      expect(res.unavailable).toBeUndefined()
+      expect(res.sessionId).toBe(first.sessionId)
+      expect(spawned).toHaveLength(1)
+      expect(subscribersOf(first.sessionId)).toBe(2)
+      expect(warnedAbout()).toHaveLength(0)
     })
 
     it('joins on the same host, user and port (an unset port is 22)', async () => {

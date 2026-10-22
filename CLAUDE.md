@@ -862,11 +862,11 @@ Lifecycle, by intent:
   (`PtyCreateResult.unavailable`) so a master that dies inside the round-trip can't sneak through.
   The spawn refusal is in `spawnNew`, and `join` refuses (`'held-elsewhere'`) a `requireRemote`
   create whose held session is local or on another host (host, user, or port differs) — a join to
-  the SAME remote's live session (a second view, a relay tab's create on the host) still attaches,
-  and so does a create whose master is momentarily down (no `sshRemote`) onto a held remote session.
-  The held session is never killed. An offline node reports itself to `SshReconnector`, so the
-  canvas heals itself; `retryNow` (banner Reconnect / node Reconnect) skips the backoff and clears
-  the refuse window.
+  the SAME remote's live session (a second view over the same endpoint) still attaches, and so does
+  a create that names no `sshRemote` onto a held remote session (its master momentarily down, or a
+  relay tab's create on the host, which carries none). The held session is never killed. An
+  offline node reports itself to `SshReconnector`, so the canvas heals itself; `retryNow` (banner
+  Reconnect / node Reconnect) skips the backoff and clears the refuse window.
   **Whether a node is remote comes from its PROJECT, never from its own fields** (issue #1186,
   `@shared/ssh-project-nodes`). `requireRemote`/`sshRemoteTmux` used to be stamped only by this
   machine's node factories, but an SSH project's `project.json` lives on the host and other writers
