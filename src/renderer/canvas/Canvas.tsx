@@ -199,6 +199,7 @@ import {
   BugReportDialog,
   PhonePairPopover,
   MobileLaunchCard,
+  LogPanel,
   KanbanView
 } from '../components/lazyPanels'
 import { WelcomeScreen } from '../components/WelcomeScreen'
@@ -967,6 +968,10 @@ import {
   switchOutcomeNotice,
   type ClaudeSwitchOutcome
 } from './claude-account-switch'
+import {
+  isBusyState,
+  registerActiveCanvasAccountMover
+} from '../lib/accountRemoval'
 import type { CodexAccount } from '@shared/codex-account'
 import { useSystemCodexAccount } from '../state/systemCodexAccount'
 import { kanbanSessionsFrom, toKanbanSession } from './toKanbanSession'
@@ -6206,7 +6211,11 @@ export function Canvas() {
           scmCwd(scopeCwd),
           viewCenter(),
           prompt,
-          undefined,
+          // An SSH project's agent runs on the HOST, like the history it explains. Without the
+          // binding the node was local, rooted at a remote path that does not exist here, so the
+          // pty fell back to $HOME and `git show` ran outside any checkout. The scope is always
+          // the project's own in an SSH project (no worktrees), so the root is the right cwd.
+          nodeSshFor(project?.ssh),
           account,
           activePermissionMode(),
           // The owning project, for its own `.nodeterm/settings.json` launch command — the same
@@ -9142,6 +9151,93 @@ export function Canvas() {
     return ready.length + busy.length
   }, [])
 
+  // Account REMOVAL's side on the active canvas (lib/accountRemoval.ts): every Claude session on
+  // the account is moved onto the system account before Settings deletes the account's dir. The
+  // move is the ordinary switch (`runClaudeAccountSwitch`). A node the switch cannot drive — not
+  // attached (released offscreen), or no conversation id yet — but that is idle gets the same
+  // result the hard way: copy its transcript, then recycle its tmux session with the account
+  // cleared, so the respawn (or its revive) cold-starts under the system login and resumes.
+  useEffect(
+    () =>
+      registerActiveCanvasAccountMover({
+        sessions: (accountId, hostKey) => {
+          const byId = useAgentStatus.getState().byId
+          const { ready, busy } = bulkSwitchCandidates(
+            nodesRef.current
+              .filter((n) => n.type === 'terminal' && !isAccountLoginNode(n.data))
+              .map((n) => ({
+                id: n.id,
+                agentId: restartAgentIdOf(n),
+                accountId: (n.data.accountId as string | undefined) || undefined,
+                hostKey: claudeSwitchHostKey(n),
+                busy: isBusyState(byId[n.id]?.state)
+              })),
+            accountId,
+            hostKey
+          )
+          return { ready: ready.map((n) => n.id), busy: busy.map((n) => n.id) }
+        },
+        moveToSystem: async (accountId, ids, ctx) => {
+          const outcomes = await startBulkSwitch(ids, (id) => runClaudeAccountSwitch(id, undefined))
+          const stuck: string[] = []
+          const recycle: string[] = []
+          for (const [i, id] of ids.entries()) {
+            const o = outcomes[i]
+            if (o?.kind === 'switched') continue
+            const driveless =
+              (o?.kind === 'refused' && (o.reason === 'not-attached' || o.reason === 'no-session')) ||
+              (o?.kind === 'not-restarted' && o.outcome === 'not-eligible')
+            const st = useAgentStatus.getState().byId[id]
+            // Busy by now (it started a turn mid-move): recycling would kill that turn.
+            if (!driveless || isBusyState(st?.state)) {
+              stuck.push(id)
+              continue
+            }
+            const n = nodesRef.current.find((x) => x.id === id)
+            const sessionId = restartSessionId(st?.sessionId, n?.data.agentSessionId)
+            if (sessionId) {
+              const accounts = useSettings.getState().settings.claudeAccounts
+              const copy = await window.nodeTerminal.claudeAccounts
+                .copySession(
+                  sessionId,
+                  effectiveAccountId(accountId, st?.account, accounts) ?? accountId,
+                  undefined,
+                  ctx
+                )
+                .catch((): ClaudeSessionCopyResult => ({ ok: false, reason: 'failed' }))
+              if (!copy.ok) {
+                stuck.push(id)
+                continue
+              }
+            }
+            recycle.push(id)
+          }
+          if (recycle.length) {
+            const set = new Set(recycle)
+            for (const id of recycle) transport.recycle(id)
+            usePendingPause.getState().remove(recycle) // the recycled sessions' CLIs are gone with them
+            setNodes((ns) =>
+              ns.map((n) =>
+                set.has(n.id)
+                  ? {
+                      ...n,
+                      data: {
+                        ...n.data,
+                        accountId: undefined,
+                        respawnNonce: ((n.data.respawnNonce as number | undefined) ?? 0) + 1
+                      }
+                    }
+                  : n
+              )
+            )
+            markDirty()
+          }
+          return stuck
+        }
+      }),
+    [runClaudeAccountSwitch, setNodes, markDirty]
+  )
+
   // Who the bulk restart would act on, right now: the ACTIVE project's canvas (nodesRef holds
   // exactly that). Read fresh at every call — agent state and session ids arrive asynchronously.
   const bulkRestartPlan = useCallback((): BulkRestartPlan => {
@@ -9345,7 +9441,10 @@ export function Canvas() {
         source.data.cwd,
         undefined,
         prompt,
-        source.data.sshRemoteTmux ? projectSsh : undefined,
+        // `nodeSshFor`, not the project's binding as-is: the factory reads a remote node's cwd out
+        // of `remoteCwd`, so passing `projectSsh` unchanged moved a source running in a subfolder
+        // of the project (canvas-control `--cwd`) back to the project root.
+        source.data.sshRemoteTmux ? nodeSshFor(projectSsh, source.data.cwd) : undefined,
         // Inherit the source's Claude account (dropped by the factory unless the target is claude),
         // so a claude→claude transfer resumes the transcript from the right account dir.
         source.data.accountId,
@@ -19929,6 +20028,7 @@ export function Canvas() {
           }}
         />
       )}
+      {logPanelOpen && <LogPanel onClose={() => setLogPanelOpen(false)} />}
       {mobileLaunchOpen && (
         <MobileLaunchCard
           onClose={() => {

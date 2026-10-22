@@ -52,6 +52,7 @@ import { latestClaimSize, type SizeClaim } from './pty-size'
 import { isTerminalReport } from './terminal-reports'
 import type { PreparedAgentLaunch } from './agent-launch'
 import type { HostImageStaging } from './session-host-runtime'
+import { sleep } from '../shared/sleep'
 
 export interface SessionSubscriber {
   onData(data: string): void
@@ -268,10 +269,6 @@ type ClientSessionState = {
    *  every local subscriber is a watcher. A resize is never sent in this mode (the host refuses
    *  it); the next claim-carrying attach upgrades it, `reconcileOnSocket` downgrades it. */
   appliedWatch?: boolean
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function asError(error: unknown): Error {
