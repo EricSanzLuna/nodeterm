@@ -17619,6 +17619,7 @@ export function Canvas() {
       persist: async () => (await persist()) === true,
       release: (id, removeTracked) => api.workspace.releaseFolderFiles(id, removeTracked),
       prepare: (id) => api.workspace.prepareFolderStorage(id),
+      storage: (id) => api.workspace.projectStorage(id),
       confirm: (message, confirmLabel) =>
         new Promise<boolean>((resolve) =>
           setConfirm({

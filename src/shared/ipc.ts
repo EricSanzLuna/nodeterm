@@ -490,6 +490,8 @@ export const IPC = {
   workspaceReleaseFolderFiles: 'workspace:release-folder-files',
   /** "Store in folder", first half (issue #1145): refuse an occupied folder, carry settings in. */
   workspacePrepareFolderStorage: 'workspace:prepare-folder-storage',
+  /** Where the store has a project's canvas after a move's save: folder / app data (issue #1145). */
+  workspaceProjectStorage: 'workspace:project-storage',
   projectSettingsRead: 'project-settings:read',
   projectSettingsWriteShared: 'project-settings:write-shared',
   projectSettingsUpdateLocal: 'project-settings:update-local',

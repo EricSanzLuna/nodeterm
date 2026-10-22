@@ -1499,6 +1499,9 @@ export interface WorkspaceApi {
   /** "Store in folder", first half (issue #1145): refuse a folder that already holds a canvas or
    *  settings, else carry this project's settings in. See `WorkspaceStore.prepareFolderStorage`. */
   prepareFolderStorage(projectId: string): Promise<import('./project-storage').PrepareFolderStorageResult>
+  /** Where the store has this project's canvas right now (issue #1145): asked after a move's save,
+   *  which can land while the folder write in it did not. See `WorkspaceStore.projectStorage`. */
+  projectStorage(projectId: string): Promise<import('./project-storage').ProjectStorageKind>
   /** Fired once after an on-disk migration: `v2` = a v2→v3 migration wrote .nodeterm/ dirs into the
    *  project folders; `exec` = the custom shell / advanced ssh args of already-open projects moved
    *  out of the shared project file into this machine's own workspace index (@shared/node-exec). */

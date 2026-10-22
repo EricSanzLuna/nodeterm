@@ -279,6 +279,28 @@ describe('moving a folder project between the two locations', () => {
     expect(ids((await readData('project-p1')).nodes)).toEqual(['term-1'])
   })
 
+  it('to the folder: a write that cannot land leaves the project in app data, index included', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project()]))
+    await fs.writeFile(path.join(folder, '.nodeterm'), 'not a directory')
+    await store.save(ws([project({ storeInAppData: undefined })]))
+
+    // The store says where the canvas is, so the menu can say the move did not happen…
+    expect(await store.projectStorage('project-p1')).toBe('appData')
+    expect((await readIndex()).entries[0]).toMatchObject({ cwd: folder, dataFile: true })
+    // …and a restart still finds it.
+    const loaded = (await new WorkspaceStore().load()).projects[0]
+    expect(loaded).toMatchObject({ cwd: folder, storeInAppData: true })
+    expect(ids(loaded.nodes)).toEqual(['term-1'])
+
+    // Once the folder can be written, the next save completes the move.
+    await fs.rm(path.join(folder, '.nodeterm'))
+    await store.save(ws([project({ storeInAppData: undefined })]))
+    expect(await store.projectStorage('project-p1')).toBe('folder')
+    expect(ids(JSON.parse(await fs.readFile(folderFile(), 'utf-8')).nodes)).toEqual(['term-1'])
+    expect(await exists(dataFile('project-p1'))).toBe(false)
+  })
+
   it('"Set folder…" on a cwd-less canvas no longer leaves its data file behind', async () => {
     const store = new WorkspaceStore()
     await store.save(ws([project({ cwd: undefined, storeInAppData: undefined })]))

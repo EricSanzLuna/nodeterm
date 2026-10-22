@@ -307,6 +307,17 @@ export interface IndexEntryV3 {
   execMigrated?: boolean
 }
 
+/**
+ * A folder project's canvas as a folder-data-ref stores it — in its data file and its index cache:
+ * the project WITHOUT `cwd` (node cwds stay absolute; an older build reads the cache as a plain
+ * inline canvas) and without the runtime-only flags. ONE definition for `splitWorkspace` and for
+ * the store's "the move into the folder did not land" path.
+ */
+export function appDataCanvas(p: Project): Project {
+  const { unavailable: _u, cwd: _cwd, storeInAppData: _s, ...inline } = p
+  return inline
+}
+
 /** A folder project whose canvas lives in app data (issue #1145) — see `IndexEntryV3.dataFile`. */
 export function isFolderDataRef(e: Pick<IndexEntryV3, 'cwd' | 'ssh' | 'dataFile'>): boolean {
   return !!(e.dataFile && e.cwd && !e.ssh)
@@ -919,7 +930,7 @@ export function splitWorkspace(
       //    canvas: it loses the folder binding but never writes into the folder.
       //  - A hand-edited id we will not turn into a path gets no file — the cache IS the storage,
       //    as for the pre-file inline shape — but it still never falls through to the folder.
-      const { unavailable: _u, cwd: _cwd, storeInAppData: _s, ...inline } = p
+      const inline = appDataCanvas(p)
       if (isInlineProjectFileId(p.id)) dataFiles.set(p.id, projectToFile(inline, revOf(p.id), savedAt))
       entries.push({ ...header, ...localState, ...localRef, cwd: p.cwd, dataFile: true, project: inline })
     } else if (p.cwd && !files.has(p.cwd)) {

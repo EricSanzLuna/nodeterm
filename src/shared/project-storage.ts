@@ -13,6 +13,14 @@ export function isNewProjectStorage(v: unknown): v is NewProjectStorage {
 }
 
 /**
+ * Where the store has a project's canvas right now: `'folder'` (a folder ref), `'appData'` (a
+ * folder project kept in app data), `'none'` (no such project, or neither kind). Asked after a
+ * move's save, because a save that lands can still leave the canvas where it was: a move into the
+ * folder whose folder write fails stays in app data (see `WorkspaceStore.saveNow`).
+ */
+export type ProjectStorageKind = 'folder' | 'appData' | 'none'
+
+/**
  * After a project's canvas has moved into app data: its folder files, removed or kept.
  * `kept` lists the files git tracks (or that could not be checked): deleting one shows up as a
  * change in the user's repo, so it is only done when the caller confirms with `removeTracked`.

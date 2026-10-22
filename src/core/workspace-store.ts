@@ -12,7 +12,7 @@ import {
 } from '../shared/types'
 import { contentOf, type CanvasContent } from '../shared/canvas-content'
 import {
-  PROJECT_DIR, PROJECT_FILE, fileToProject, folderFileCwd, inlineProjectFileRelPath, isFolderDataRef,
+  PROJECT_DIR, PROJECT_FILE, appDataCanvas, fileToProject, folderFileCwd, inlineProjectFileRelPath, isFolderDataRef,
   isInlineProjectFileId,
   projectToFile, resolveNodes, sameProjectContent,
   sanitizeLoadedClosedSessions, sanitizeNodeTriggers, serializeProjectFile, splitWorkspace,
@@ -23,7 +23,7 @@ import {
 } from './workspace-files'
 import { projectSettingsPath, readProjectSettingsFile, writeProjectSettingsFile } from './project-settings-files'
 import { gitTracksFile } from './git-tracked'
-import type { PrepareFolderStorageResult, ReleaseFolderFilesResult } from '../shared/project-storage'
+import type { PrepareFolderStorageResult, ProjectStorageKind, ReleaseFolderFilesResult } from '../shared/project-storage'
 import {
   parseProjectSettingsFile, sameProjectSettingsContent, sanitizeProjectLocalSettings,
   sanitizeProjectSettingsDoc, serializeProjectSettingsFile,
@@ -459,6 +459,8 @@ export class WorkspaceStore {
         : { ok: false, reason: 'not-app-data' })
     platform().handle(IPC.workspacePrepareFolderStorage, (projectId: unknown) =>
       typeof projectId === 'string' ? this.prepareFolderStorage(projectId) : { ok: false, reason: 'not-app-data' })
+    platform().handle(IPC.workspaceProjectStorage, (projectId: unknown) =>
+      typeof projectId === 'string' ? this.projectStorage(projectId) : 'none')
     platform().handle(IPC.projectSettingsRead, (projectId: unknown) =>
       typeof projectId === 'string' ? this.readProjectSettings(projectId) : null)
     platform().handle(IPC.projectSettingsWriteShared, (projectId: unknown, doc: ProjectSettingsDoc) =>
@@ -1590,6 +1592,27 @@ export class WorkspaceStore {
       } catch { /* folder gone (unmounted disk): the entry simply stays stale → unavailable next load */ }
     }
 
+    // A folder project moving its canvas from app data INTO its folder (issue #1145) whose folder
+    // write did not land — the leg above swallows a failed write, an unchanged skip is impossible
+    // here (the record was dropped above) — stays a folder-data-ref for this save: same data file,
+    // same cache. Otherwise the index would name a folder file that is not there, a restart would
+    // open the project empty and unavailable, and its data file would be referenced by nothing.
+    // The renderer still asks for the folder, so the next save retries; `projectStorage` tells the
+    // menu the move did not happen. Unavailable placeholders never reach this (the loop further up
+    // already kept their `dataFile`, so they have no folder file to ask for).
+    for (const e of index.entries) {
+      const cwd = folderFileCwd(e)
+      if (!cwd || folderFilesWritten.has(projectFilePath(cwd))) continue
+      const before = previousById.get(e.id)
+      if (!before || !isFolderDataRef(before)) continue
+      const p = workspace.projects.find((x) => x.id === e.id)
+      if (!p) continue
+      const inline = appDataCanvas(p)
+      e.dataFile = true
+      e.project = inline
+      if (isInlineProjectFileId(e.id)) dataFiles.set(e.id, projectToFile(inline, this.revs.get(e.id) ?? 0, savedAt))
+    }
+
     // Inline (cwd-less) canvases: their own file under userData, written before the index and with
     // the same rules the folder leg lives by — skip an unchanged candidate, never let an empty
     // candidate overwrite a populated file this store has not read — plus the one rule only this
@@ -1928,6 +1951,22 @@ export class WorkspaceStore {
    * and an unreadable file is never taken for an absent one. Otherwise carry the project's
    * app-data settings into the folder, so they are there the moment the canvas is.
    */
+  /**
+   * Where this store has a project's canvas, answered after any save in flight (queued on
+   * `saveChain`). The move into the folder asks it after its save: a save can land while the folder
+   * write inside it did not, in which case the project stays in app data and the menu must say so.
+   */
+  projectStorage(projectId: string): Promise<ProjectStorageKind> {
+    const run = this.saveChain.then((): ProjectStorageKind => {
+      const e = this.index?.entries.find((x) => x.id === projectId)
+      if (!e) return 'none'
+      if (isFolderDataRef(e)) return 'appData'
+      return folderFileCwd(e) ? 'folder' : 'none'
+    })
+    this.saveChain = run.catch(() => {})
+    return run
+  }
+
   async prepareFolderStorage(projectId: string): Promise<PrepareFolderStorageResult> {
     const e = this.index?.entries.find((x) => x.id === projectId)
     if (!e || !isFolderDataRef(e) || !e.cwd) return { ok: false, reason: 'not-app-data' }

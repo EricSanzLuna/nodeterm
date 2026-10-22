@@ -3,13 +3,14 @@
 // canvas is pointed at it — and that a failed save puts the flag back.
 import { describe, expect, it } from 'vitest'
 import { moveProjectToAppData, moveProjectToFolder, type ProjectStorageMoveDeps } from './projectStorageMove'
-import type { PrepareFolderStorageResult, ReleaseFolderFilesResult } from '@shared/project-storage'
+import type { PrepareFolderStorageResult, ProjectStorageKind, ReleaseFolderFilesResult } from '@shared/project-storage'
 
 function harness(opts: {
   saves?: boolean[]
   release?: ReleaseFolderFilesResult[]
   prepare?: PrepareFolderStorageResult
   confirm?: boolean
+  storage?: ProjectStorageKind
 } = {}) {
   const log: string[] = []
   const saves = [...(opts.saves ?? [true])]
@@ -21,6 +22,7 @@ function harness(opts: {
     release: async (_id, removeTracked) => { log.push(`release:${removeTracked}`); return releases.shift()! },
     prepare: async () => { log.push('prepare'); return opts.prepare ?? { ok: true } },
     confirm: async () => { log.push('confirm'); return opts.confirm ?? false },
+    storage: async () => { log.push('storage'); return opts.storage ?? 'folder' },
     notice: (kind, text) => { notices.push({ kind, text }) }
   }
   return { deps, log, notices }
@@ -66,7 +68,17 @@ describe('moveProjectToFolder', () => {
   it('probes the folder BEFORE pointing the canvas at it', async () => {
     const h = harness()
     await moveProjectToFolder('p1', h.deps)
-    expect(h.log).toEqual(['prepare', 'flag:false', 'save'])
+    expect(h.log).toEqual(['prepare', 'flag:false', 'save', 'storage'])
+    expect(h.notices).toEqual([{ kind: 'info', text: 'Canvas stored in the folder, in .nodeterm/project.json.' }])
+  })
+
+  it('a save that landed without the folder file: the canvas stays in app data, and it says so', async () => {
+    const h = harness({ storage: 'appData' })
+    await moveProjectToFolder('p1', h.deps)
+    expect(h.log).toEqual(['prepare', 'flag:false', 'save', 'storage', 'flag:true', 'save'])
+    expect(h.notices).toEqual([
+      { kind: 'error', text: 'The canvas could not be written to the folder, so it stays in app data.' }
+    ])
   })
 
   it('an occupied folder changes nothing and says why', async () => {

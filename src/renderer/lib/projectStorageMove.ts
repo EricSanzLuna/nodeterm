@@ -7,12 +7,15 @@
 //    says otherwise — deleting it is a change in their repo.
 //  - Into the folder: `prepareFolderStorage` first (refuses a folder that already holds a canvas or
 //    settings, which the save would overwrite — the "Set folder…" probe-before-bind rule) → flag →
-//    save. The store deletes the app-data copy only after the folder file has landed.
+//    save → ask the store where the canvas is. A save can land while its folder write did not; the
+//    store then keeps the project in app data, and so does this (flag back, saved again). The store
+//    deletes the app-data copy only after the folder file has landed.
 //
 // Pure of React and the stores; Canvas passes the levers.
 import {
   PREPARE_FOLDER_STORAGE_REFUSALS,
   type PrepareFolderStorageResult,
+  type ProjectStorageKind,
   type ReleaseFolderFilesResult
 } from '@shared/project-storage'
 
@@ -22,6 +25,8 @@ export interface ProjectStorageMoveDeps {
   persist(): Promise<boolean>
   release(projectId: string, removeTracked: boolean): Promise<ReleaseFolderFilesResult>
   prepare(projectId: string): Promise<PrepareFolderStorageResult>
+  /** Where the store has the canvas now; asked after the move into the folder has saved. */
+  storage(projectId: string): Promise<ProjectStorageKind>
   confirm(message: string, confirmLabel: string): Promise<boolean>
   notice(kind: 'info' | 'error', text: string): void
 }
@@ -60,6 +65,8 @@ export async function moveProjectToAppData(projectId: string, deps: ProjectStora
   )
 }
 
+const FOLDER_WRITE_FAILED = 'The canvas could not be written to the folder, so it stays in app data.'
+
 export async function moveProjectToFolder(projectId: string, deps: ProjectStorageMoveDeps): Promise<void> {
   const ready = await deps.prepare(projectId)
   if (!ready.ok) {
@@ -69,7 +76,26 @@ export async function moveProjectToFolder(projectId: string, deps: ProjectStorag
   deps.setStoreInAppData(projectId, false)
   if (!(await deps.persist())) {
     deps.setStoreInAppData(projectId, true)
-    deps.notice('error', 'The canvas could not be written to the folder, so it stays in app data.')
+    deps.notice('error', FOLDER_WRITE_FAILED)
+    return
+  }
+  let where: ProjectStorageKind | 'unknown'
+  try {
+    where = await deps.storage(projectId)
+  } catch {
+    where = 'unknown'
+  }
+  if (where === 'appData') {
+    // The save landed, the folder write in it did not (a read-only or unmounted folder): the store
+    // kept the canvas in app data. Say so, and put the flag back so the next save does not keep
+    // retrying a move the user was told failed.
+    deps.setStoreInAppData(projectId, true)
+    await deps.persist()
+    deps.notice('error', FOLDER_WRITE_FAILED)
+    return
+  }
+  if (where !== 'folder') {
+    deps.notice('error', 'The canvas was saved, but nodeterm could not confirm it is now in the folder.')
     return
   }
   deps.notice('info', 'Canvas stored in the folder, in .nodeterm/project.json.')

@@ -390,6 +390,10 @@ export function buildRealApi(
       client.request(IPC.workspacePrepareFolderStorage, projectId) as ReturnType<
         WorkspaceApi['prepareFolderStorage']
       >,
+    projectStorage: (projectId: string) =>
+      client.request(IPC.workspaceProjectStorage, projectId) as ReturnType<
+        WorkspaceApi['projectStorage']
+      >,
     // REAL: core broadcasts IPC.workspaceMigrated after a v2→v3 migration (workspace-store.ts).
     onMigrated: (cb) => client.subscribe(IPC.workspaceMigrated, cb as Listener),
     // REAL: core broadcasts IPC.workspaceCorruptRecovered from the load path (workspace-store.ts).

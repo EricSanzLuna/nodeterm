@@ -173,6 +173,7 @@ const api: NodeTerminalApi = {
     releaseFolderFiles: (projectId: string, removeTracked: boolean) =>
       ipcRenderer.invoke(IPC.workspaceReleaseFolderFiles, projectId, removeTracked),
     prepareFolderStorage: (projectId: string) => ipcRenderer.invoke(IPC.workspacePrepareFolderStorage, projectId),
+    projectStorage: (projectId: string) => ipcRenderer.invoke(IPC.workspaceProjectStorage, projectId),
     onMigrated: (cb: (kind: WorkspaceMigrationKind) => void) => {
       // Older mains broadcast no payload; that was the v2→v3 migration.
       const h = (_e: unknown, kind?: WorkspaceMigrationKind) => cb(kind ?? 'v2')

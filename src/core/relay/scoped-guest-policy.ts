@@ -441,6 +441,7 @@ export const SCOPED_REFUSED: ReadonlySet<string> = new Set<string>([
   // Moving a project's storage writes and deletes host files (issue #1145); host-only.
   IPC.workspaceReleaseFolderFiles,
   IPC.workspacePrepareFolderStorage,
+  IPC.workspaceProjectStorage,
   // Host-only (shared/host-control.ts): a peer's launch claim would make the host's own viewers
   // stand down from a launch (#1173). A relay tab never sends it.
   IPC.workspaceClaimLaunch,
