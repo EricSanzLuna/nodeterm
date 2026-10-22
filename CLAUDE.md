@@ -550,8 +550,14 @@ project's nodes only.** The contract:
   (unknown ⇒ the last known owner); the same id feeds `OwningProjectContext`. A local → local
   switch keeps the key `'local'` (no remount). A session-changing remount now lands one commit
   AFTER the load applied the project's camera and builds a fresh pan/zoom, so `<ReactFlow>` gets
-  `defaultViewport={viewportRef.current}`, or the switch resets the camera to the origin.
-  `flowStoreOwner.test.tsx` replays the switches through real React Flow.
+  `defaultViewport={viewportRef.current}`, or the switch resets the camera to the origin. For the
+  same reason the load's settle timer must not frame or read the incoming nodes itself: the
+  pending focus / "Open recent" resume / `nodeterm://` link it finishes run through
+  `useFlowLanding` (`canvas/flowLanding.ts`) once the owner IS that project — React may run the
+  store copy's passive effect after a due timer, which then framed the pan/zoom the remount
+  destroys and read the outgoing copy of a shared node id. The rule holds for a local → local
+  switch too (no remount, but the owner still flips). `flowStoreOwner.test.tsx` replays the
+  switches through real React Flow, the timer firing inside that window included.
 - Switching away unmounts the old project's `TerminalNode`s → their tmux clients detach but
   the sessions keep running; switching back reattaches. tmux session names are per-node-id
   (globally unique), so projects never collide.

@@ -14,10 +14,10 @@
 // harness): it applies TerminalNode's create rule (TerminalNode.tsx, the lifecycle effect's create
 // path — `dialsSsh`, the near-side refusal, `requireRemote: sshRemoteTmux`). `CanvasReplica` is
 // Canvas cut down to the lines that matter: the load effect (`setNodes` + `installEpoch` + the
-// saved viewport), the merged array handed to `<ReactFlow nodes>`, and the keyed provider — wired
-// with the REAL `useNodesEpoch` and the REAL `useFlowStoreOwner`. The source pin at the bottom fails
+// saved viewport + the settle timer's framing), the merged array handed to `<ReactFlow nodes>`, and
+// the keyed provider — wired with the REAL `useNodesEpoch`, `useFlowStoreOwner` and `useFlowLanding`. The source pin at the bottom fails
 // if Canvas stops wiring the provider the same way, so the replica cannot silently drift.
-import { act, useEffect, useMemo, useRef, useState } from 'react'
+import { act, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import {
   ReactFlow,
@@ -48,6 +48,7 @@ import { LocalTransport } from '../terminal/local-transport'
 import { nodeStatesToFlow, type CanvasNode } from '../state/workspace'
 import { useNodesEpoch } from './nodesEpoch'
 import { useFlowStoreOwner } from './flowStoreOwner'
+import { useFlowLanding } from './flowLanding'
 
 ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -164,14 +165,44 @@ let viewports: Record<string, Viewport> = {}
 /** Every key the node-subtree provider rendered with, in order. */
 let providerKeys: string[] = []
 let readViewport: (() => Viewport) | null = null
+let readStore: ReturnType<typeof useStoreApi> | null = null
+// ── The load's settle timer and the cross-project focus it consumes (Canvas's pendingFocusRef) ──
+/** A node to frame once its project lands, as a notification click / sidebar jump stages it. */
+let pendingFocus: string | null = null
+/** false = 2e9684300's ordering: the settle timer frames at once instead of waiting for the store. */
+let gateOnOwner = true
+/** How the load schedules its settle callback; Canvas: `setTimeout(…, 0)`. Returns the cancel. */
+let scheduleSettle: (fn: () => void) => () => void = (fn) => {
+  const t = setTimeout(fn, 0)
+  return () => clearTimeout(t)
+}
+/** A settle callback held back by a test, fired by `settleAtCommitOf` below. */
+let heldSettle: (() => void) | null = null
+/** When set, the held settle fires in the COMMIT of the render that hands this project's nodes —
+ *  after that render, before its passive effects copy them into the store. That is the window a due
+ *  timer hits when React runs those passive effects in a later task (the field ordering). */
+let settleAtCommitOf: string | null = null
+/** Every landing that ran, by project. */
+let landings: string[] = []
+/** What each framing saw: the target's y in React Flow's store, and the pan/zoom it drove. */
+let framings: Array<{ id: string; y: number | null; panZoom: unknown }> = []
 function CanvasReplica() {
   const activeProjectId = useActive((s) => s.id)
   const [nodes, setNodes] = useState<CanvasNode[]>([])
   const { renderedProjectId, installEpoch } = useNodesEpoch(nodes)
-  const { setViewport, getViewport } = useReactFlow()
+  const { setViewport, getViewport, getInternalNode } = useReactFlow()
+  const store = useStoreApi()
   readViewport = getViewport
+  readStore = store
   const viewportRef = useRef<Viewport>({ x: 0, y: 0, zoom: 1 })
-  // Canvas's active-project load effect: `setNodes(flow)` + `installEpoch` + the saved viewport.
+  // Canvas merges the ephemeral cards and the keep-alive pool into a NEW array per change.
+  const allNodes = useMemo(() => [...nodes], [nodes])
+  const flowOwnerProjectId = useFlowStoreOwner(allNodes, renderedProjectId)
+  const nodeSession = sessionForProject(flowOwnerProjectId ?? '')
+  const flowLanding = useFlowLanding(flowOwnerProjectId)
+  providerKeys.push(nodeSession.id)
+  // Canvas's active-project load effect: `setNodes(flow)` + `installEpoch` + the saved viewport,
+  // then the settle timer whose framing work waits for the store (`flowLanding.land`).
   useEffect(() => {
     // Canvas's bail-out: no active project (welcome screen) leaves the PREVIOUS nodes mounted.
     if (!activeProjectId) {
@@ -186,13 +217,32 @@ function CanvasReplica() {
       viewportRef.current = vp
       void setViewport(vp)
     }
+    const projectId = activeProjectId
+    // Canvas's pendingFocusRef consumer, cut down to the two reads that matter: the node off
+    // React Flow's store (`getInternalNode`, as frameNode does) and the pan/zoom the camera moves.
+    const consume = (): void => {
+      landings.push(projectId)
+      const id = pendingFocus
+      if (!id) return
+      pendingFocus = null
+      if (!flow.some((n) => n.id === id)) return // Canvas: `nodesRef.current.find`, the node not here
+      const y = getInternalNode(id)?.internals.positionAbsolute.y ?? null
+      framings.push({ id, y, panZoom: store.getState().panZoom })
+      if (y !== null) void setViewport({ x: 40, y: 100 - y, zoom: 1 })
+    }
+    const cancelSettle = scheduleSettle(() => (gateOnOwner ? flowLanding.land(projectId, consume) : consume()))
+    return () => {
+      cancelSettle()
+      flowLanding.cancel()
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProjectId])
-  // Canvas merges the ephemeral cards and the keep-alive pool into a NEW array per change.
-  const allNodes = useMemo(() => [...nodes], [nodes])
-  const flowOwnerProjectId = useFlowStoreOwner(allNodes, renderedProjectId)
-  const nodeSession = sessionForProject(flowOwnerProjectId ?? '')
-  providerKeys.push(nodeSession.id)
+  useLayoutEffect(() => {
+    if (settleAtCommitOf === null || renderedProjectId !== settleAtCommitOf) return
+    const fire = heldSettle
+    heldSettle = null
+    fire?.()
+  }, [renderedProjectId])
   return (
     <SessionProvider session={nodeSession} key={nodeSession.id}>
       <OwningProjectContext.Provider value={flowOwnerProjectId}>
@@ -268,6 +318,17 @@ beforeEach(() => {
   stored = {}
   viewports = {}
   readViewport = null
+  readStore = null
+  pendingFocus = null
+  gateOnOwner = true
+  scheduleSettle = (fn) => {
+    const t = setTimeout(fn, 0)
+    return () => clearTimeout(t)
+  }
+  heldSettle = null
+  settleAtCommitOf = null
+  landings = []
+  framings = []
   resetSessionsForTest()
   createSession('local', fakeApi('local'), 'This machine')
   const relay = createSession('relay', fakeApi('host'), 'e2ehost')
@@ -403,6 +464,118 @@ describe('the node subtree runs under the session of the project React Flow STOR
   })
 })
 
+// ── The load's framing work waits for the store (review of 2e9684300) ──────────────────────────────
+describe('a just-loaded project is framed only once React Flow\'s store holds its nodes', () => {
+  /** Hold the next settle callback and fire it in the commit that hands `projectId`'s nodes —
+   *  before that commit's passive effects copy them into the store. No `act` boundary sits between
+   *  the two: React runs them in its own order inside one flush. */
+  function settleBeforeTheStoreCopy(projectId: string): void {
+    scheduleSettle = (fn) => {
+      heldSettle = fn
+      return () => {
+        if (heldSettle === fn) heldSettle = null
+      }
+    }
+    settleAtCommitOf = projectId
+  }
+  /** One node id in both projects ("Open here anyway", a second worktree): only its y tells the
+   *  incoming copy (2000) from the outgoing one (0). */
+  function sharedNode(from: string, to: string): void {
+    stored = { [from]: [plainTerminal('term-shared', 0)], [to]: [plainTerminal('term-shared', 2000)] }
+    useActive.setState({ id: from })
+  }
+
+  it('session-changing switch: the framing reads the INCOMING copy and drives the remounted pan/zoom', async () => {
+    sharedNode(LOCAL_ONE, TEAM_ALPHA)
+    await mount()
+    landings = []
+    pendingFocus = 'term-shared'
+    settleBeforeTheStoreCopy(TEAM_ALPHA)
+
+    await switchTo(TEAM_ALPHA)
+
+    expect(heldSettle).toBeNull() // the timer did fire, in the window
+    expect(providerKeys.at(-1)).toBe(sessionForProject(TEAM_ALPHA).id) // and the remount happened
+    expect(landings).toEqual([TEAM_ALPHA])
+    expect(framings).toHaveLength(1)
+    expect(framings[0].y).toBe(2000)
+    expect(framings[0].panZoom).toBe(readStore!.getState().panZoom)
+    expect(readViewport!()).toEqual({ x: 40, y: -1900, zoom: 1 })
+  })
+
+  it('local → local (no remount): the owner still flips, and the framing waits for it', async () => {
+    sharedNode(LOCAL_ONE, LOCAL_TWO)
+    await mount()
+    landings = []
+    pendingFocus = 'term-shared'
+    settleBeforeTheStoreCopy(LOCAL_TWO)
+
+    await switchTo(LOCAL_TWO)
+
+    expect(heldSettle).toBeNull()
+    expect(new Set(providerKeys)).toEqual(new Set(['local']))
+    expect(landings).toEqual([LOCAL_TWO])
+    expect(framings.map((f) => f.y)).toEqual([2000])
+    expect(readViewport!()).toEqual({ x: 40, y: -1900, zoom: 1 })
+  })
+
+  it.each([
+    ['session-changing', LOCAL_ONE, TEAM_ALPHA],
+    ['local → local', LOCAL_ONE, LOCAL_TWO]
+  ])('control (%s): on 2e9684300\'s ordering the same timer frames the OUTGOING copy', async (_kind, from, to) => {
+    // The window is real: without the gate, the framing reads the copy the store still holds.
+    sharedNode(from, to)
+    await mount()
+    gateOnOwner = false
+    pendingFocus = 'term-shared'
+    settleBeforeTheStoreCopy(to)
+
+    await switchTo(to)
+
+    expect(heldSettle).toBeNull()
+    expect(framings.map((f) => f.y)).toEqual([0])
+    if (sessionForProject(from).id !== sessionForProject(to).id) {
+      // ...and moved a pan/zoom instance the remount then threw away.
+      expect(framings[0].panZoom).not.toBe(readStore!.getState().panZoom)
+    }
+  })
+
+  it.each([
+    ['session-changing', TEAM_ALPHA],
+    ['local → local', LOCAL_TWO]
+  ])('%s switch into a project with NO nodes still releases the landing, once', async (_kind, to) => {
+    stored = { [LOCAL_ONE]: [plainTerminal('term-x')], [to]: [] }
+    useActive.setState({ id: LOCAL_ONE })
+    await mount()
+    landings = []
+    pendingFocus = 'term-x'
+    settleBeforeTheStoreCopy(to)
+
+    await switchTo(to)
+
+    expect(landings).toEqual([to])
+    expect(pendingFocus).toBeNull() // consumed: the node is not on this canvas, so nothing framed
+    expect(framings).toEqual([])
+    await act(async () => {
+      readStore!.getState().setNodes([]) // a later store change with the same owner
+    })
+    expect(landings).toEqual([to])
+  })
+
+  it('a timer that fires after the store copy frames at once', async () => {
+    sharedNode(LOCAL_ONE, TEAM_ALPHA)
+    await mount()
+    landings = []
+    pendingFocus = 'term-shared'
+
+    await switchTo(TEAM_ALPHA) // the default setTimeout fires after the remount
+
+    expect(landings).toEqual([TEAM_ALPHA])
+    expect(framings.map((f) => f.y)).toEqual([2000])
+    expect(framings[0].panZoom).toBe(readStore!.getState().panZoom)
+  })
+})
+
 // ── The hook alone ────────────────────────────────────────────────────────────────────────────────
 describe('useFlowStoreOwner', () => {
   let renders = 0
@@ -457,8 +630,10 @@ describe('useFlowStoreOwner', () => {
     await render(a, 'project-a')
     await storeTakes(a)
     expect(owner).toBe('project-a')
+    const before = renders
     await storeTakes([]) // e.g. a remounted <ReactFlow>'s store reset
     expect(owner).toBe('project-a')
+    expect(renders).toBe(before) // the fallback is selected, so nothing changed and nothing rendered
   })
 
   it('does not record an array handed while no project is mounted (the welcome-screen bail-out)', async () => {
@@ -481,6 +656,73 @@ describe('useFlowStoreOwner', () => {
     await storeTakes(a2) // a drag frame: a new array, same project
     expect(renders).toBe(before)
     expect(owner).toBe('project-a')
+  })
+})
+
+describe('useFlowLanding', () => {
+  let landing: ReturnType<typeof useFlowLanding> | null = null
+  function Harness({ owner }: { owner: string | null }) {
+    landing = useFlowLanding(owner)
+    return null
+  }
+  async function render(owner: string | null): Promise<void> {
+    await act(async () => {
+      root!.render(<Harness owner={owner} />)
+    })
+  }
+  beforeEach(() => {
+    landing = null
+    host = document.createElement('div')
+    document.body.append(host)
+    root = createRoot(host)
+  })
+
+  it('holds work until the store holds its project, then runs it exactly once', async () => {
+    const ran: string[] = []
+    await render('project-a')
+    landing!.land('project-b', () => ran.push('b'))
+    expect(ran).toEqual([])
+    await render('project-a')
+    expect(ran).toEqual([])
+    await render('project-b')
+    expect(ran).toEqual(['b'])
+    await render('project-a')
+    await render('project-b')
+    expect(ran).toEqual(['b'])
+  })
+
+  it('runs at once when the store already holds the project (an in-place reload, a late timer)', async () => {
+    const ran: string[] = []
+    await render('project-a')
+    landing!.land('project-a', () => ran.push('a'))
+    expect(ran).toEqual(['a'])
+  })
+
+  it('cancel drops the work: a project the user moved on from never runs it late', async () => {
+    const ran: string[] = []
+    await render('project-a')
+    landing!.land('project-b', () => ran.push('b'))
+    landing!.cancel()
+    await render('project-b')
+    expect(ran).toEqual([])
+  })
+
+  it('a later land replaces the earlier one', async () => {
+    const ran: string[] = []
+    await render('project-a')
+    landing!.land('project-b', () => ran.push('b'))
+    landing!.land('project-c', () => ran.push('c'))
+    await render('project-b')
+    expect(ran).toEqual([])
+    await render('project-c')
+    expect(ran).toEqual(['c'])
+  })
+
+  it('is one stable object (Canvas leaves it out of the load effect\'s deps)', async () => {
+    await render('project-a')
+    const first = landing
+    await render('project-b')
+    expect(landing).toBe(first)
   })
 })
 
@@ -507,6 +749,26 @@ describe('source pin (the replica mirrors Canvas)', () => {
     // Not on the active id: that flip is what remounted the outgoing nodes under the incoming session.
     expect(CANVAS).not.toMatch(/<SessionProvider session=\{sessionForProject\(activeProjectId/)
     expect(CANVAS).not.toMatch(/key=\{sessionForProject\(activeProjectId/)
+  })
+
+  it('Canvas frames a just-loaded project only through the owner-gated landing', () => {
+    const hook = CANVAS.indexOf('const flowOwnerProjectId = useFlowStoreOwner(allNodes, renderedProjectId)')
+    expect(CANVAS.indexOf('const flowLanding = useFlowLanding(flowOwnerProjectId)')).toBeGreaterThan(hook)
+    const timer = CANVAS.indexOf('const t = setTimeout(() => {\n      loadingRef.current = false')
+    const land = CANVAS.indexOf('flowLanding.land(project.id, () => {', timer)
+    const end = CANVAS.indexOf('\n    }, 0)\n', land)
+    expect(timer).toBeGreaterThan(0)
+    expect(land).toBeGreaterThan(timer)
+    expect(end).toBeGreaterThan(land)
+    const beforeLand = CANVAS.slice(timer, land)
+    const inLand = CANVAS.slice(land, end)
+    for (const ref of ['pendingFocusRef', 'pendingResumeRef', 'pendingLinkRef']) {
+      expect(beforeLand).not.toContain(ref)
+      expect(inLand).toContain(`${ref}.current`)
+    }
+    expect(inLand).toContain('goToNode(node)')
+    // The load effect's cleanup drops it, so a project the user moved on from never frames late.
+    expect(CANVAS.slice(end, end + 120)).toContain('flowLanding.cancel()')
   })
 
   it('Canvas loads nodes in an effect (the window the keying has to survive)', () => {

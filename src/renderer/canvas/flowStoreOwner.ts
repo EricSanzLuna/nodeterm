@@ -27,8 +27,10 @@ export function useFlowStoreOwner(handed: readonly unknown[], renderedProjectId:
   if (ownersRef.current === null) ownersRef.current = new WeakMap()
   const owners = ownersRef.current
   if (renderedProjectId !== null) owners.set(handed, renderedProjectId)
-  const held = useStore((s) => owners.get(s.nodes))
   const lastKnownRef = useRef<string | null>(null)
-  if (held !== undefined) lastKnownRef.current = held
-  return lastKnownRef.current
+  // The fallback lives INSIDE the selector: a remount's store reset (`[]`) then selects the same
+  // owner and schedules no render, where an `undefined` outside it cost a whole Canvas render.
+  const held = useStore((s) => owners.get(s.nodes) ?? lastKnownRef.current)
+  lastKnownRef.current = held
+  return held
 }

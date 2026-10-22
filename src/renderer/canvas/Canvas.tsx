@@ -800,6 +800,7 @@ import { snapResizeChanges } from '../lib/resizeSnap'
 import { canClearDirty, canCommitCanvas, canCreateOnCanvas, liveCanvasHolds } from '../state/persistGuards'
 import { mirrorLatest, rebaseOnLatest, useNodesEpoch } from './nodesEpoch'
 import { useFlowStoreOwner } from './flowStoreOwner'
+import { useFlowLanding } from './flowLanding'
 import { OwningProjectContext } from '../session/owning-project'
 import { boardLiveNodeIds, createKanbanPublisher } from './kanban-sync'
 import { applyToStoredCopy, createStoredCanvasPublisher } from './stored-publish'
@@ -2886,6 +2887,8 @@ export function Canvas() {
   // active id, so the outgoing project's nodes never remount under the incoming project's session.
   const flowOwnerProjectId = useFlowStoreOwner(allNodes, renderedProjectId)
   const nodeSession = sessionForProject(flowOwnerProjectId ?? '')
+  // Work that frames a just-loaded project waits for that same ownership (see flowLanding.ts).
+  const flowLanding = useFlowLanding(flowOwnerProjectId)
 
   // Context-link edges, statically styled (no per-message activity in the pull model).
   const accent = settings.accent
@@ -3441,41 +3444,49 @@ export function Canvas() {
       } else {
         setResumeProject(null)
       }
-      // Finish an "Open recent" resume that had to land on this project first.
-      const pendingResume = pendingResumeRef.current
-      if (pendingResume && pendingResume.projectId === project.id) {
-        pendingResumeRef.current = null
-        resumeCreateRef.current(pendingResume.conv)
-      }
-      // Finish a `nodeterm://open` link that had to land on this project first.
-      const pendingLink = pendingLinkRef.current
-      if (pendingLink && pendingLink.projectId === project.id) {
-        pendingLinkRef.current = null
-        if (Date.now() - pendingLink.at < PENDING_LINK_MAX_MS) linkCreateRef.current(pendingLink.open)
-      }
-      // Consume a cross-project focus request (notification click on a background node).
-      const pending = pendingFocusRef.current
-      if (pending) {
-        pendingFocusRef.current = null
-        const node = nodesRef.current.find((n) => n.id === pending)
-        if (node) {
-          // Same rule as focusNodeById: if the project we just landed on shows the BOARD, the
-          // node lives on a card, not on the canvas hidden under it.
-          if (isGlobalKanbanOpen() || isKanbanOpen(useProjects.getState().activeProjectId)) {
-            useViewMode.getState().requestCard(pending)
-          } else {
-            setNodes((ns) => ns.map((n) => ({ ...n, selected: n.id === pending })))
-            goToNode(node)
-            // Same as focusNodeById: after the cross-project switch lands, hand the keyboard to the
-            // target terminal so the user can type without a second click.
-            useTerminalFocus.getState().request(pending)
-          }
-          useAgentStatus.getState().setActive(pending, true)
-          useAgentStatus.getState().clearUnread(pending)
+      // The rest frames the new project or reads its nodes off React Flow's store, so it waits
+      // until the store holds THIS project's nodes (flowLanding.ts): a session-changing switch
+      // remounts <ReactFlow> after that copy, and this timer can fire before it.
+      flowLanding.land(project.id, () => {
+        // Finish an "Open recent" resume that had to land on this project first.
+        const pendingResume = pendingResumeRef.current
+        if (pendingResume && pendingResume.projectId === project.id) {
+          pendingResumeRef.current = null
+          resumeCreateRef.current(pendingResume.conv)
         }
-      }
+        // Finish a `nodeterm://open` link that had to land on this project first.
+        const pendingLink = pendingLinkRef.current
+        if (pendingLink && pendingLink.projectId === project.id) {
+          pendingLinkRef.current = null
+          if (Date.now() - pendingLink.at < PENDING_LINK_MAX_MS) linkCreateRef.current(pendingLink.open)
+        }
+        // Consume a cross-project focus request (notification click on a background node).
+        const pending = pendingFocusRef.current
+        if (pending) {
+          pendingFocusRef.current = null
+          const node = nodesRef.current.find((n) => n.id === pending)
+          if (node) {
+            // Same rule as focusNodeById: if the project we just landed on shows the BOARD, the
+            // node lives on a card, not on the canvas hidden under it.
+            if (isGlobalKanbanOpen() || isKanbanOpen(useProjects.getState().activeProjectId)) {
+              useViewMode.getState().requestCard(pending)
+            } else {
+              setNodes((ns) => ns.map((n) => ({ ...n, selected: n.id === pending })))
+              goToNode(node)
+              // Same as focusNodeById: after the cross-project switch lands, hand the keyboard to
+              // the target terminal so the user can type without a second click.
+              useTerminalFocus.getState().request(pending)
+            }
+            useAgentStatus.getState().setActive(pending, true)
+            useAgentStatus.getState().clearUnread(pending)
+          }
+        }
+      })
     }, 0)
-    return () => clearTimeout(t)
+    return () => {
+      clearTimeout(t)
+      flowLanding.cancel()
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProjectId, reloadNonce, setNodes, setViewport, installEpoch])
 
