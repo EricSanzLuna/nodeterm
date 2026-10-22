@@ -539,7 +539,19 @@ export function ModalTerminal({
         requireRemote: spawn.sshRemoteTmux,
         // Same local-login exemption as the canvas node (issue #1186).
         ...(isLocalOnSshCanvas(nodeId) ? { localOnSshCanvas: true } : {})
-      })
+      }).catch((err: unknown): Error => (err instanceof Error ? err : new Error(String(err))))
+      // A create that REJECTS started nothing — the core could not be asked (a relay tab whose
+      // connection is gone, e.g. the offline relay session, answers every call with E_DISCONNECTED).
+      // Say so, like TerminalNode's spawn-error overlay, instead of a blank viewer and an unhandled
+      // rejection out of this effect.
+      if (res instanceof Error) {
+        if (!dead) {
+          // eslint-disable-next-line no-control-regex -- the message is written INTO the terminal
+          const why = res.message.replace(/[\x00-\x1f\x7f]/g, ' ')
+          term.write(`\r\n\x1b[90m[this terminal could not be started: ${why}]\x1b[0m\r\n`)
+        }
+        return
+      }
       // Refused core-side (the master died inside our round-trip, or `ssh` is missing).
       if (res.unavailable) {
         const refusal = ptyRefusal(res.unavailable)

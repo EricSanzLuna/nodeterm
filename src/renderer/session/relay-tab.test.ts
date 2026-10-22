@@ -15,7 +15,11 @@ import {
   resetSessionsForTest,
   projectIdsBoundToSession,
   bindProjectToSession,
+  boundSessionForProject,
+  setOfflineRelayApiFactory,
+  OFFLINE_RELAY_SESSION_ID,
 } from './session'
+import { useProjects } from '../state/projects'
 import { LocalTransport } from '../terminal/local-transport'
 import { planActiveProjectDials } from '../lib/sshAttachments'
 import type { NodeTerminalApi, Project, Workspace } from '@shared/types'
@@ -113,8 +117,38 @@ describe('openRelayTab (connect → tab → mount)', () => {
     expect(close).not.toHaveBeenCalled()
     tab.dispose()
     expect(close).toHaveBeenCalledTimes(1)
-    expect(sessionForProject(tab.projectId).source).toBe('local') // unbound → local
+    // Unbound → local, because THIS test's projects store does not hold 'proj-1' (addProject is a
+    // spy), so nothing says the tab is remote. A remote tab resolves to the offline relay session
+    // instead — the next test.
+    expect(useProjects.getState().getProject(tab.projectId)).toBeUndefined()
+    expect(sessionForProject(tab.projectId).source).toBe('local')
     expect(sessionCount()).toBe(1) // only local remains
+  })
+
+  it('a disposed tab whose project is REMOTE in the store resolves to the offline relay session, never local', async () => {
+    const { api } = fakeBridgedApi()
+    const handle: RelayApiHandle = { api, ready: () => Promise.resolve(), close: vi.fn() }
+    const { deps } = makeDeps({ handle })
+    // The relay ingest adopts the host's project with `remote: true` (openRelayTab's adopt path).
+    useProjects.setState({ projects: [{ id: 'proj-1', name: "Ayşe's Mac", remote: true } as unknown as Project] })
+    const offlineApi = { marker: 'offline-relay' } as unknown as NodeTerminalApi
+    setOfflineRelayApiFactory(() => offlineApi)
+    try {
+      const tab = await openRelayTab('conn-1', "Ayşe's Mac", deps)
+      expect(boundSessionForProject(tab.projectId)?.id).toBe(tab.sessionId)
+      tab.dispose()
+      const s = sessionForProject(tab.projectId)
+      expect(s.id).toBe(OFFLINE_RELAY_SESSION_ID)
+      expect(s.source).toBe('relay')
+      expect(s.status).toBe('offline')
+      expect(s.api).toBe(offlineApi)
+      // The lifecycle question — "which relay session is bound to this tab?" — has no answer now.
+      expect(boundSessionForProject(tab.projectId)).toBeNull()
+      expect(sessionCount()).toBe(1) // the sentinel is not a registered session
+    } finally {
+      setOfflineRelayApiFactory(null)
+      useProjects.setState({ projects: [], activeProjectId: '' })
+    }
   })
 
   it('populates the tab by ADOPTING the host\'s scoped project (nodes intact, remote:true)', async () => {

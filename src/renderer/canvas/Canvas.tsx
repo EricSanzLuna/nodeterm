@@ -657,6 +657,7 @@ import {
   useSession,
   SessionProvider,
   sessionForProject,
+  boundSessionForProject,
   presenceForProject,
   setActiveSession,
   disposeSession,
@@ -1692,10 +1693,12 @@ export function Canvas() {
   //
   // Dispose by the project BINDING, not by iterating relayTabsRef: an INVOLUNTARY drop already
   // removed the tab from relayTabsRef (it went offline) but KEPT the session bound, so only
-  // `sessionForProject` still reaches it — iterating relayTabsRef alone would orphan the offline
-  // session in the registry forever. `disposeSession` is idempotent: it runs the held teardowns for
-  // a still-live tab, no-ops them for an already-offline one, and unbinds + drops the entry either
-  // way. We also sweep any live relayTabsRef entry for the project so a dead connectionId can't linger.
+  // `boundSessionForProject` still reaches it — iterating relayTabsRef alone would orphan the offline
+  // session in the registry forever. (The live binding only: an UNBOUND remote tab resolves through
+  // `sessionForProject` to the offline relay sentinel, which owns nothing and is never disposed.)
+  // `disposeSession` is idempotent: it runs the held teardowns for a still-live tab, no-ops them for
+  // an already-offline one, and unbinds + drops the entry either way. We also sweep any live
+  // relayTabsRef entry for the project so a dead connectionId can't linger.
   const disposeRelayTabForProject = useCallback((projectId: string) => {
     // One of a hosted team's several tabs: dismiss just this one. The team's connection lives on
     // for the others (and the joiner keeps reconnecting into one that is still open).
@@ -1706,15 +1709,15 @@ export function Canvas() {
     }
     // A hosted tab's team stops trying to come back into it, in any phase (R40). A no-op otherwise.
     hostedJoinerRef.current?.tabClosed(projectId)
-    const s = sessionForProject(projectId)
+    const s = boundSessionForProject(projectId)
     for (const [connectionId, tab] of relayTabsRef.current) {
       // By session too: a team's last tab may be one a share event opened after the mount. Never
       // while the connection still serves other tabs (one closed earlier lingers in `projectIds`).
-      const ours = tab.projectIds.includes(projectId) || (s.source === 'relay' && tab.sessionId === s.id)
+      const ours = tab.projectIds.includes(projectId) || (s?.source === 'relay' && tab.sessionId === s.id)
       const othersBound = projectIdsBoundToSession(tab.sessionId).some((id) => id !== projectId)
       if (ours && !othersBound) relayTabsRef.current.delete(connectionId)
     }
-    if (s.source === 'relay') {
+    if (s?.source === 'relay') {
       disposeSession(s.id)
       useHostedTeams.getState().forget(s.id) // a no-op for a Team Access relay tab
     }
@@ -5628,9 +5631,10 @@ export function Canvas() {
         .then((tab): HostedMountOutcome | null => {
           relayTabsRef.current.set(connectionId, tab)
           // The session's api, read ONCE while the mount's tab is surely bound to it: a share event
-          // may close that tab later, and resolving through it then would answer the local session.
-          const bound = sessionForProject(tab.projectId)
-          const api = bound.id === tab.sessionId ? bound.api : null
+          // may close that tab later, and resolving through it then would answer no session at all.
+          // The live binding only — never the offline sentinel an unbound remote tab falls back to.
+          const bound = boundSessionForProject(tab.projectId)
+          const api = bound?.id === tab.sessionId ? bound.api : null
           if (reconnectProjectId) {
             // The fresh session is now bound to the tab (openRelayTab rebound the SAME project id),
             // so it is finally safe to drop the stale offline session it replaced. Disposing only
@@ -5783,7 +5787,9 @@ export function Canvas() {
       bookmarks: async () => (await window.nodeTerminal.relayHosted?.bookmarks()) ?? [],
       removeBookmark: (hostId) => window.nodeTerminal.relayHosted.removeBookmark(hostId),
       mount: (connectionId, req, hooks) => {
-        const bound = req.reconnectProjectId ? sessionForProject(req.reconnectProjectId) : null
+        // The live binding only: the stale session a reconnect replaces is never the offline
+        // sentinel an unbound remote tab resolves to (it would be "disposed" after the rebind).
+        const bound = req.reconnectProjectId ? boundSessionForProject(req.reconnectProjectId) : null
         return confirmAndMount(
           connectionId,
           req.label || 'Hosted team',
@@ -5863,8 +5869,9 @@ export function Canvas() {
       // A hosted team's tab reconnects from its bookmark: no code to paste.
       if (hostedJoinerRef.current?.reconnectTab(projectId)) return
       const label = useProjects.getState().getProject(projectId)?.name ?? 'Remote host'
-      const bound = sessionForProject(projectId)
-      const staleSessionId = bound.source === 'relay' ? bound.id : undefined
+      // The live binding only (never the offline sentinel): an unbound tab has no stale session.
+      const bound = boundSessionForProject(projectId)
+      const staleSessionId = bound?.source === 'relay' ? bound.id : undefined
       void reconnectRelayTab(projectId, {
         promptForOffer: async () => {
           const offer = await promptDialog({ message: "Paste the host's new pairing code:" })
