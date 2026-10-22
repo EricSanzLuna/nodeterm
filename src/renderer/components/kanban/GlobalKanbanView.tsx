@@ -4,6 +4,7 @@ import { AGENT_CONFIG, BUILTIN_AGENT_IDS, type AgentId } from '@shared/agents/co
 import { useProjects } from '../../state/projects'
 import { useSettings } from '../../state/settings'
 import { useBoardWallpaperStyle } from '../../state/wallpaper'
+import { AerialWallpaper } from '../AerialWallpaper'
 import {
   addColumn, assignNode, assignedTo, boardLabels, cardMatchesLabelFilter, cardMeta, columnForNode,
   deleteColumn, labelsForCard, moveColumn,
@@ -519,6 +520,7 @@ export const GlobalKanbanView = memo(function GlobalKanbanView({ live = null, on
   if (projects.length === 0) {
     return (
       <div className="kanban-overlay global-kanban" style={boardStyle}>
+        {boardStyle && <AerialWallpaper board />}
         <div className="kanban-header"><span className="kanban-header__name">All Projects</span><KanbanScopeSwitch scope="all" /></div>
         <div className="kanban-empty">No projects yet. Create a project to see its swimlane.</div>
       </div>
@@ -527,6 +529,7 @@ export const GlobalKanbanView = memo(function GlobalKanbanView({ live = null, on
 
   return (
     <div className="kanban-overlay global-kanban" ref={containerRef} style={boardStyle}>
+      {boardStyle && <AerialWallpaper board />}
       <div className="kanban-header">
         <span className="kanban-header__name">All Projects</span>
         <KanbanScopeSwitch scope="all" />

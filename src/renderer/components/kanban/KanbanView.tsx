@@ -17,6 +17,7 @@ import { useViewMode } from '../../state/viewMode'
 import { useProjects } from '../../state/projects'
 import { useSettings } from '../../state/settings'
 import { useBoardWallpaperStyle } from '../../state/wallpaper'
+import { AerialWallpaper } from '../AerialWallpaper'
 import {
   AT_COLUMN_END, addColumn, assignNode, assignedTo, boardLabels, cardAssignees, cardMatchesLabelFilter, cardMeta, columnForNode,
   deleteColumn, labelsForCard, moveColumn,
@@ -1051,6 +1052,7 @@ export const KanbanView = memo(function KanbanView({
 
   return (
     <div className="kanban-overlay" style={boardStyle}>
+      {boardStyle && <AerialWallpaper board />}
       {/* Title strip: names the board's project AND pushes the columns below the top-right
           controls cluster, so column headers never sit under its icons. */}
       <div className="kanban-header">

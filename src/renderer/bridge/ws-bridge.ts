@@ -1121,7 +1121,9 @@ export function buildWallpaperApi(client: RpcClient): Pick<NodeTerminalApi, 'wal
     wallpaper: {
       listStills: () => client.request(IPC.wallpaperListStills) as Promise<WallpaperStill[]>,
       load: (w: DesktopWallpaper) => client.request(IPC.wallpaperLoad, w) as Promise<string | null>,
-      importImage: (p: string) => client.request(IPC.wallpaperImport, p) as Promise<DesktopWallpaper>
+      importImage: (p: string) => client.request(IPC.wallpaperImport, p) as Promise<DesktopWallpaper>,
+      listAerials: () => client.request(IPC.wallpaperListAerials) as Promise<WallpaperStill[]>,
+      aerialClips: (w: DesktopWallpaper) => client.request(IPC.wallpaperAerialClips, w) as Promise<string[]>
     }
   }
 }

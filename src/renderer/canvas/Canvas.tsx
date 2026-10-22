@@ -976,6 +976,7 @@ import type { TeamStation } from '../lib/teamProgress'
 import { canvasTeamStations, useTeamStations } from '../state/teamStations'
 import { applyPullAutoMove } from '../lib/pullAutoMove'
 import { useWallpaperBackground, wallpaperLayers } from '../state/wallpaper'
+import { AerialWallpaper } from '../components/AerialWallpaper'
 import { showCanvasDots } from '../lib/canvasDots'
 import { PROJECT_NAME_MAX, clampProjectName } from '@shared/project-name'
 
@@ -19259,6 +19260,7 @@ export function Canvas() {
 
   return (
     <div className="canvas-root" style={wallpaperStyle}>
+      <AerialWallpaper />
       <TabBar
         onSwitch={switchProject}
         onReconnect={reconnectRelay}

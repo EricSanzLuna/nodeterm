@@ -403,6 +403,8 @@ export const IPC = {
   wallpaperListStills: 'wallpaper:list-stills',
   wallpaperLoad: 'wallpaper:load',
   wallpaperImport: 'wallpaper:import',
+  wallpaperListAerials: 'wallpaper:list-aerials',
+  wallpaperAerialClips: 'wallpaper:aerial-clips',
   // Run node (core/run-service.ts): launch.json entries, devices, launcher, status, stop, signals.
   runEntries: 'run:entries',
   runDevices: 'run:devices',
