@@ -1045,6 +1045,24 @@ body,
   box-shadow: 0 12px 36px rgba(0, 0, 0, calc(0.55 * var(--shadow-k)));
 }
 
+/* The add menu lists every node kind and agent (860px+ on a stock setup), so on a short window its
+   top ran up under the tab bar and off the screen, where those rows could not be clicked. It is
+   capped to the space between the tab bar and the dock, and its rows scroll inside an inner list:
+   scrolling the menu box itself would scroll its glass `::before` layer away with the rows. 54px
+   is the dock's measured height, 16px the menu's gap above the dock plus a margin below the tab
+   bar. The agent flyouts are portaled out of the list (Dock.tsx). */
+.dock-add-menu {
+  max-height: calc(100vh - var(--tabbar-h) - var(--float-gap) - 54px - 16px);
+}
+.dock-menu__list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
 .dock-menu button {
   display: flex;
   align-items: center;
