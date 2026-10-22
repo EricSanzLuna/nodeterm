@@ -223,7 +223,7 @@ export function ModalTerminal({
   visualRef.current = visual
   // Liquid Glass: the same glass as the canvas node (a second view of one session must look like
   // it). The DOM renderer keeps app-painted cell backgrounds opaque (see CLAUDE.md).
-  const { glass, vars: glassVars } = useTerminalGlass(visual.terminalTheme)
+  const { glass, vars: glassVars } = useTerminalGlass(visual.terminalTheme, true)
   const glassRef = useRef(glass)
   glassRef.current = glass
   const [dropping, setDropping] = useState(false)

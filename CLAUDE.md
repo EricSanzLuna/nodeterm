@@ -7125,8 +7125,9 @@ glass never sits over plain black; a wallpaper the user chose is never replaced.
   backgrounds opaque); the settings preview never does. Glass stands down while a shared glyph grid is
   mounted (it paints text BELOW the nodes, so a tint would cover it), and, only when **Keep blur while
   moving** is off, the blur is dropped while the camera moves (`.canvas-moving`, toggled by
-  `onMoveStart`/`onMoveEnd` via classList so a pan does not re-render Canvas) — the tint alone
-  carries the contrast guarantee.
+  `onMoveStart`/`onMoveEnd` via classList so a pan does not re-render Canvas). Only the blur
+  pauses: nodes keep their backdrop squeeze (see **Backdrop squeeze**), which is what holds the text
+  left of the Readable tick.
 - **App-painted cell backgrounds become glass** (`terminal/glass-cell-backgrounds.ts`). addon-webgl
   0.18.0 paints every background rectangle at alpha 1 (`RectangleRenderer._updateRectangle`,
   `$a = 1`), so full-screen TUIs read as slabs: Grok's `48;2;20;20;20` screen fill, Codex's composer,
@@ -7292,22 +7293,45 @@ glass never sits over plain black; a wallpaper the user chose is never replaced.
   glass header are ink over a tinted chip (`-webkit-text-fill-color: var(--text)` with the chip
   mixed from `currentColor`), not coloured text. `styles.palette.test.ts` pins the mapping and that
   no two meanings resolve to the same colour, in both themes.
+- **Backdrop squeeze: readable at every slider position** (`glassBackdropRange`,
+  `glassChromeBackdropRange`, `glassBackdropFilter` in `glassContrast.ts`). Left of the tick the
+  tint alone measured about 1:1 at Clear (dark text over a black wallpaper, light text over a white
+  one). So each glass node appends a colour-matrix filter that squeezes the backdrop into a range
+  the tint can cover: light glass lifts it to a floor (`contrast(c) brightness(b)` maps 0..1 to
+  lo..1), dark glass caps it (`brightness(hi)`). CSS filter functions work per channel in gamma
+  sRGB, the space `composite` blends in (measured live: predicted 153, rendered 154), so every
+  squeezed channel lies in the range and the grey-endpoint argument still holds. The promise slides
+  with the slider (`glassMinRatio`): `GLASS_CLEAR_RATIO` 3:1 at Clear rising to 4.5:1 at the tick,
+  picked by eye over light and dark wallpapers in both themes (4.5:1 at Clear dimmed bright
+  wallpapers to brown). Light glass also gets a frost floor that fades in toward the tick
+  (`glassFrostFloor`, full `GLASS_LIGHT_FROST` 0.5 from the tick; without it light glass over a dark
+  wallpaper read as grey mud); the text and control chrome chains carry the same floor as a static
+  `--glass-frost` (light only). Terminal nodes get theirs per node as `--term-glass-backdrop`
+  (`useTerminalGlass`); canvas cards (subagent, files, loop, trigger, dino) follow the slider too
+  (`--glass-node-bg` at `glassSurfaceAlpha`, squeeze `--glass-node-squeeze`, both from App.tsx).
+  Glass that needs no squeeze gets no filter (null; `var(--x,)` falls back to nothing), so dark
+  glass at or right of the tick runs the exact chain it ran before. The kanban card modal's terminal
+  has no backdrop filter of its own, so it never goes clearer than the tick
+  (`useTerminalGlass(theme, true)`). Under Liquid Glass the empty-canvas hint is a text-surface pill
+  (its faint ink vanished on the wallpaper). Measured with 4 terminals panning: no frame-time change.
 - **Glass slider + refraction** (Settings → Appearance, shown only under Liquid Glass; iOS 26's
   Clear ↔ Tinted). `settings.glassTint` is a slider POSITION, not an alpha (`null` = the Readable
   tick, read through `resolveGlassSlider`): every surface has its own readable alpha, so each maps
-  the position through three points — `GLASS_CLEAR_ALPHA` 0.2 at Clear (terminal nodes; chrome controls 0.35, text surfaces never below readable — see Liquid Glass chrome), its OWN computed readable
+  the position through three points — `GLASS_CLEAR_ALPHA` 0.05 at Clear (terminal nodes and canvas cards; chrome controls 0.35, text surfaces never below readable — see Liquid Glass chrome), its OWN computed readable
   alpha at `GLASS_READABLE_TICK` (0.7), `max(readable, 0.95)` at Tinted (`glassSliderAlpha`). At the
   tick every surface is exactly at the alpha `glassTintAlpha`/`glassChromeAlpha` computed, and every
-  alpha right of it is higher — so Readable→Tinted keeps 4.5:1; left of the tick the row says the
-  guarantee is off. Measured: chrome dark 0.20 / 0.70 / 0.95, chrome light 0.20 / 0.745 / 0.95,
-  nodeterm-dark 0.20 / 0.675 / 0.95 (Clear / Readable / Tinted). App.tsx sets `--glass-t` (blur
-  16→28px on chrome and × 0.85 = 13.6→23.8px on terminal nodes via `--glass-term-blur`; saturation
+  alpha right of it is higher, so Readable→Tinted keeps 4.5:1 from the tint alone; left of the tick
+  the backdrop squeeze carries a sliding promise (see **Backdrop squeeze**). Measured: chrome dark
+  0.05 / 0.70 / 0.95, chrome light 0.05 / 0.745 / 0.95, nodeterm-dark 0.05 / 0.675 / 0.95 (Clear /
+  Readable / Tinted). App.tsx sets `--glass-t` (blur 16→28px on chrome text and controls; canvas
+  cards (`--glass-blur`) and terminal nodes (`--glass-term-blur`, × 0.85) run 4px at Clear up to the
+  same 24.4px at the tick, `16 + 12t − 12·max(0, 1 − t/0.7)`, picked by eye so Clear reads through; saturation
   `--glass-sat` 180% at Clear → 150% from the Readable tick to Tinted, text surfaces a flat 150% —
   round 2 N9: 1.6–2.0 turned glass olive or pink over bright wallpapers). **Refraction** is ONE shared SVG filter
   (`components/GlassRefraction.tsx`, `#nt-refract`: a 256² edge-lens displacement map generated once,
   `primitiveUnits="objectBoundingBox"` so one filter fits every element), referenced from
-  `--glass-blur` as `url(#nt-refract)` — no per-node filters. **It runs LAST in the chain**
-  (`blur() saturate() url()`) and composites over its SourceGraphic so its output is opaque: first in
+  `--glass-blur` as `url(#nt-refract)` — no per-node filters. **It runs after the blur**
+  (`blur() saturate() url()`; only the colour-matrix squeeze may follow it, since it moves no pixels) and composites over its SourceGraphic so its output is opaque: first in
   the chain (plus an in-filter soft blur with default edgeMode) it let Chromium show a 20–40px band of
   SHARP backdrop inside every glass rim at every slider value (visual QA C1). Measured on an empty
   `.ctx-menu` over terminal text, rim-band high-frequency energy 2.55 → 0.20 (Clear), 1.90 → 0.07

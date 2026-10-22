@@ -544,7 +544,7 @@ export function AppearanceSection({ isActive }: { isActive: boolean }): React.JS
                 : glassA11y.moreContrast
                 ? 'Increase Contrast is on in your system settings, so glass stays at Tinted with stronger edges.'
                 : glassSlider < GLASS_READABLE_TICK
-                ? 'Clearer than Readable: text can fade over bright parts of the wallpaper.'
+                ? 'Clearer than Readable: more of the wallpaper shows through, and terminal text stays readable.'
                 : 'Regular text keeps 4.5:1 contrast over any wallpaper.'
             }
             control={
