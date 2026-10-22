@@ -30,6 +30,9 @@ Run `npm run rebuild`. node-pty 1.1.0 leaks a pty device per spawn on macOS
 conhost alive per killed session (its exit thread deletes the ConPTY baton without closing the
 HPCON); we patch both sources before `electron-rebuild` compiles them, and that test guards the
 patches surviving upgrades.
+The same goes for `src/core/speech/smart-whisper-patch.test.ts`: `scripts/patch-smart-whisper.mjs`
+adds an AVX2 build of whisper.cpp beside the baseline on Linux x64 (issue #1267, ~10× faster
+dictation), and `npm run rebuild` applies it.
 After the rebuild, `scripts/stage-conpty-dll.mjs` copies node-pty's bundled `conpty.dll` +
 `OpenConsole.exe` back beside `build/Release/conpty.node` on Windows (the rebuild deletes them);
 without them Windows terminals fall back to the inbox ConPTY, where a fullscreen TUI cannot scroll.
@@ -267,6 +270,13 @@ priority, labels, the phone's label verb) rebuilds the entry from a fixed list a
 anything else. Board-level fields survive every transform — `pullLinks` is one.
 
 ## House rules
+
+- **Check `src/shared` before writing a two-line helper.** A JSON-object guard (`isRecord`), an
+  error's message (`errorText`), `sleep`, the root-space parent walk (`rootPositionWith`) and the
+  credential-store temp sweep (`sweepForeignTempFiles` in `core/fs-atomic.ts`) each existed in five
+  to twenty-one hand-typed copies until #1252's follow-up, and the parent walk's copies had already
+  drifted apart on corrupt canvases. A local helper that shares a name but behaves differently
+  (zellij's `errorText`, windows-conpty's array-accepting guard) is not a copy; leave it alone.
 
 - **Typing into a pane by node id goes through `PtyManager.sendPaneKeys`, and an SSH-project node
   is never read or typed into on the local tmux socket.** An unmounted remote node resolves through

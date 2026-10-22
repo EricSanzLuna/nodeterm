@@ -2,7 +2,7 @@ import type { SshConnection } from '../shared/ssh'
 import { promises as fs } from 'fs'
 import { createHash, randomUUID } from 'node:crypto'
 import path from 'path'
-import { renameAtomic, writeFileAtomic } from './fs-atomic'
+import { renameAtomic, sweepForeignTempFiles, writeFileAtomic } from './fs-atomic'
 import { IPC } from '../shared/ipc'
 import { platform } from './platform'
 import {
@@ -229,26 +229,6 @@ export async function writeAtomic(filePath: string, content: string): Promise<vo
   await writeFileAtomic(filePath, content)
 }
 
-/** Remove tmp litter next to `target` left by writers that died mid-write: the legacy fixed
- *  `<file>.tmp` name and any `<file>.<pid>.<seq>[.<uuid>].tmp` from another (dead) pid. Our own
- *  pid's temps are in-flight writes and stay. Same family rule as provider-cookie's sweep. */
-async function sweepStaleTmp(target: string): Promise<void> {
-  try {
-    const dir = path.dirname(target)
-    const base = path.basename(target)
-    for (const entry of await fs.readdir(dir)) {
-      if (!entry.startsWith(base) || !entry.endsWith('.tmp')) continue
-      const middle = entry.slice(base.length, -'.tmp'.length) // '' or '.<pid>.<seq>[.<uuid>]'
-      const owner = /^\.(\d+)\.\d+(?:\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})?$/.exec(middle)?.[1]
-      if (middle === '' || (owner && owner !== String(process.pid))) {
-        await fs.rm(path.join(dir, entry), { force: true }).catch(() => undefined)
-      }
-    }
-  } catch {
-    // A dir we cannot read is not a reason to fail the load.
-  }
-}
-
 /**
  * Whether `real` (already a real path) is the filesystem root, the real home directory, or a folder
  * that contains it. A shared folder is readable by every teammate, Viewers included, and a home
@@ -468,7 +448,7 @@ export class WorkspaceStore {
   private async loadInner(sideline: boolean): Promise<Workspace> {
     // Read-only loads (sideline: false — the relay blob path) must not mutate the disk, so the
     // litter sweep rides the same flag as the corrupt-file sideline.
-    if (sideline) await sweepStaleTmp(this.indexPath)
+    if (sideline) await sweepForeignTempFiles(this.indexPath)
     let raw: string
     try {
       raw = await fs.readFile(this.indexPath, 'utf-8')
@@ -608,7 +588,7 @@ export class WorkspaceStore {
           }
         })
       } else if (e.cwd) {
-        if (sideline) await sweepStaleTmp(projectFilePath(e.cwd))
+        if (sideline) await sweepForeignTempFiles(projectFilePath(e.cwd))
         const read = await this.readProjectFile(e.cwd, sideline)
         if (read) {
           const p = read.file
@@ -1135,7 +1115,7 @@ export class WorkspaceStore {
   private async loadDataFileEntry(e: IndexEntryV3, sideline: boolean): Promise<LoadedEntry | null> {
     if (!isInlineProjectFileId(e.id)) return null
     const file = inlineFilePath(e.id)
-    if (sideline) await sweepStaleTmp(file)
+    if (sideline) await sweepForeignTempFiles(file)
     const read = await this.readDataFile(e.id, sideline)
     if (!read) return null
     this.revs.set(e.id, read.file.rev)

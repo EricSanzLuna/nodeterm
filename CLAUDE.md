@@ -5920,7 +5920,14 @@ bridges enter live state only via `appendBridgeEdges`) and the server
     **login node** that runs `claude /login` under the account dir. Core polls the dir's
     `.claude.json` (`LOGIN_POLL_MS` 2 s, up to `LOGIN_TIMEOUT_MS` 5 min) for `oauthAccount.email`;
     on capture the account flips out of `pending` with its email as the default label. Account
-    removal cancels any pending wait + `markDirty`. **Codex accounts have the same two halves** —
+    removal cancels any pending wait + `markDirty`. **A removal that deletes the dir first MOVES the
+    account's Claude sessions to the system account** (`renderer/lib/accountRemoval.ts`): a running
+    `claude` keeps the account's `CLAUDE_CONFIG_DIR` in its tmux env, so deleting the dir under it
+    left the CLI logged out and repainting half-blank. Active canvas → the ordinary switch
+    (`runClaudeAccountSwitch` to system), or copy + recycle for an idle node the switch cannot drive;
+    other projects → `copySession` + tmux kill (they cold-resume on next open). Any busy session, or
+    one that could not be moved, refuses the removal and keeps the account. Linked accounts and a
+    disconnected host's account delete nothing, so they skip the move. **Codex accounts have the same two halves** —
     `createCodexAccountLoginNode` (`codex login`, title "Codex login") behind the
     `nodeterm:add-codex-account-login` listener, with `codexAccounts.waitLogin` polling the managed
     home's `auth.json`. **On Windows the Codex identity comes from that `auth.json`'s id_token JWT
@@ -9870,6 +9877,27 @@ Voice-to-text input captured via microphone, turned into terminal text via on-de
   the default is still `auto`. **Mobile** keeps its own list, tracked separately as issue #591.
 - **Browser constraints** — `getUserMedia` requires HTTPS or `localhost`; mic permission prompt is the browser's own (not handled by nodeterm). Model downloads land on the **server's data dir** (accessible across sessions).
 - **Electron + native dep** — smart-whisper is externalized + `asarUnpack`'d (not bundled); `postinstall` rebuilds it against Electron's ABI. Device verification of the ABI rebuild is not yet exercised on a dev machine — test paths exist but have not been run in CI.
+- **Linux x64 ships TWO whisper binaries, picked per CPU (issue #1267).** smart-whisper's
+  binding.gyp passes no `-m` flags, so on x86-64 ggml compiles at the SSE2 baseline and every
+  AVX/AVX2/FMA/F16C kernel drops out (`objdump -d smart-whisper.node | grep -c ymm` = **0** on the
+  shipped build). Measured, base model, 3 s of audio, 12-thread AVX2 box: **18.8 s** as shipped vs
+  **1.9 s** with `-mavx -mavx2 -mfma -mf16c`, and the same 11.2 s → 1.5 s under Electron's ABI; the
+  report was large-v3-turbo taking ~7 min for one sentence. `scripts/patch-smart-whisper.mjs` (run
+  before `electron-rebuild` in `postinstall`/`rebuild`, beside the node-pty patch) adds a
+  `smart-whisper-avx2` target behind a gyp `OS=="linux" and target_arch=="x64"` condition — mac and
+  Windows builds are unchanged — and makes smart-whisper's loader read
+  `globalThis.__NODETERM_WHISPER_BINARY__`. `pickWhisperBinary` sets it from `/proc/cpuinfo`.
+  **Never ship a single `-mavx2` build**: on a CPU without AVX2 that is a SIGILL that takes the
+  whole app down on the first dictation, which is why the baseline stays and why every failure
+  (flags unreadable, variant file absent, variant fails to load) falls back to it rather than to
+  "unavailable". `WHISPER_SIMD_FLAGS` and the script's `SIMD_FLAGS` must name the same set (pinned
+  by `smart-whisper-patch.test.ts`, which also fails on an unpatched install). Threads:
+  `whisperThreads` replaces whisper.cpp's `min(4, cpus)` with about half the logical CPUs plus two,
+  capped at 8 — **not** every CPU: ggml's workers spin-wait, and 12 threads on 12 busy logical CPUs
+  measured 12.8 s against 8 threads' 1.4 s. Not covered yet: macOS x64 (Accelerate, same missing
+  SIMD flags in ggml), a GPU backend (this smart-whisper has no Vulkan build option), cancelling a
+  running transcription, and the Server Edition (installed with `--ignore-scripts`, so it keeps the
+  baseline; the startup log line `[speech] whisper binary: …` says which binary loaded).
 
 ## Packaging & auto-update
 
