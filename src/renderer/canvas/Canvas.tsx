@@ -18196,16 +18196,21 @@ export function Canvas() {
   /** Land on `projectId`, then resume there (now if the canvas already holds it). */
   const resumeWhenLanded = useCallback(
     (projectId: string, conv: RecentConversation) => {
+      // "Holds it" means React Flow's store, not just the epoch tag: after "Open folder & resume"
+      // switches projects, this runs in the `.then` after the load effect installed the tag but
+      // before the store copy, and framing then would drive the pan/zoom a remount destroys.
+      // Otherwise the load effect's landing consumes the pending resume (flowLanding.ts).
       if (
         projectId === useProjects.getState().activeProjectId &&
-        canCreateOnCanvas(nodesProjectIdRef.current, projectId)
+        canCreateOnCanvas(nodesProjectIdRef.current, projectId) &&
+        flowLanding.holds(projectId)
       ) {
         createRecentResumeNode(conv)
         return
       }
       pendingResumeRef.current = { projectId, conv }
     },
-    [createRecentResumeNode]
+    [createRecentResumeNode, flowLanding]
   )
 
   const resumeRecentConversation = useCallback(
@@ -18322,7 +18327,13 @@ export function Canvas() {
           return
         }
       }
-      if (projectId === useProjects.getState().activeProjectId && canCreateOnCanvas(nodesProjectIdRef.current, projectId)) {
+      // Same rule as resumeWhenLanded: after `openOrAdoptFolder` switched projects the tag is
+      // installed before React Flow's store holds the nodes, so the link waits for the landing.
+      if (
+        projectId === useProjects.getState().activeProjectId &&
+        canCreateOnCanvas(nodesProjectIdRef.current, projectId) &&
+        flowLanding.holds(projectId)
+      ) {
         createFromLink(open)
         return
       }
@@ -18332,7 +18343,7 @@ export function Canvas() {
         if (!ok && pendingLinkRef.current?.open === open) pendingLinkRef.current = null
       } else switchProject(projectId)
     },
-    [api, openOrAdoptFolder, createFromLink, reopenProject, switchProject]
+    [api, openOrAdoptFolder, createFromLink, reopenProject, switchProject, flowLanding]
   )
 
   const linkPermissionLabel = useCallback(

@@ -556,8 +556,15 @@ project's nodes only.** The contract:
   `useFlowLanding` (`canvas/flowLanding.ts`) once the owner IS that project — React may run the
   store copy's passive effect after a due timer, which then framed the pan/zoom the remount
   destroys and read the outgoing copy of a shared node id. The rule holds for a local → local
-  switch too (no remount, but the owner still flips). `flowStoreOwner.test.tsx` replays the
-  switches through real React Flow, the timer firing inside that window included.
+  switch too (no remount, but the owner still flips). A caller that would create and frame AT ONCE
+  (`resumeWhenLanded`, `runLinkOpen`) must also ask `flowLanding.holds(projectId)`, never the epoch
+  tag alone: after "Open folder & resume" or a link that opens a new folder, the switch is the
+  folder open's last synchronous step, so the `.then` runs after the load effect installed the tag
+  and before the store copy — every time, not by chance. Otherwise it leaves the work in
+  `pendingResumeRef` / `pendingLinkRef` for the landing. A throw inside a landing is logged, never
+  rethrown: it runs in a passive effect and `<Canvas />` has no error boundary.
+  `flowStoreOwner.test.tsx` replays the switches through real React Flow, the timer firing inside
+  that window and the folder-open continuation included.
 - Switching away unmounts the old project's `TerminalNode`s → their tmux clients detach but
   the sessions keep running; switching back reattaches. tmux session names are per-node-id
   (globally unique), so projects never collide.

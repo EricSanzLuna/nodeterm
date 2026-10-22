@@ -49,6 +49,7 @@ import { nodeStatesToFlow, type CanvasNode } from '../state/workspace'
 import { useNodesEpoch } from './nodesEpoch'
 import { useFlowStoreOwner } from './flowStoreOwner'
 import { useFlowLanding } from './flowLanding'
+import { canCreateOnCanvas } from '../state/persistGuards'
 
 ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -186,10 +187,19 @@ let settleAtCommitOf: string | null = null
 let landings: string[] = []
 /** What each framing saw: the target's y in React Flow's store, and the pan/zoom it drove. */
 let framings: Array<{ id: string; y: number | null; panZoom: unknown }> = []
+// ── "Open recent" / a `nodeterm://` link into a folder: Canvas's resumeWhenLanded + pendingResumeRef ──
+/** A resume staged for the load's landing (Canvas's pendingResumeRef). */
+let pendingResume: { projectId: string; id: string } | null = null
+/** false = ff4fb2812's direct path: create + frame as soon as the epoch tag is installed. */
+let gateDirectOnOwner = true
+/** Canvas's `resumeWhenLanded`, published by the replica's latest render. */
+let resumeWhenLanded: ((projectId: string, id: string) => void) | null = null
+/** Per direct-path call: the epoch tag it saw and whether the landing held the project. */
+let resumeCalls: Array<{ epoch: string | null; holds: boolean }> = []
 function CanvasReplica() {
   const activeProjectId = useActive((s) => s.id)
   const [nodes, setNodes] = useState<CanvasNode[]>([])
-  const { renderedProjectId, installEpoch } = useNodesEpoch(nodes)
+  const { nodesProjectIdRef, renderedProjectId, installEpoch } = useNodesEpoch(nodes)
   const { setViewport, getViewport, getInternalNode } = useReactFlow()
   const store = useStoreApi()
   readViewport = getViewport
@@ -201,6 +211,29 @@ function CanvasReplica() {
   const nodeSession = sessionForProject(flowOwnerProjectId ?? '')
   const flowLanding = useFlowLanding(flowOwnerProjectId)
   providerKeys.push(nodeSession.id)
+  /** goToNode, cut down to the two reads that matter: the node off React Flow's store (as
+   *  frameNode reads it) and the pan/zoom the camera moves. */
+  const frame = (id: string): void => {
+    const y = getInternalNode(id)?.internals.positionAbsolute.y ?? null
+    framings.push({ id, y, panZoom: store.getState().panZoom })
+    if (y !== null) void setViewport({ x: 40, y: 100 - y, zoom: 1 })
+  }
+  // Canvas's `resumeWhenLanded` (runLinkOpen's tail is the same shape): create and frame now when
+  // the canvas holds the project, else stage it for the load's landing. The shared node stands in
+  // for the resumed one; what matters is which copy the framing reads and which pan/zoom it drives.
+  resumeWhenLanded = (projectId, id) => {
+    const holds = flowLanding.holds(projectId)
+    resumeCalls.push({ epoch: nodesProjectIdRef.current, holds })
+    if (
+      projectId === useActive.getState().id &&
+      canCreateOnCanvas(nodesProjectIdRef.current, projectId) &&
+      (!gateDirectOnOwner || holds)
+    ) {
+      frame(id)
+      return
+    }
+    pendingResume = { projectId, id }
+  }
   // Canvas's active-project load effect: `setNodes(flow)` + `installEpoch` + the saved viewport,
   // then the settle timer whose framing work waits for the store (`flowLanding.land`).
   useEffect(() => {
@@ -218,17 +251,19 @@ function CanvasReplica() {
       void setViewport(vp)
     }
     const projectId = activeProjectId
-    // Canvas's pendingFocusRef consumer, cut down to the two reads that matter: the node off
-    // React Flow's store (`getInternalNode`, as frameNode does) and the pan/zoom the camera moves.
+    // Canvas's pendingResumeRef and pendingFocusRef consumers.
     const consume = (): void => {
       landings.push(projectId)
+      const resume = pendingResume
+      if (resume && resume.projectId === projectId) {
+        pendingResume = null
+        frame(resume.id) // Canvas: resumeCreateRef.current → createRecentResumeNode → goToNode
+      }
       const id = pendingFocus
       if (!id) return
       pendingFocus = null
       if (!flow.some((n) => n.id === id)) return // Canvas: `nodesRef.current.find`, the node not here
-      const y = getInternalNode(id)?.internals.positionAbsolute.y ?? null
-      framings.push({ id, y, panZoom: store.getState().panZoom })
-      if (y !== null) void setViewport({ x: 40, y: 100 - y, zoom: 1 })
+      frame(id)
     }
     const cancelSettle = scheduleSettle(() => (gateOnOwner ? flowLanding.land(projectId, consume) : consume()))
     return () => {
@@ -329,6 +364,10 @@ beforeEach(() => {
   settleAtCommitOf = null
   landings = []
   framings = []
+  pendingResume = null
+  gateDirectOnOwner = true
+  resumeWhenLanded = null
+  resumeCalls = []
   resetSessionsForTest()
   createSession('local', fakeApi('local'), 'This machine')
   const relay = createSession('relay', fakeApi('host'), 'e2ehost')
@@ -576,6 +615,79 @@ describe('a just-loaded project is framed only once React Flow\'s store holds it
   })
 })
 
+describe('a folder opened to resume or follow a link frames only once the store holds it', () => {
+  // `resumeRecentConversation` 'open-folder' → `openOrAdoptFolder(…).then(() => resumeWhenLanded(…))`
+  // and `runLinkOpen` → `await openOrAdoptFolder(…)` → `createFromLink`. On the adopt / new-folder
+  // branch the project switch is the folder open's LAST synchronous step, so this is not a race:
+  // the zustand write queues React's SyncLane microtask, that render runs the load effect
+  // (installing the epoch tag), and only then does the caller's continuation run — before the
+  // DefaultLane `setNodes(flow)` render that hands the store the incoming nodes.
+  async function openFolder(projectId: string): Promise<void> {
+    await Promise.resolve() // the probe / projectFileState await before the switch
+    useActive.setState({ id: projectId })
+  }
+  const actEnv = globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
+  /** Real React and real timers: act() would flush both lanes together and close the window. */
+  async function openAndResume(from: string, to: string): Promise<void> {
+    stored = { [from]: [plainTerminal('term-shared', 0)], [to]: [plainTerminal('term-shared', 2000)] }
+    useActive.setState({ id: from })
+    await mount()
+    landings = []
+    actEnv.IS_REACT_ACT_ENVIRONMENT = false
+    try {
+      // Nothing is flushed between the switch and the continuation.
+      void openFolder(to).then(() => resumeWhenLanded!(to, 'term-shared'))
+      for (let i = 0; i < 100 && !landings.includes(to); i++) await new Promise((r) => setTimeout(r, 10))
+      expect(landings).toEqual([to])
+      await new Promise((r) => setTimeout(r, 30)) // anything late would land here
+    } finally {
+      actEnv.IS_REACT_ACT_ENVIRONMENT = true
+    }
+  }
+  const cases = [
+    ['session-changing', LOCAL_ONE, TEAM_ALPHA],
+    ['local → local', LOCAL_ONE, LOCAL_TWO]
+  ] as const
+
+  it.each(cases)('%s: the continuation leaves the work to the landing, which frames the INCOMING copy once', async (_kind, from, to) => {
+    await openAndResume(from, to)
+
+    // The window was open: the epoch-tag guard alone already passed when the `.then` ran.
+    expect(resumeCalls).toEqual([{ epoch: to, holds: false }])
+    expect(pendingResume).toBeNull() // consumed by the landing
+    expect(framings).toHaveLength(1) // never twice
+    expect(framings[0].y).toBe(2000)
+    expect(framings[0].panZoom).toBe(readStore!.getState().panZoom)
+    expect(readViewport!()).toEqual({ x: 40, y: -1900, zoom: 1 })
+  })
+
+  it.each(cases)('control (%s): on ff4fb2812\'s direct path the same continuation frames the OUTGOING copy', async (_kind, from, to) => {
+    gateDirectOnOwner = false
+    await openAndResume(from, to)
+
+    expect(resumeCalls).toEqual([{ epoch: to, holds: false }])
+    expect(framings.map((f) => f.y)).toEqual([0])
+    if (sessionForProject(from).id !== sessionForProject(to).id) {
+      // ...and drove a pan/zoom instance the remount then threw away.
+      expect(framings[0].panZoom).not.toBe(readStore!.getState().panZoom)
+    }
+  })
+
+  it('a project the store already holds is resumed at once (no landing involved)', async () => {
+    stored = { [LOCAL_ONE]: [plainTerminal('term-shared', 300)] }
+    useActive.setState({ id: LOCAL_ONE })
+    await mount()
+    landings = []
+
+    await act(async () => resumeWhenLanded!(LOCAL_ONE, 'term-shared'))
+
+    expect(resumeCalls).toEqual([{ epoch: LOCAL_ONE, holds: true }])
+    expect(pendingResume).toBeNull()
+    expect(landings).toEqual([])
+    expect(framings.map((f) => f.y)).toEqual([300])
+  })
+})
+
 // ── The hook alone ────────────────────────────────────────────────────────────────────────────────
 describe('useFlowStoreOwner', () => {
   let renders = 0
@@ -663,7 +775,7 @@ describe('useFlowLanding', () => {
   let landing: ReturnType<typeof useFlowLanding> | null = null
   function Harness({ owner }: { owner: string | null }) {
     landing = useFlowLanding(owner)
-    return null
+    return <span className="landing-harness" />
   }
   async function render(owner: string | null): Promise<void> {
     await act(async () => {
@@ -718,6 +830,43 @@ describe('useFlowLanding', () => {
     expect(ran).toEqual(['c'])
   })
 
+  it('holds answers the owner the effect committed', async () => {
+    await render('project-a')
+    expect(landing!.holds('project-a')).toBe(true)
+    expect(landing!.holds('project-b')).toBe(false)
+    await render('project-b')
+    expect(landing!.holds('project-a')).toBe(false)
+    expect(landing!.holds('project-b')).toBe(true)
+  })
+
+  it('a throwing item is logged, does not unmount the tree, and the next landing still runs', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const ran: string[] = []
+      await render('project-a')
+      // Runs inside the owner's passive effect, where an uncaught throw would unmount the root.
+      landing!.land('project-b', () => {
+        throw new Error('boom')
+      })
+      await render('project-b')
+      expect(errors).toHaveBeenCalledWith('[canvas] landing failed', expect.objectContaining({ message: 'boom' }))
+      expect(host!.querySelector('.landing-harness')).not.toBeNull()
+      // Runs at once from `land` (the settle timer's path): logged, not thrown at the caller.
+      expect(() =>
+        landing!.land('project-b', () => {
+          throw new Error('again')
+        })
+      ).not.toThrow()
+      expect(errors).toHaveBeenCalledTimes(2)
+      landing!.land('project-c', () => ran.push('c'))
+      await render('project-c')
+      expect(ran).toEqual(['c'])
+      expect(host!.querySelector('.landing-harness')).not.toBeNull()
+    } finally {
+      errors.mockRestore()
+    }
+  })
+
   it('is one stable object (Canvas leaves it out of the load effect\'s deps)', async () => {
     await render('project-a')
     const first = landing
@@ -769,6 +918,28 @@ describe('source pin (the replica mirrors Canvas)', () => {
     expect(inLand).toContain('goToNode(node)')
     // The load effect's cleanup drops it, so a project the user moved on from never frames late.
     expect(CANVAS.slice(end, end + 120)).toContain('flowLanding.cancel()')
+  })
+
+  it('a folder-open resume and a link create at once only when the landing holds the project', () => {
+    const resume = CANVAS.slice(
+      CANVAS.indexOf('const resumeWhenLanded = useCallback('),
+      CANVAS.indexOf('pendingResumeRef.current = { projectId, conv }')
+    )
+    expect(resume).toMatch(
+      /canCreateOnCanvas\(nodesProjectIdRef\.current, projectId\) &&\s*flowLanding\.holds\(projectId\)\s*\) \{\s*createRecentResumeNode\(conv\)/
+    )
+    const link = CANVAS.slice(
+      CANVAS.indexOf('const runLinkOpen = useCallback('),
+      CANVAS.indexOf('pendingLinkRef.current = { projectId, open, at: Date.now() }')
+    )
+    expect(link).toMatch(
+      /canCreateOnCanvas\(nodesProjectIdRef\.current, projectId\) &&\s*flowLanding\.holds\(projectId\)\s*\) \{\s*createFromLink\(open\)/
+    )
+    // Those are the only direct creates; everything else goes through the landing's refs.
+    expect(CANVAS.match(/createRecentResumeNode\(conv\)/g)).toHaveLength(1)
+    expect(CANVAS.match(/createFromLink\(open\)/g)).toHaveLength(1)
+    // The "Open folder & resume" continuation goes through resumeWhenLanded.
+    expect(CANVAS).toMatch(/void openOrAdoptFolder\(plan\.folder\)[\s\S]{0,400}if \(landed\) resumeWhenLanded\(landed\.id, conv\)/)
   })
 
   it('Canvas loads nodes in an effect (the window the keying has to survive)', () => {
