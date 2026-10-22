@@ -123,6 +123,14 @@ both scoped to the shared project).
   the CSP and absent offline). The plugin serves `dist/prod/fonts` in dev and emits it under
   `excalidraw-assets/` in builds, without Xiaolai (the 12 MB CJK family; CJK text falls back to a
   system font). ~480 KB.
+- **Export under the app's CSP (measured, headless Chrome over http, Excalidraw 0.18.1 built by
+  this repo's Vite, the exact `index.html` policy):** SVG and PNG export both work, with Workers and
+  with Workers unavailable, and the SVG embeds its font. Two things the console shows are expected:
+  one `script-src 'eval'` violation — `script-src 'self'` refuses the WebAssembly Excalidraw uses to
+  SUBSET fonts, so it embeds the unsubset font file (~33 KB for Latin text: a bigger SVG, not a
+  broken one) — and a `font-src` violation per font face for Excalidraw's own CDN (esm.sh), which it
+  tries besides the local file; the CDN is blocked and the local font is the one that loads. The
+  CSP is deliberately not widened for either. Not run: the packaged desktop app over `file://`.
 - `@excalidraw/mermaid-to-excalidraw` is **aliased to a stub** (`whiteboard/mermaid-stub.ts`): it
   pulls in all of mermaid for "text to diagram", ~10 MB of chunks (renderer output 48 MB → 38 MB).
   A pasted mermaid definition falls back to plain text.
