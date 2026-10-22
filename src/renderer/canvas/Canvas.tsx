@@ -328,6 +328,7 @@ import {
 import { isTerminalTarget, KEYBOARD_OWNER_SELECTOR, type ContextElement } from '../lib/keyContext'
 import { nextMdMode } from '../lib/markdownModeToggle'
 import { installTerminalFocusMirror } from '../lib/terminalFocusMirror'
+import { runQuitFlushes } from '../lib/quitFlush'
 import { nodeToRefocus } from '../lib/focusRestore'
 import { openDialogCount } from '../components/dialog-stack'
 import {
@@ -4190,10 +4191,15 @@ export function Canvas() {
   // Quit / restart-to-update: main asks for the pending edits the debounce above still holds
   // (src/main/renderer-flush.ts). Without this, the last ~800 ms of node moves / renames / camera
   // changes were lost on every ⌘Q and every update restart. Same conflict rule as the autosave.
+  // Main takes ONE answer, so the other debounced writes (an open whiteboard's autosave) are
+  // flushed here too, through lib/quitFlush.ts, before this answers.
   useEffect(
     () =>
       api.workspace.onFlushRequest(async () => {
-        if (shouldFlushOnQuit(dirtyRef.current, !!conflictRef.current)) await persist()
+        await Promise.allSettled([
+          shouldFlushOnQuit(dirtyRef.current, !!conflictRef.current) ? persist() : undefined,
+          runQuitFlushes()
+        ])
       }),
     [api, persist]
   )

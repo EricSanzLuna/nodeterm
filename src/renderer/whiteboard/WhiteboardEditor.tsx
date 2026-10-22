@@ -12,6 +12,7 @@ import {
 import type { AppState, BinaryFiles, ExcalidrawImperativeAPI } from '@excalidraw/excalidraw/types'
 import type { ExcalidrawElement } from '@excalidraw/excalidraw/element/types'
 import { boardZoom, rescaleForCanvas, screenZoom } from './zoom'
+import { addQuitFlush } from '../lib/quitFlush'
 
 /** After the last change, how long until the scene is written. Long enough that a burst of
  *  strokes is one write; short enough that a crash loses a few seconds, not a session. */
@@ -207,6 +208,10 @@ export default function WhiteboardEditor({
       controlRef.current = null
     }
   }, [controlRef, flush, onExit])
+
+  // Quitting the app or restarting to update unmounts nothing — the window just goes — so the
+  // strokes still inside the autosave delay are handed to main's quit flush (lib/quitFlush.ts).
+  useEffect(() => (readOnly ? undefined : addQuitFlush(() => flush(false))), [flush, readOnly])
 
   // Leaving without an exit (a project switch, the node deleted): write whatever is unsaved. The
   // api is still readable synchronously here; the write itself is async and the core finishes it

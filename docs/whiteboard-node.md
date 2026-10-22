@@ -68,8 +68,11 @@ could aim a read or an overwrite anywhere. A node id must be a `string` passing 
 - `boardRev` — epoch ms, bumped once per editing session that changed the board (never per
   stroke), so strokes never reach the workspace save, canvas undo or team sync.
 
-Saves happen 1.5 s after the last change, when editing ends (with the picture), and on unmount
-(project switch, node closed). Whether there is anything to save is decided by comparing the
+Saves happen 1.5 s after the last change, when editing ends (with the picture), on unmount
+(project switch, node closed), and — on the desktop — when the app quits or restarts to update: an
+open editor registers its pending save with `lib/quitFlush.ts`, which Canvas's answer to main's
+flush request waits for (main caps that wait at ~1 s). A browser tab of the Server Edition has no
+such request, so closing it can lose the last ≤1.5 s of strokes. Whether there is anything to save is decided by comparing the
 scene's version with the one this editor last saved, not by an `onChange` flag; the unmount flush
 writes a snapshot kept from `onChange`, because by cleanup time Excalidraw's api answers an empty
 scene. A board whose file does not parse is shown as unreadable and never opened, so an autosave

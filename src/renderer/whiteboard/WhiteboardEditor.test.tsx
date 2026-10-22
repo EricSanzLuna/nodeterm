@@ -182,3 +182,23 @@ describe('a read-only board (a hosted-team Viewer)', () => {
     expect(onExit).toHaveBeenCalledWith(false)
   })
 })
+
+describe('quitting the app (or restarting to update) writes the pending strokes', () => {
+  it('an open editor\'s unsaved changes are written by the quit flush', async () => {
+    const { runQuitFlushes } = await import('../lib/quitFlush')
+    const onSave = vi.fn(async () => true)
+    mount({ onSave, onExit: vi.fn() })
+    draw()
+    await act(async () => runQuitFlushes())
+    expect(onSave).toHaveBeenCalledTimes(1)
+  })
+
+  it('a read-only board registers nothing to write', async () => {
+    const { runQuitFlushes } = await import('../lib/quitFlush')
+    const onSave = vi.fn(async () => true)
+    mount({ onSave, onExit: vi.fn(), readOnly: true })
+    draw()
+    await act(async () => runQuitFlushes())
+    expect(onSave).not.toHaveBeenCalled()
+  })
+})
