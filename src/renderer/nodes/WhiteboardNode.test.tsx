@@ -220,3 +220,63 @@ describe('a hosted-team Viewer', () => {
     expect(props.readOnly).toBeFalsy()
   })
 })
+
+describe('Copy as image', () => {
+  // The app's CSP (`default-src 'self'`, no `connect-src data:`) refuses `fetch` of a data: URL —
+  // measured in Chrome with the exact index.html policy: "TypeError: Failed to fetch". The stub
+  // answers the same way, so a copy that goes through fetch fails here as it does in the app.
+  const PNG_BASE64 = 'iVBORw0KGgo='
+  let written: Array<Record<string, Blob>>
+  const realFetch = globalThis.fetch
+
+  beforeEach(() => {
+    written = []
+    globalThis.fetch = vi.fn(async () => {
+      throw new TypeError('Failed to fetch')
+    }) as typeof fetch
+    ;(globalThis as { ClipboardItem?: unknown }).ClipboardItem = class {
+      constructor(public items: Record<string, Blob>) {}
+    }
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        write: vi.fn(async (items: Array<{ items: Record<string, Blob> }>) => {
+          written.push(...items.map((i) => i.items))
+        })
+      }
+    })
+  })
+  afterEach(() => {
+    globalThis.fetch = realFetch
+  })
+
+  it('puts the board picture on the clipboard as a PNG without fetching a data: URL', async () => {
+    files.readWhiteboard.mockResolvedValue({ thumbnailBase64: PNG_BASE64, updatedAt: 1, rev: 'r1', fromSource: false })
+    mount()
+    await settle()
+    const copy = button(/copy whiteboard as image/i)
+    expect(copy?.disabled).toBe(false)
+    await act(async () => copy!.click())
+    await settle()
+    expect(written).toHaveLength(1)
+    const blob = written[0]!['image/png']!
+    expect(blob.type).toBe('image/png')
+    const bytes = new Uint8Array(await blob.arrayBuffer())
+    expect([...bytes]).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    expect(globalThis.fetch).not.toHaveBeenCalled()
+  })
+
+  it('a clipboard that refuses the image is reported, not swallowed', async () => {
+    ;(navigator.clipboard.write as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('NotAllowedError'))
+    const toasts: unknown[] = []
+    const onToast = (e: Event) => toasts.push((e as CustomEvent).detail)
+    window.addEventListener('nodeterm:toast', onToast)
+    files.readWhiteboard.mockResolvedValue({ thumbnailBase64: 'iVBORw0KGgo=', updatedAt: 1, rev: 'r1', fromSource: false })
+    mount()
+    await settle()
+    await act(async () => button(/copy whiteboard as image/i)!.click())
+    await settle()
+    window.removeEventListener('nodeterm:toast', onToast)
+    expect(toasts).toEqual([expect.objectContaining({ kind: 'error' })])
+  })
+})

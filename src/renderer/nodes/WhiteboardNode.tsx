@@ -44,6 +44,16 @@ interface Geometry {
 
 const pngDataUrl = (base64: string): string => `data:image/png;base64,${base64}`
 
+/** The resting picture's bytes as a PNG Blob, decoded here. NOT `fetch(dataUrl)`: the app's CSP
+ *  (`default-src 'self'`, no `connect-src data:`) refuses a fetch of a data: URL, which is how
+ *  "Copy as image" used to fail without a word. */
+export function pngBlobFromBase64(base64: string): Blob {
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return new Blob([bytes], { type: 'image/png' })
+}
+
 /**
  * A whiteboard: an infinite Excalidraw canvas inside a canvas node.
  *
@@ -81,6 +91,7 @@ export function WhiteboardNode({ id, data, selected, positionAbsoluteX, position
   const overlayRef = useRef<HTMLDivElement>(null)
   const [mode, setMode] = useState<null | 'edit' | 'present'>(null)
   const [geom, setGeom] = useState<Geometry | null>(null)
+  // The resting picture, base64 (the data: URL for the <img> is derived at render).
   const [thumb, setThumb] = useState<string>()
   // Bumped when editing ends, so the resting picture is read again: after "Discard my changes" the
   // board on disk may be someone else's newer version, which no node-data change announces here.
@@ -113,7 +124,7 @@ export function WhiteboardNode({ id, data, selected, positionAbsoluteX, position
       .then(() => api.files.readWhiteboard(projectIdRef.current, id, data.whiteboardSource, false))
       .then((file) => {
         if (!live) return
-        setThumb(file?.thumbnailBase64 ? pngDataUrl(file.thumbnailBase64) : undefined)
+        setThumb(file?.thumbnailBase64 || undefined)
         setLoadState('ready')
       })
       .catch(() => {
@@ -174,7 +185,7 @@ export function WhiteboardNode({ id, data, selected, positionAbsoluteX, position
       revRef.current = typeof res === 'string' ? undefined : res.rev
       setSaveState('saved')
       sceneRef.current = scene
-      if (thumbnailBase64 !== undefined) setThumb(thumbnailBase64 ? pngDataUrl(thumbnailBase64) : undefined)
+      if (thumbnailBase64 !== undefined) setThumb(thumbnailBase64 || undefined)
       // A copy has its own file now; it stops reading the original's.
       if (dataRef.current.whiteboardSource) {
         updateNodeData(id, { whiteboardSource: undefined })
@@ -248,12 +259,18 @@ export function WhiteboardNode({ id, data, selected, positionAbsoluteX, position
   const copyImage = useCallback(async () => {
     if (!thumb) return
     try {
-      const blob = await (await fetch(thumb)).blob()
+      const blob = pngBlobFromBase64(thumb)
       await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
     } catch {
-      // Clipboard refused (no focus / permission): nothing was copied, the icon simply stays put.
+      // Clipboard refused (no focus, no permission, a browser without image clipboard): say so — a
+      // copy button that does nothing reads as broken.
+      window.dispatchEvent(
+        new CustomEvent('nodeterm:toast', {
+          detail: { kind: 'error', message: 'Could not copy the whiteboard: the clipboard refused the image.' }
+        })
+      )
     }
   }, [thumb])
 
@@ -362,7 +379,7 @@ export function WhiteboardNode({ id, data, selected, positionAbsoluteX, position
           {loadState === 'unreadable' ? (
             <span className="whiteboard-node__hint">This board could not be read here</span>
           ) : thumb ? (
-            <img className="whiteboard-node__thumb" src={thumb} alt="" draggable={false} />
+            <img className="whiteboard-node__thumb" src={pngDataUrl(thumb)} alt="" draggable={false} />
           ) : loadState === 'ready' ? (
             <span className="whiteboard-node__hint">Double-click to draw</span>
           ) : null}
