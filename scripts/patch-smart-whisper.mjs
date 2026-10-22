@@ -93,8 +93,7 @@ export function patchSmartWhisper(dir) {
   const gyp = fs.readFileSync(gypPath, 'utf8')
   const js = fs.readFileSync(jsPath, 'utf8')
   const modelPath = path.join(dir, 'src', 'binding', 'model.cc')
-  if (!fs.existsSync(modelPath)) fail('src/binding/model.cc', 'not found')
-  const model = fs.readFileSync(modelPath, 'utf8')
+  const model = readOrFail(modelPath, 'src/binding/model.cc')
   const gypDone = gyp.includes(PATCH_MARKER)
   const jsDone = js.includes(PATCH_MARKER)
   const modelDone = model.includes(CTX_PARAMS_MARKER)
@@ -137,6 +136,16 @@ export function patchSmartWhisper(dir) {
     fs.writeFileSync(gypPath, gyp.replace(GYP_FIND, `    }\n  ],\n${conditions}}`))
   }
   return 'patched'
+}
+
+/** Reads a file the patch needs; a missing one is an anchor failure, not a crash. */
+function readOrFail(file, name) {
+  try {
+    return fs.readFileSync(file, 'utf8')
+  } catch (err) {
+    if (err && err.code === 'ENOENT') fail(name, 'not found')
+    throw err
+  }
 }
 
 function expectOnce(text, needle, name) {
