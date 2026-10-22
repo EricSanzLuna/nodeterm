@@ -391,3 +391,47 @@ describe('the move steps', () => {
     expect(await exists(settingsIn(appRoot()))).toBe(true)
   })
 })
+
+// A move into a folder deletes the data file. The store may do that only once the folder file
+// really holds the canvas, and its record of what it last wrote to a folder is not proof: a file
+// can leave the folder behind the store's back (`git rm`, a branch checkout, by hand) while the
+// record stays, and an unchanged canvas is then "already written" and skipped.
+describe('a move into a folder never loses the canvas', () => {
+  it('a kept tracked folder file that later disappears: the unchanged move back still writes it', async () => {
+    execFileSync('git', ['init', '-q'], { cwd: folder })
+    const store = new WorkspaceStore()
+    await store.save(ws([project({ storeInAppData: undefined })]))
+    execFileSync('git', ['add', '.nodeterm/project.json'], { cwd: folder })
+    await store.save(ws([project()]))
+    // "Delete anyway?" answered no: the tracked file stays in the folder.
+    expect(await store.releaseFolderFiles('project-p1', false)).toMatchObject({ kept: [folderFile()] })
+    // Later it leaves the folder outside the app.
+    await fs.rm(folderFile())
+
+    expect(await store.prepareFolderStorage('project-p1')).toEqual({ ok: true })
+    await store.save(ws([project({ storeInAppData: undefined })]))
+
+    expect(ids(JSON.parse(await fs.readFile(folderFile(), 'utf-8')).nodes)).toEqual(['term-1'])
+    const loaded = (await new WorkspaceStore().load()).projects[0]
+    expect(loaded.unavailable).toBeFalsy()
+    expect(ids(loaded.nodes)).toEqual(['term-1'])
+  })
+
+  it('"Set folder…" onto a folder this store once wrote for another project keeps the canvas', async () => {
+    const store = new WorkspaceStore()
+    // Another project used this folder and was then deleted; its file was removed by hand.
+    await store.save(ws([project({ id: 'project-old', storeInAppData: undefined })]))
+    await store.save(ws([project({ id: 'project-p1', cwd: undefined, storeInAppData: undefined })]))
+    await fs.rm(folderFile())
+    expect(await exists(dataFile('project-p1'))).toBe(true)
+
+    // The same canvas content, now bound to the folder.
+    await store.save(ws([project({ storeInAppData: undefined })]))
+
+    const onDisk = (await exists(folderFile())) || (await exists(dataFile('project-p1')))
+    expect(onDisk).toBe(true)
+    const loaded = (await new WorkspaceStore().load()).projects[0]
+    expect(loaded.unavailable).toBeFalsy()
+    expect(ids(loaded.nodes)).toEqual(['term-1'])
+  })
+})

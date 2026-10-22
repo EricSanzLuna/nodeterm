@@ -1551,6 +1551,22 @@ export class WorkspaceStore {
     const projectIdForCwd = new Map(
       index.entries.filter((e) => folderFileCwd(e)).map((e) => [e.cwd!, e.id] as const)
     )
+    // What this store remembers of a folder file belongs to the entry that owned that folder in the
+    // PREVIOUS index. An entry that takes a folder over from a data file ("Set folder…", a move back
+    // from app data, issue #1145) starts without the record: the folder was probed empty right
+    // before, so a remembered copy can only describe a file that has since left the folder (a
+    // `git rm`, a branch checkout), and comparing against it would skip the write as "unchanged" —
+    // after which the sweep below would delete the data file, the only copy left.
+    const previousById = new Map((previousIndex?.entries ?? []).map((e) => [e.id, e] as const))
+    for (const e of index.entries) {
+      const cwd = folderFileCwd(e)
+      if (!cwd || !previousById.get(e.id)?.dataFile) continue
+      this.lastWritten.delete(projectFilePath(cwd))
+      this.lastWrittenParsed.delete(projectFilePath(cwd))
+    }
+    // The folder files this save actually wrote. The data-file sweep reads this, never `lastWritten`:
+    // only a write in this save shows that the folder holds the canvas now.
+    const folderFilesWritten = new Set<string>()
     for (const [cwd, candidate] of files) {
       const projectId = projectIdForCwd.get(cwd) ?? cwd
       const file = projectFilePath(cwd)
@@ -1570,6 +1586,7 @@ export class WorkspaceStore {
         await writeAtomic(file, content)
         this.lastWritten.set(file, content)
         this.revs.set(projectId, next.rev)
+        folderFilesWritten.add(file)
       } catch { /* folder gone (unmounted disk): the entry simply stays stale → unavailable next load */ }
     }
 
@@ -1589,7 +1606,12 @@ export class WorkspaceStore {
       (previousIndex?.entries ?? []).filter((e) => folderFileCwd(e)).map((e) => e.id)
     )
     for (const e of index.entries) {
-      if (!isFolderDataRef(e) || !wasFolderRef.has(e.id) || !isInlineProjectFileId(e.id)) continue
+      if (!isFolderDataRef(e) || !wasFolderRef.has(e.id) || !e.cwd) continue
+      // From this save on the folder's project.json is not this project's, whether or not the user
+      // later keeps a tracked copy of it: forget it, so nothing compares a future write against it.
+      this.lastWritten.delete(projectFilePath(e.cwd))
+      this.lastWrittenParsed.delete(projectFilePath(e.cwd))
+      if (!isInlineProjectFileId(e.id)) continue
       const file = inlineFilePath(e.id)
       await fs.rm(file, { force: true }).catch(() => undefined)
       this.lastWritten.delete(file)
@@ -1679,7 +1701,7 @@ export class WorkspaceStore {
         ? { json: indexJson, size: st.size, mtimeMs: st.mtimeMs, ino: st.ino }
         : null
     }
-    await this.sweepRemovedDataFiles(previousIndex, index)
+    await this.sweepRemovedDataFiles(previousIndex, index, folderFilesWritten)
     this.index = index
 
     if (migrating) platform().broadcast(IPC.workspaceMigrated, 'v2')
@@ -1755,7 +1777,8 @@ export class WorkspaceStore {
    */
   private async sweepRemovedDataFiles(
     previous: WorkspaceIndexV3 | null,
-    next: WorkspaceIndexV3
+    next: WorkspaceIndexV3,
+    folderFilesWritten: ReadonlySet<string>
   ): Promise<void> {
     if (!previous) return
     // Ids whose entry still keeps its content in a data file. An id that is live but no longer a
@@ -1766,14 +1789,15 @@ export class WorkspaceStore {
     //
     // Only once the folder holds the canvas, though: the folder leg swallows a failed write (an
     // unmounted or read-only disk), and deleting the data file then would leave the canvas in
-    // memory only. Until this store has written or read that folder's file, the leftover stays.
+    // memory only. So the file goes only when THIS save wrote the folder's file. What the store
+    // remembers having written there is not enough: the file may have left the folder since.
     const nextById = new Map(next.entries.map((e) => [e.id, e] as const))
     const keep = (id: string): boolean => {
       const n = nextById.get(id)
       if (!n) return false
       if (n.dataFile) return true
       const cwd = folderFileCwd(n)
-      return !cwd || !this.lastWritten.has(projectFilePath(cwd))
+      return !cwd || !folderFilesWritten.has(projectFilePath(cwd))
     }
     for (const e of previous.entries) {
       if (!e.dataFile || keep(e.id) || !isInlineProjectFileId(e.id)) continue
@@ -1852,6 +1876,10 @@ export class WorkspaceStore {
       return { ok: false, reason: 'not-saved' }
     }
     const cwd = e.cwd
+    // Kept or removed, the folder's project.json is no longer this project's record (the move's save
+    // already forgot it; this covers a release that runs on its own).
+    this.lastWritten.delete(projectFilePath(cwd))
+    this.lastWrittenParsed.delete(projectFilePath(cwd))
     const candidates: string[] = []
     if ((await this.projectFileState(cwd)) === 'present') candidates.push(projectFilePath(cwd))
 
@@ -1884,10 +1912,6 @@ export class WorkspaceStore {
       try {
         await fs.rm(file, { force: true })
         removed.push(file)
-        // Forget it as ours, or a move back with an unchanged canvas would skip the folder write as
-        // "unchanged" and the sweep would then delete the data file: the only copy.
-        this.lastWritten.delete(file)
-        this.lastWrittenParsed.delete(file)
       } catch {
         kept.push(file)
       }
