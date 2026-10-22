@@ -7101,14 +7101,18 @@ glass never sits over plain black; a wallpaper the user chose is never replaced.
   regular files; the renderer never names a path. Videos stream through nt-media:// via the
   `setWallpaperMediaUrl` seam (main registers `allowMediaPath`; the Server Edition registers none, so
   it lists no aerials). Never downloaded, never bundled. `load` returns the 214×130 thumbnail as the
-  CSS still; `AerialWallpaper.tsx` puts a muted `<video>` above it (z-index −1; `.canvas-root`
-  isolates only while it holds one) on the canvas and, under Liquid Glass, the boards. A category or
-  aerial with no downloaded clip of its own plays ANY downloaded aerial — the upscaled thumbnail read
-  as a blurry regression in live review — so the thumbnail is the picture only with nothing
-  downloaded at all or a load error. Reduce Motion mounts the video paused (a full-resolution frame).
-  Paused while `document.hidden` and, for the canvas layer, while a board covers it. MEASURED (4K
-  240 fps HEVC Dubai clip, M-series, Liquid Glass + one terminal): GPU process ~72 % vs ~0 % on a
-  still, renderer ~3 % vs ~0 %.
+  still; `AerialWallpaper.tsx` paints still + muted `<video>` on a `position: fixed`, z-index auto
+  layer rendered as the SIBLING before `.canvas-root` (which then paints no background), so NO new
+  stacking context is created and every panel/portal stacks exactly as over a still — an earlier
+  `isolation: isolate` on the root changed portal-vs-chrome order (review of 095cf396). Under Liquid
+  Glass each board renders its own layer (z −1 inside the overlay) and picks its own clip. Clip
+  choice: the category's shuffle clips, else its other downloaded clips, else ANY downloaded aerial
+  — the upscaled thumbnail read as a blurry regression in live review — so the thumbnail is the
+  picture only with nothing downloaded at all or every clip failing. Reduce Motion mounts the video
+  paused (a full-resolution frame). Paused while `data-nt-window="idle"` (unfocused or hidden — the
+  CSS animation gate's signal) and, for the canvas layer, while a board covers it. MEASURED (4K
+  240 fps HEVC Dubai clip, M-series, Liquid Glass + one terminal): GPU process ~70 % playing, ~0.1 %
+  idle-paused or on a still; renderer ~3 % vs ~0 %.
 - **The cache is pruned on a SAVED change and on import, never at boot.** `SettingsStore.init`
   answers an unreadable settings.json with the defaults, and pruning against that would delete the
   image the user chose. Only hash-named full-size files are candidates; thumbnails, temps and

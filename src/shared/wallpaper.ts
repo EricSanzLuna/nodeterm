@@ -108,6 +108,12 @@ export function isAerialUuid(s: string): boolean {
   return UUID.test(s)
 }
 
+/** Does this (hand-editable) setting name an aerial wallpaper? */
+export function isAerialWallpaper(raw: unknown): boolean {
+  const w = normalizeWallpaper(raw)
+  return w.kind === 'preset' && parseAerialId(w.id) !== null
+}
+
 /** The UUID an aerial id names and whether it is a shuffle, or null for any other id. */
 export function parseAerialId(id: string): { uuid: string; shuffle: boolean } | null {
   const shuffle = id.startsWith(AERIAL_SHUFFLE_PREFIX)

@@ -322,6 +322,13 @@ describe('macOS aerials', () => {
     expect(await loadWallpaper(unknown)).toBeNull()
   })
 
+  it('a shuffle with no includeInShuffle clip downloaded plays its own category before any other', async () => {
+    const r = fixture()
+    const video = (id: string): string => url(path.join(r, 'videos', `${id}.mov`))
+    rmSync(path.join(r, 'videos', `${A1}.mov`)) // Landscapes' only shuffle clip; A3 is not in shuffle
+    expect(await aerialClips({ kind: 'preset', id: `aerial-shuffle:${L}` })).toEqual([video(A3)])
+  })
+
   it('with none of its own downloaded, any downloaded aerial plays; nothing at all = empty', async () => {
     const r = fixture()
     const video = (id: string): string => url(path.join(r, 'videos', `${id}.mov`))

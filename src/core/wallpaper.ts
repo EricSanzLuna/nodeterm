@@ -580,7 +580,7 @@ export async function listAerials(): Promise<WallpaperStill[]> {
 
 /**
  * The clips an aerial wallpaper plays: its own downloaded ones (a shuffle's only if
- * `includeInShuffle`). When it has none — a category macOS has not downloaded anything for, or a
+ * `includeInShuffle`, else any of the category's downloaded ones). When it has none — a category macOS has not downloaded anything for, or a
  * single aerial macOS has since deleted — ANY downloaded aerial plays instead: the thumbnail is a
  * 214×130 PNG, and stretched over the window it reads as a blurry regression, not a wallpaper. Only
  * with nothing downloaded at all is the list empty (the thumbnail then shows).
@@ -590,8 +590,12 @@ export async function aerialClips(value: unknown): Promise<string[]> {
   const s = w.kind === 'preset' && parseAerialId(w.id) ? await aerialScan() : null
   if (!s || w.kind !== 'preset') return []
   const shuffle = parseAerialId(w.id)!.shuffle
-  const own = aerialMembers(s.scan, w.id).filter((a) => s.scan.downloaded.has(a.id) && (!shuffle || a.includeInShuffle))
-  const clips = own.length ? own : s.scan.assets.filter((a) => s.scan.downloaded.has(a.id))
+  const downloaded = aerialMembers(s.scan, w.id).filter((a) => s.scan.downloaded.has(a.id))
+  const own = shuffle ? downloaded.filter((a) => a.includeInShuffle) : downloaded
+  // A category whose downloaded clips are all left out of macOS's shuffle still plays its own
+  // before anything from another category.
+  const fallback = own.length ? own : downloaded
+  const clips = fallback.length ? fallback : s.scan.assets.filter((a) => s.scan.downloaded.has(a.id))
   return clips.map((a) => s.url(path.join(s.root, 'videos', `${a.id}.mov`)))
 }
 
