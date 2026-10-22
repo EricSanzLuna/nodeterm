@@ -16,9 +16,17 @@
 // taking a path from it would let a crafted canvas aim a read or an overwrite anywhere this
 // process can reach. A node id is validated with `isSafeNodeId` (no separators, no `..`), so the
 // only files this module ever touches are `<id>.excalidraw` / `<id>.png` in those two folders.
+//
+// **The project folder is bound by its REAL path** (`projectBoardsDir`). The id check covers the
+// file name only: a repository can commit `.nodeterm` or `.nodeterm/whiteboards` as a symlink to any
+// directory on this machine, and every component before the file name used to be followed — a save
+// wrote `<id>.excalidraw` / `<id>.png` on the other side, and a read (which a hosted-team Viewer can
+// ask for) served that side's files past the realpath jail every `fs:*` call gets. Each existing
+// component is resolved and must stay inside the project's real root before anything is created
+// through it; otherwise the project folder is not used and the board falls back to the app folder.
 
 import { promises as fs } from 'fs'
-import { join } from 'path'
+import { isAbsolute, join, relative, sep } from 'path'
 import { renameAtomic, tempNameFor, writeFileAtomic } from './fs-atomic'
 import { readRegularFileBytesNoFollow } from './read-regular-file'
 import { isSafeNodeId } from '../shared/safe-id'
@@ -59,19 +67,55 @@ async function writeBytesAtomic(target: string, data: Buffer): Promise<void> {
   }
 }
 
-const isDir = async (p: string): Promise<boolean> => {
-  try {
-    return (await fs.stat(p)).isDirectory()
-  } catch {
-    return false
-  }
+/** `child` is `root` or below it, by path SEGMENTS (a sibling `root-x` is not inside `root`). A
+ *  path on another Windows drive comes back from `relative` absolute, and is not inside either. */
+const within = (root: string, child: string): boolean => {
+  const rel = relative(root, child)
+  return rel === '' || (!isAbsolute(rel) && rel.split(sep)[0] !== '..')
 }
 
-/** The folders a board may be in, most specific first. A project folder that is GONE is left out
- *  so a write never resurrects `<cwd>/.nodeterm/whiteboards` under a directory the user deleted. */
-async function candidateDirs(loc: WhiteboardLocation): Promise<string[]> {
+/**
+ * The project's whiteboards folder by its real path, or null when it must not be used: the project
+ * folder is gone, a component of `.nodeterm/whiteboards` leads outside the project (or dangles), or
+ * — for a read — the folder does not exist. `create` makes it for a write; a read never creates.
+ *
+ * Every component that exists is resolved BEFORE anything is created through it: `mkdir -p` on a
+ * `.nodeterm` that links out of the project would make `whiteboards` on the other side. A project
+ * folder that is GONE is refused too, so a write never resurrects a directory the user deleted.
+ */
+async function projectBoardsDir(projectCwd: string, create: boolean): Promise<string | null> {
+  const root = await fs.realpath(projectCwd).catch(() => null)
+  if (!root || !(await fs.stat(root).then((s) => s.isDirectory(), () => false))) return null
+  const boards = join(root, '.nodeterm', 'whiteboards')
+  for (const p of [join(root, '.nodeterm'), boards]) {
+    const present = await fs.lstat(p).then(
+      () => true,
+      (e: NodeJS.ErrnoException) => (e?.code === 'ENOENT' ? false : null)
+    )
+    if (present === null) return null
+    if (!present) {
+      if (!create) return null
+      break
+    }
+    // A dangling link has no real path: refused, never created through.
+    const real = await fs.realpath(p).catch(() => null)
+    if (!real || !within(root, real)) return null
+  }
+  if (create) await fs.mkdir(boards, { recursive: true })
+  const real = await fs.realpath(boards).catch(() => null)
+  if (!real || !within(root, real)) return null
+  return (await fs.stat(real).then((s) => s.isDirectory(), () => false)) ? real : null
+}
+
+/** The folders a board may be in, most specific first. `write` creates the project's folder; a read
+ *  only looks in one that exists. A project folder that cannot be used (see `projectBoardsDir`) is
+ *  left out, so the board lands in — or is read from — the app folder alone. */
+async function candidateDirs(loc: WhiteboardLocation, write: boolean): Promise<string[]> {
   const dirs: string[] = []
-  if (loc.projectCwd && (await isDir(loc.projectCwd))) dirs.push(projectWhiteboardsDir(loc.projectCwd))
+  if (loc.projectCwd) {
+    const dir = await projectBoardsDir(loc.projectCwd, write).catch(() => null)
+    if (dir) dirs.push(dir)
+  }
   dirs.push(appWhiteboardsDir(loc.userDataDir))
   return dirs
 }
@@ -99,7 +143,7 @@ export async function saveWhiteboard(
     thumb = Buffer.from(thumbnailBase64, 'base64')
     if (thumb.length > WHITEBOARD_THUMB_MAX_BYTES) return null
   }
-  for (const dir of await candidateDirs(loc)) {
+  for (const dir of await candidateDirs(loc, true)) {
     try {
       await fs.mkdir(dir, { recursive: true })
       const scenePath = join(dir, `${nodeId}.excalidraw`)
@@ -159,7 +203,7 @@ export async function readWhiteboard(
   withScene = true
 ): Promise<WhiteboardFile | null> {
   if (!safeId(nodeId)) return null
-  const dirs = await candidateDirs(loc)
+  const dirs = await candidateDirs(loc, false)
   const own = await readIn(dirs, nodeId, withScene !== false)
   if (own) return { ...own, fromSource: false }
   if (sourceId !== nodeId && safeId(sourceId)) {

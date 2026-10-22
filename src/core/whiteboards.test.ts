@@ -122,3 +122,56 @@ describe('saveWhiteboard / readWhiteboard', () => {
     expect(await readWhiteboard({ projectCwd, userDataDir }, 'whiteboard-new')).toBeNull()
   })
 })
+
+// `.nodeterm/` is git-shared, so a cloned repository can commit `.nodeterm/whiteboards` (or
+// `.nodeterm` itself) as a symlink to anywhere on this machine. The file-level no-follow read above
+// does not cover that: every path component before the file name is still followed.
+describe.skipIf(process.platform === 'win32')('the project folder is bound by its real path', () => {
+  let outside: string
+  beforeEach(async () => {
+    outside = join(root, 'outside')
+    await fs.mkdir(outside)
+  })
+
+  it('a .nodeterm/whiteboards symlink out of the project: nothing is written through it', async () => {
+    await fs.mkdir(join(projectCwd, '.nodeterm'))
+    await fs.symlink(outside, projectWhiteboardsDir(projectCwd))
+    const path = await saveWhiteboard({ projectCwd, userDataDir }, 'whiteboard-1', scene, png)
+    expect(path).toBe(join(appWhiteboardsDir(userDataDir), 'whiteboard-1.excalidraw'))
+    expect(await fs.readdir(outside)).toEqual([])
+  })
+
+  it('a .nodeterm symlink out of the project: no folder is created on the other side', async () => {
+    await fs.symlink(outside, join(projectCwd, '.nodeterm'))
+    const path = await saveWhiteboard({ projectCwd, userDataDir }, 'whiteboard-1', scene, png)
+    expect(path).toBe(join(appWhiteboardsDir(userDataDir), 'whiteboard-1.excalidraw'))
+    expect(await fs.readdir(outside)).toEqual([])
+  })
+
+  it('a read never follows a symlinked folder out of the project', async () => {
+    await fs.writeFile(join(outside, 'whiteboard-x.excalidraw'), scene)
+    await fs.writeFile(join(outside, 'whiteboard-x.png'), pngBytes)
+    await fs.mkdir(join(projectCwd, '.nodeterm'))
+    await fs.symlink(outside, projectWhiteboardsDir(projectCwd))
+    expect(await readWhiteboard({ projectCwd, userDataDir }, 'whiteboard-x')).toBeNull()
+    // ...and neither does a copy's read of its source through the same folder.
+    expect(await readWhiteboard({ projectCwd, userDataDir }, 'whiteboard-y', 'whiteboard-x')).toBeNull()
+  })
+
+  it('a symlink that stays inside the project is followed', async () => {
+    await fs.mkdir(join(projectCwd, 'boards'))
+    await fs.mkdir(join(projectCwd, '.nodeterm'))
+    await fs.symlink(join(projectCwd, 'boards'), projectWhiteboardsDir(projectCwd))
+    expect(await saveWhiteboard({ projectCwd, userDataDir }, 'whiteboard-1', scene)).not.toBeNull()
+    expect(await fs.readFile(join(projectCwd, 'boards', 'whiteboard-1.excalidraw'), 'utf8')).toBe(scene)
+    expect((await readWhiteboard({ projectCwd, userDataDir }, 'whiteboard-1'))?.scene).toBe(scene)
+  })
+
+  it('a project folder opened through a symlink still keeps its boards in the project', async () => {
+    const linked = join(root, 'linked-project')
+    await fs.symlink(projectCwd, linked)
+    expect(await saveWhiteboard({ projectCwd: linked, userDataDir }, 'whiteboard-1', scene)).not.toBeNull()
+    expect(await fs.readFile(join(projectWhiteboardsDir(projectCwd), 'whiteboard-1.excalidraw'), 'utf8')).toBe(scene)
+    expect(await fs.readdir(join(root, 'userData')).catch(() => [])).toEqual([])
+  })
+})
