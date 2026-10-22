@@ -28,6 +28,15 @@
  *     no-op when nothing sets the global.
  *   - Runs before electron-rebuild in `postinstall` / `rebuild`, so the native build sees it.
  *
+ * SECOND PATCH: Metal shaders in a packaged app (macOS)
+ *   smart-whisper tells whisper.cpp where its Metal shader source is through
+ *   GGML_METAL_PATH_RESOURCES, built from its own __dirname. In the packaged app dist/ is inside
+ *   app.asar, and native code cannot read inside an asar ("Not a directory"), so Metal init fails
+ *   and whisper.cpp silently runs on the CPU. The shader file is already unpacked beside it
+ *   (asarUnpack), so the patch points at app.asar.unpacked. Measured on an M5 Pro, Electron 42,
+ *   large-v3-turbo, 2.7 s clip, the app's own binary: 5.97 s on the CPU vs 0.64 s on Metal. An
+ *   explicit GGML_METAL_PATH_RESOURCES and a dev install are left unchanged.
+ *
  * GUARD: src/core/speech/smart-whisper-patch.test.ts asserts the marker is present in the
  * installed sources. If it is red, your node_modules is unpatched — run `npm run rebuild`.
  */
@@ -65,6 +74,14 @@ var module2 = (() => {
 
 const GYP_FIND = '    }\n  ],\n}'
 
+export const METAL_MARKER = 'NODETERM-PATCH(smart-whisper-metal-asar)'
+
+const METAL_FIND =
+  'process.env.GGML_METAL_PATH_RESOURCES = process.env.GGML_METAL_PATH_RESOURCES || import_node_path.default.join(__dirname, "../whisper.cpp/ggml/src");'
+
+const METAL_REPLACE = `// ${METAL_MARKER}: native code cannot read inside app.asar; use the unpacked copy.
+process.env.GGML_METAL_PATH_RESOURCES = process.env.GGML_METAL_PATH_RESOURCES || import_node_path.default.join(__dirname, "../whisper.cpp/ggml/src").replace(/([\\\\/])app\\.asar(?=[\\\\/])/, "$1app.asar.unpacked");`
+
 /** Patches the smart-whisper package in `dir`. Returns 'patched' | 'already-patched'. */
 export function patchSmartWhisper(dir) {
   const gypPath = path.join(dir, 'binding.gyp')
@@ -73,11 +90,16 @@ export function patchSmartWhisper(dir) {
   const js = fs.readFileSync(jsPath, 'utf8')
   const gypDone = gyp.includes(PATCH_MARKER)
   const jsDone = js.includes(PATCH_MARKER)
-  if (gypDone && jsDone) return 'already-patched'
+  const metalDone = js.includes(METAL_MARKER)
+  if (gypDone && jsDone && metalDone) return 'already-patched'
 
-  if (!jsDone) {
-    expectOnce(js, LOADER_FIND, 'dist/index.js binary require')
-    fs.writeFileSync(jsPath, js.replace(LOADER_FIND, LOADER_REPLACE))
+  if (!jsDone || !metalDone) {
+    if (!jsDone) expectOnce(js, LOADER_FIND, 'dist/index.js binary require')
+    if (!metalDone) expectOnce(js, METAL_FIND, 'dist/index.js Metal path')
+    let out = js
+    if (!jsDone) out = out.replace(LOADER_FIND, LOADER_REPLACE)
+    if (!metalDone) out = out.replace(METAL_FIND, METAL_REPLACE)
+    fs.writeFileSync(jsPath, out)
   }
 
   if (!gypDone) {
