@@ -9893,6 +9893,16 @@ Voice-to-text input captured via microphone, turned into terminal text via on-de
   SIMD flags in ggml), a GPU backend (this smart-whisper has no Vulkan build option), cancelling a
   running transcription, and the Server Edition (installed with `--ignore-scripts`, so it keeps the
   baseline; the startup log line `[speech] whisper binary: …` says which binary loaded).
+- **smart-whisper's model params are patched to start from whisper.cpp's defaults** (second patch in
+  `scripts/patch-smart-whisper.mjs`, marker `NODETERM-PATCH(smart-whisper-ctx-params)`, every
+  platform). Its `LoadModel` declared `whisper_context_params params;` and set only `use_gpu`, so DTW,
+  `gpu_device`, `flash_attn` and the rest were uninitialized stack memory and the result depended on
+  what was there. MEASURED on an M5 Pro, Electron 42, large-v3-turbo: the shipped binary crashed in 4
+  of 4 runs outside the app (`aheads_masks_init` then a crash in `whisper_free_state`, because garbage
+  switched DTW on with large-v3's alignment heads) and took 7-10 s per dictation inside it; with the
+  defaults it took 0.56 s for a 2.7 s clip and 0.93 s for 21 s, no crash. A newer whisper.cpp is
+  faster again (0.22 s / 0.43 s, measured the same way) but needs a build change on every platform;
+  that is a separate follow-up.
 
 ## Packaging & auto-update
 
