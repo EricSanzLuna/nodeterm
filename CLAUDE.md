@@ -326,16 +326,40 @@ Persistence has two layers:
   a teammate's canvas); and the cache's missing `cwd` is the downgrade contract — an older build
   opens it as a plain inline canvas instead of writing a fresh file into the folder. Its side files
   follow it: settings.json and the board log under `userData/project-files/<id>/.nodeterm/`
-  (`appDataProjectRoot`; settings still load as `'shared'`), canvas images to the existing
+  (`appDataProjectRoot`; settings still load as `'shared'`; removed with the project when it is
+  deleted, kept when it moves back into its folder), canvas images to the existing
   `userData/canvas-images` fallback (`sideFilesFolderForProject`). `localCwdForProject` still answers
   the folder, because it means where terminals run and what a relay seat is jailed to. Moving
   between the two is the tab menu's "Store canvas in app data / in folder"
   (`lib/projectStorageMove.ts`): into app data = save, then `releaseFolderFiles` (refused until the
   data file holds the canvas; files git tracks are kept unless the user confirms); into the folder =
-  `prepareFolderStorage` (refuses an occupied folder, like "Set folder…"), then save; the sweep
-  deletes the departed side's copy only once the folder file has landed, and keeps the rev. New
-  folder projects follow `settings.newProjectStorage`; a folder that already has a project.json is
-  adopted as it is, in its folder.
+  `prepareFolderStorage` (refuses an occupied folder, like "Set folder…"), then save, then
+  `projectStorage` (where the store has the canvas now). New folder projects follow
+  `settings.newProjectStorage`; a folder that already has a project.json is adopted as it is, in its
+  folder. Rules the moves rest on:
+  - **The data file goes only when THIS save wrote the folder file** (`sweepRemovedDataFiles`'
+    `folderFilesWritten`), never because `lastWritten` remembers one: a file can leave the folder
+    behind the store's back (`git rm`, a branch checkout) while the record stays, an unchanged
+    canvas then skipped the write as "unchanged", and the sweep deleted the only copy. For the same
+    reason the record of a folder file is dropped when its project moves into app data (kept file
+    or not) and when an entry takes a folder over from a data file ("Set folder…", a move back).
+  - **A move into the folder whose folder write fails stays in app data, index included**: the
+    folder leg swallows a failed write, so the save keeps that entry a folder-data-ref for that save
+    (`appDataCanvas`, the one builder of its cache). The menu reads `projectStorage` after the save,
+    puts the flag back and says the move failed; it never reads a landed save as a landed move.
+  - The rev continues across a move (the sweep keeps it for an id that is still live).
+
+  **Known limits:** an older build that opens a folder-data-ref while a folder `project.json` is
+  still there (a tracked file the user kept) keys its watcher, its phone writer and `readLocalRef`
+  on the entry's `cwd`, so until it next saves its index it can adopt that file as the project
+  (after which the entry is a plain folder ref there and the data file is orphaned). Images and a
+  board log stay on the side they were written on when a project moves, in either direction.
+  Handoff files from Transfer still write `<node cwd>/.nodeterm/`. The iOS app does not know the
+  kind: over direct SSH it reads the entry's `project` cache, which has no `cwd`, so it shows a
+  project without a folder (it never reads or writes the folder file, and its board and label
+  writers refuse with no write path; the relay verbs are handled here), and its repo scan finds no
+  `project.json` in that folder, so it can offer the folder as a new project and write one there.
+  SSH projects and Server `team bootstrap` cannot use the kind.
 
   In all three the file carries CONTENT and the entry carries the machine-local half — project
   `id`, `viewport`, `defaultAccountId`, `breadcrumbs`, `closedSessions`, `localApprovalId`,
