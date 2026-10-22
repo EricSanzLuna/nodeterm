@@ -2168,9 +2168,18 @@ number: change the table in that one module, never in one emulator.
   (project, node id) — `core/whiteboards.ts` — and NEVER by a path from node data (project.json is
   git-shared, hostile input); node data holds only `whiteboardSource` (a copy's original, by id)
   and `boardRev` (once per session); (3) the overlay is `data-nt-keyboard-owner`, which every
-  typing-aware key site honours via `isKeyboardOwnerTarget`; (4) every save path compares versions
-  against disk, and the unmount flush writes a snapshot kept from `onChange` — Excalidraw's api is
-  empty by cleanup time, and reading it there once erased a board. Excalidraw loads lazily; fonts
+  typing-aware key site honours via `isKeyboardOwnerTarget`; (4) every save is a COMPARE-AND-SET:
+  it sends the revision its editor last read or wrote (`rev`, `dev:ino:size:mtimeNs` of the scene
+  file — writers publish by rename, so it changes on every write; `null` = no board of its own yet)
+  and the core refuses it when the file on disk has moved on, so a board open in two places (two
+  tabs, a desktop and a browser on one folder, two hosted-team Editors, a `git pull`) is never
+  silently replaced by the later writer — the editor says "Changed elsewhere" instead. Saves of one
+  board are serialized within a core; two CORES on one folder can still interleave between the
+  check and the rename. The editor's own "has anything changed" test compares with what IT last
+  saved, not with disk. The unmount flush writes a snapshot kept from `onChange` — Excalidraw's api
+  is empty by cleanup time, and reading it there once erased a board; (5) the project folder is
+  bound by its REAL path — a `.nodeterm` or `.nodeterm/whiteboards` symlink leading out of the
+  project is not followed (the board falls back to the app folder). Excalidraw loads lazily; fonts
   come from `scripts/excalidraw-assets-plugin.ts`; mermaid is aliased to a stub.
 - **Run node** (a `terminal` node carrying `data.runConfig`, NOT a new NodeKind;
   `@shared/run-config`, `core/run-service.ts`, `nodes/RunBar.tsx`) — VS Code's "Run Without

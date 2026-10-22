@@ -83,14 +83,16 @@ export function registerFsHandlers(
   // A whiteboard's scene + picture: beside project.json when the project has a local cwd, else in
   // this core's data dir. Addressed by node id only — see core/whiteboards.ts for why a path is
   // never accepted.
+  // `expectedRev` is the compare-and-set revision (see `saveWhiteboard`): a stale one is refused.
   platform.handle(
     IPC.filesSaveWhiteboard,
-    (projectId: string, nodeId: string, scene: string, thumbnailBase64?: string) =>
+    (projectId: string, nodeId: string, scene: string, thumbnailBase64?: string, expectedRev?: string | null) =>
       saveWhiteboard(
         { projectCwd: deps.localProjectCwd?.(projectId), userDataDir: platform.userDataDir },
         nodeId,
         scene,
-        thumbnailBase64
+        thumbnailBase64,
+        expectedRev
       )
   )
   platform.handle(

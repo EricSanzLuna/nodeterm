@@ -68,10 +68,31 @@ could aim a read or an overwrite anywhere. A node id must be a `string` passing 
   stroke), so strokes never reach the workspace save, canvas undo or team sync.
 
 Saves happen 1.5 s after the last change, when editing ends (with the picture), and on unmount
-(project switch, node closed, quit). Each compares the current version with what is on disk rather
-than trusting an `onChange` flag; the unmount flush writes a snapshot kept from `onChange`, because
-by cleanup time Excalidraw's api answers an empty scene. A board whose file does not parse is shown
-as unreadable and never opened, so an autosave cannot overwrite it.
+(project switch, node closed). Whether there is anything to save is decided by comparing the
+scene's version with the one this editor last saved, not by an `onChange` flag; the unmount flush
+writes a snapshot kept from `onChange`, because by cleanup time Excalidraw's api answers an empty
+scene. A board whose file does not parse is shown as unreadable and never opened, so an autosave
+cannot overwrite it.
+
+**Every save is a compare-and-set against the file on disk.** A board can be open in two places:
+two Server Edition tabs, the desktop and a browser on one folder, two Editors of a hosted team, or
+a `git pull` that rewrites the file while it is open. Each read returns the scene file's revision
+(`rev`: `dev:ino:size:mtimeNs` of the descriptor read — every writer publishes by rename, so it
+changes on every write, also on a coarse-mtime filesystem), the editor sends the revision it last
+read or wrote with every save (`null` when the node has no board of its own yet — a new board, or a
+copy still showing its source), and the core refuses a save whose revision is not the one on disk.
+Nothing is written then, and the header says **Changed elsewhere**: the other version was kept.
+Saves of one board are serialized inside one core, so two saves racing there cannot both pass the
+check; two cores writing one folder (a desktop and a Server Edition) can still interleave in the
+moment between the check and the rename. A core on an older build ignores the revision and answers
+the bare path, and the save is then unchecked, as before.
+
+**The project folder is bound by its real path.** `.nodeterm/` is git-shared, so a repository can
+commit `.nodeterm` or `.nodeterm/whiteboards` as a symlink to any directory on this machine. Each
+existing component is resolved before anything is created through it and must stay inside the
+project's real root; a link that leads out (or dangles) means the project folder is not used — a
+save lands in the app folder, a read does not look there. A link that stays inside the project is
+followed.
 
 The two channels (`files.saveWhiteboard`, `files.readWhiteboard`) are registered in core for both
 shells and classified in both relay policies exactly like a canvas image (save: editors only;

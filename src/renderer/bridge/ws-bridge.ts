@@ -85,7 +85,7 @@ import {
 import type { PeerIdentity } from '../../shared/presence'
 import type { PaneOwner } from '../../shared/agents/pane-owner-predicate'
 import type { LaunchIntentExecutionResult } from '../../shared/types'
-import type { WhiteboardFile } from '../../shared/whiteboard'
+import type { WhiteboardFile, WhiteboardSaveResult } from '../../shared/whiteboard'
 import { fitsOneWsFrame } from '../../shared/ws-frame'
 import { buildStubApi, unsupported } from './stubs'
 import { sanitizeStationNotices } from '@shared/station-notice'
@@ -693,10 +693,10 @@ export function buildFilesApi(
     // The server closes the WHOLE socket (code 1009) on a client frame over WS_MAX_PAYLOAD, so a
     // board too big for one frame is refused here, before sending — the node shows "Not saved"
     // instead of the browser tab losing its connection to every terminal.
-    saveWhiteboard: (projectId, nodeId, scene, thumbnailBase64) =>
-      fitsOneWsFrame([projectId, nodeId, scene, thumbnailBase64])
-        ? (client.request(IPC.filesSaveWhiteboard, projectId, nodeId, scene, thumbnailBase64) as Promise<
-            string | null
+    saveWhiteboard: (projectId, nodeId, scene, thumbnailBase64, expectedRev) =>
+      fitsOneWsFrame([projectId, nodeId, scene, thumbnailBase64, expectedRev])
+        ? (client.request(IPC.filesSaveWhiteboard, projectId, nodeId, scene, thumbnailBase64, expectedRev) as Promise<
+            WhiteboardSaveResult | string | null
           >)
         : Promise.resolve(null),
     readWhiteboard: (projectId, nodeId, sourceId, withScene) =>

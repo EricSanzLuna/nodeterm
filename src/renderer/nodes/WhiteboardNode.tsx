@@ -77,8 +77,15 @@ export function WhiteboardNode({ id, data, selected, positionAbsoluteX, position
   const [geom, setGeom] = useState<Geometry | null>(null)
   const [thumb, setThumb] = useState<string>()
   const sceneRef = useRef<string | undefined>(undefined)
+  // The revision of the board file this editing session started from, then of each save it made —
+  // what every save sends, so the core can refuse one made over somebody else's newer board
+  // (core/whiteboards.ts, compare-and-set). `null`: this node has no board of its own yet (a new
+  // board, or a copy still showing its source). `undefined`: unknown (a core on an older build
+  // reports none), and the save is then not checked.
+  const revRef = useRef<string | null | undefined>(undefined)
   const [loadState, setLoadState] = useState<'loading' | 'ready' | 'unreadable'>('loading')
-  const [saveFailed, setSaveFailed] = useState(false)
+  // `conflict`: the core refused the last save because someone else saved this board meanwhile.
+  const [saveState, setSaveState] = useState<'saved' | 'failed' | 'conflict'>('saved')
   const [copied, setCopied] = useState(false)
   const maximizedByPresentRef = useRef(false)
   const viewKey = useStore(transformKey)
@@ -139,14 +146,20 @@ export function WhiteboardNode({ id, data, selected, positionAbsoluteX, position
 
   const save = useCallback(
     async (scene: string, thumbnailBase64?: string): Promise<boolean> => {
-      const path = await Promise.resolve()
-        .then(() => api.files.saveWhiteboard(projectIdRef.current, id, scene, thumbnailBase64))
+      const res = await Promise.resolve()
+        .then(() => api.files.saveWhiteboard(projectIdRef.current, id, scene, thumbnailBase64, revRef.current))
         .catch(() => null)
-      if (!path) {
-        setSaveFailed(true)
+      if (!res) {
+        setSaveState('failed')
         return false
       }
-      setSaveFailed(false)
+      if (typeof res === 'object' && !res.ok) {
+        setSaveState('conflict')
+        return false
+      }
+      // A core on an older build answers the bare path and no revision: the next save goes unchecked.
+      revRef.current = typeof res === 'string' ? undefined : res.rev
+      setSaveState('saved')
       sceneRef.current = scene
       if (thumbnailBase64 !== undefined) setThumb(thumbnailBase64 ? pngDataUrl(thumbnailBase64) : undefined)
       // A copy has its own file now; it stops reading the original's.
@@ -179,6 +192,8 @@ export function WhiteboardNode({ id, data, selected, positionAbsoluteX, position
           }
         }
         sceneRef.current = file?.scene
+        revRef.current = !file || file.fromSource ? null : file.rev
+        setSaveState('saved')
         if (next === 'present' && !dataRef.current.premaxRect) {
           setMaximized(false)
           maximizedByPresentRef.current = true
@@ -243,13 +258,17 @@ export function WhiteboardNode({ id, data, selected, positionAbsoluteX, position
             spellCheck={false}
             onChange={(e) => updateNodeData(id, { title: e.target.value })}
           />
-          {saveFailed && (
+          {saveState !== 'saved' && (
             <span
               className="whiteboard-node__save-failed"
               role="status"
-              title="The last change could not be written. The board stays open; it retries on the next change."
+              title={
+                saveState === 'conflict'
+                  ? 'Someone else saved this board while it was open here (another tab, another computer on this folder, or a teammate). Their version was kept; your changes are not saved.'
+                  : 'The last change could not be written. The board stays open; it retries on the next change.'
+              }
             >
-              Not saved
+              {saveState === 'conflict' ? 'Changed elsewhere' : 'Not saved'}
             </span>
           )}
           <span className="term-node__spacer" />

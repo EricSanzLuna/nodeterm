@@ -30,12 +30,12 @@ import { isAbsolute, join, relative, sep } from 'path'
 import { renameAtomic, tempNameFor, writeFileAtomic } from './fs-atomic'
 import { readRegularFileBytesNoFollow } from './read-regular-file'
 import { isSafeNodeId } from '../shared/safe-id'
-import type { WhiteboardFile } from '../shared/whiteboard'
+import type { WhiteboardFile, WhiteboardSaveResult } from '../shared/whiteboard'
 
 /** `isSafeNodeId` alone would pass a NUMBER (its regex coerces it); these arrive over IPC. */
 const safeId = (id: unknown): id is string => typeof id === 'string' && isSafeNodeId(id)
 
-export type { WhiteboardFile }
+export type { WhiteboardFile, WhiteboardSaveResult }
 
 export const projectWhiteboardsDir = (projectCwd: string): string =>
   join(projectCwd, '.nodeterm', 'whiteboards')
@@ -120,21 +120,59 @@ async function candidateDirs(loc: WhiteboardLocation, write: boolean): Promise<s
   return dirs
 }
 
+/** The revision of this node's OWN board — the file `readWhiteboard` would answer for it — or null
+ *  when it has none. Stat only: the scene is not read. */
+async function ownRev(dirs: string[], nodeId: string): Promise<string | null> {
+  for (const dir of dirs) {
+    const st = await readRegularFileBytesNoFollow(join(dir, `${nodeId}.excalidraw`), WHITEBOARD_SCENE_MAX_BYTES, {
+      read: false
+    })
+    if (st) return st.stamp
+  }
+  return null
+}
+
 /**
- * Write a board's scene (and optionally its picture). Resolves the scene's absolute path, or null
- * when the input is refused (bad id, over the cap) or no folder would take it. Never throws: the
- * caller keeps the board open and says the save failed — a drawing that silently was not saved is
- * the failure this must not have. The project folder is tried first; a read-only checkout or a
- * `.nodeterm` that is a file falls back to the app folder, like a canvas image.
+ * One save at a time per board in this process, so a compare-and-set can never interleave with
+ * another save of the same board in the same core. Two CORES writing one folder (a desktop and a
+ * Server Edition on the same project) can still interleave between the check and the rename; that
+ * window is a stat and a rename long.
+ */
+const savesInFlight = new Map<string, Promise<unknown>>()
+function oneSaveAtATime<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const next = (savesInFlight.get(key) ?? Promise.resolve()).then(run, run)
+  const tail = next.catch(() => undefined)
+  savesInFlight.set(key, tail)
+  void tail.then(() => {
+    if (savesInFlight.get(key) === tail) savesInFlight.delete(key)
+  })
+  return next
+}
+
+/**
+ * Write a board's scene (and optionally its picture). Resolves `{ok: true, path, rev}`, a conflict
+ * (below), or null when the input is refused (bad id, over the cap) or no folder would take it.
+ * Never throws: the caller keeps the board open and says the save failed — a drawing that silently
+ * was not saved is the failure this must not have. The project folder is tried first; a read-only
+ * checkout or a `.nodeterm` that is a file falls back to the app folder, like a canvas image.
+ *
+ * **Compare-and-set.** `expectedRev` is the revision the editor last read or wrote (`null`: it has
+ * no board of its own yet — a new board, or a copy still showing its source). When the board on
+ * disk is not that revision, nothing is written and the answer is `{conflict: true, currentRev}`:
+ * someone else saved it meanwhile, and replacing their whole board with ours is exactly the loss
+ * this exists to prevent. `undefined` (a caller that sends no revision — a renderer on an older
+ * build reaching this core over a relay) keeps the unconditional write.
  */
 export async function saveWhiteboard(
   loc: WhiteboardLocation,
   nodeId: string,
   scene: string,
-  thumbnailBase64?: string
-): Promise<string | null> {
+  thumbnailBase64?: string,
+  expectedRev?: string | null
+): Promise<WhiteboardSaveResult | null> {
   if (!safeId(nodeId)) return null
   if (typeof scene !== 'string' || Buffer.byteLength(scene) > WHITEBOARD_SCENE_MAX_BYTES) return null
+  if (expectedRev !== undefined && expectedRev !== null && typeof expectedRev !== 'string') return null
   let thumb: Buffer | undefined
   if (typeof thumbnailBase64 === 'string' && thumbnailBase64.length) {
     // Measure the ENCODED length first: decoding a hostile 2 GB string is the allocation the cap
@@ -143,22 +181,29 @@ export async function saveWhiteboard(
     thumb = Buffer.from(thumbnailBase64, 'base64')
     if (thumb.length > WHITEBOARD_THUMB_MAX_BYTES) return null
   }
-  for (const dir of await candidateDirs(loc, true)) {
-    try {
-      await fs.mkdir(dir, { recursive: true })
-      const scenePath = join(dir, `${nodeId}.excalidraw`)
-      await writeFileAtomic(scenePath, scene)
-      // The picture is best-effort: a board whose scene saved but whose picture did not is still
-      // a saved board (the node re-renders the picture the next time it is opened).
-      if (thumb) await writeBytesAtomic(join(dir, `${nodeId}.png`), thumb).catch(() => undefined)
-      // An empty string means the board is empty now: drop the old picture instead of showing it.
-      else if (thumbnailBase64 === '') await fs.rm(join(dir, `${nodeId}.png`), { force: true }).catch(() => undefined)
-      return scenePath
-    } catch {
-      // try the next folder
+  return oneSaveAtATime(JSON.stringify([loc.userDataDir, loc.projectCwd ?? '', nodeId]), async () => {
+    if (expectedRev !== undefined) {
+      const currentRev = await ownRev(await candidateDirs(loc, false), nodeId)
+      if (currentRev !== expectedRev) return { ok: false as const, conflict: true as const, currentRev }
     }
-  }
-  return null
+    for (const dir of await candidateDirs(loc, true)) {
+      try {
+        await fs.mkdir(dir, { recursive: true })
+        const scenePath = join(dir, `${nodeId}.excalidraw`)
+        await writeFileAtomic(scenePath, scene)
+        // The picture is best-effort: a board whose scene saved but whose picture did not is still
+        // a saved board (the node re-renders the picture the next time it is opened).
+        if (thumb) await writeBytesAtomic(join(dir, `${nodeId}.png`), thumb).catch(() => undefined)
+        // An empty string means the board is empty now: drop the old picture instead of showing it.
+        else if (thumbnailBase64 === '') await fs.rm(join(dir, `${nodeId}.png`), { force: true }).catch(() => undefined)
+        const written = await readRegularFileBytesNoFollow(scenePath, WHITEBOARD_SCENE_MAX_BYTES, { read: false })
+        return { ok: true as const, path: scenePath, rev: written?.stamp ?? '' }
+      } catch {
+        // try the next folder
+      }
+    }
+    return null
+  })
 }
 
 /**
@@ -180,7 +225,8 @@ async function readIn(
     return {
       scene: scene.bytes?.toString('utf8'),
       thumbnailBase64: png?.bytes?.toString('base64'),
-      updatedAt: scene.mtimeMs
+      updatedAt: scene.mtimeMs,
+      rev: scene.stamp
     }
   }
   return null

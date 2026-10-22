@@ -16,6 +16,10 @@ const scene = JSON.stringify({ type: 'excalidraw', elements: [{ id: 'a' }] })
 const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0xfe, 0x80])
 const png = pngBytes.toString('base64')
 
+/** The written path of a successful save (the tests above the compare-and-set block do not care
+ *  about revisions). */
+const pathOf = (r: Awaited<ReturnType<typeof saveWhiteboard>>): string | null => (r && r.ok ? r.path : null)
+
 let root: string
 let userDataDir: string
 let projectCwd: string
@@ -31,7 +35,7 @@ afterEach(() => rm(root, { recursive: true, force: true }))
 describe('saveWhiteboard / readWhiteboard', () => {
   it('writes beside project.json and reads the scene and picture back, picture byte-exact', async () => {
     const path = await saveWhiteboard({ projectCwd, userDataDir }, 'whiteboard-1', scene, png)
-    expect(path).toBe(join(projectWhiteboardsDir(projectCwd), 'whiteboard-1.excalidraw'))
+    expect(pathOf(path)).toBe(join(projectWhiteboardsDir(projectCwd), 'whiteboard-1.excalidraw'))
     const read = await readWhiteboard({ projectCwd, userDataDir }, 'whiteboard-1')
     expect(read).toMatchObject({ scene, fromSource: false })
     expect(Buffer.from(read!.thumbnailBase64!, 'base64').equals(pngBytes)).toBe(true)
@@ -40,21 +44,21 @@ describe('saveWhiteboard / readWhiteboard', () => {
 
   it('uses the app folder for a project with no local cwd (cwd-less canvas, SSH project)', async () => {
     const path = await saveWhiteboard({ userDataDir }, 'whiteboard-1', scene)
-    expect(path).toBe(join(appWhiteboardsDir(userDataDir), 'whiteboard-1.excalidraw'))
+    expect(pathOf(path)).toBe(join(appWhiteboardsDir(userDataDir), 'whiteboard-1.excalidraw'))
     expect((await readWhiteboard({ userDataDir }, 'whiteboard-1'))?.scene).toBe(scene)
   })
 
   it('never resurrects a deleted project folder; the board lands in the app folder instead', async () => {
     await rm(projectCwd, { recursive: true, force: true })
     const path = await saveWhiteboard({ projectCwd, userDataDir }, 'whiteboard-1', scene)
-    expect(path).toBe(join(appWhiteboardsDir(userDataDir), 'whiteboard-1.excalidraw'))
+    expect(pathOf(path)).toBe(join(appWhiteboardsDir(userDataDir), 'whiteboard-1.excalidraw'))
     await expect(fs.stat(projectCwd)).rejects.toThrow()
   })
 
   it('falls back to the app folder when the project folder will not take the file', async () => {
     await fs.writeFile(join(projectCwd, '.nodeterm'), 'not a directory')
     const path = await saveWhiteboard({ projectCwd, userDataDir }, 'whiteboard-1', scene)
-    expect(path).toBe(join(appWhiteboardsDir(userDataDir), 'whiteboard-1.excalidraw'))
+    expect(pathOf(path)).toBe(join(appWhiteboardsDir(userDataDir), 'whiteboard-1.excalidraw'))
     // ...and a read finds it there, since the project folder has no board.
     expect((await readWhiteboard({ projectCwd, userDataDir }, 'whiteboard-1'))?.scene).toBe(scene)
   })
@@ -137,14 +141,14 @@ describe.skipIf(process.platform === 'win32')('the project folder is bound by it
     await fs.mkdir(join(projectCwd, '.nodeterm'))
     await fs.symlink(outside, projectWhiteboardsDir(projectCwd))
     const path = await saveWhiteboard({ projectCwd, userDataDir }, 'whiteboard-1', scene, png)
-    expect(path).toBe(join(appWhiteboardsDir(userDataDir), 'whiteboard-1.excalidraw'))
+    expect(pathOf(path)).toBe(join(appWhiteboardsDir(userDataDir), 'whiteboard-1.excalidraw'))
     expect(await fs.readdir(outside)).toEqual([])
   })
 
   it('a .nodeterm symlink out of the project: no folder is created on the other side', async () => {
     await fs.symlink(outside, join(projectCwd, '.nodeterm'))
     const path = await saveWhiteboard({ projectCwd, userDataDir }, 'whiteboard-1', scene, png)
-    expect(path).toBe(join(appWhiteboardsDir(userDataDir), 'whiteboard-1.excalidraw'))
+    expect(pathOf(path)).toBe(join(appWhiteboardsDir(userDataDir), 'whiteboard-1.excalidraw'))
     expect(await fs.readdir(outside)).toEqual([])
   })
 
@@ -173,5 +177,78 @@ describe.skipIf(process.platform === 'win32')('the project folder is bound by it
     expect(await saveWhiteboard({ projectCwd: linked, userDataDir }, 'whiteboard-1', scene)).not.toBeNull()
     expect(await fs.readFile(join(projectWhiteboardsDir(projectCwd), 'whiteboard-1.excalidraw'), 'utf8')).toBe(scene)
     expect(await fs.readdir(join(root, 'userData')).catch(() => [])).toEqual([])
+  })
+})
+
+// A board can be open in two places at once: two Server Edition tabs, the desktop and a browser on
+// one folder, two Editors of a hosted team. Each save names the revision its editor last read or
+// wrote, and the core refuses a save whose revision is no longer the one on disk — instead of the
+// later writer silently replacing the earlier writer's whole board.
+describe('compare-and-set: a save made against a stale revision is refused', () => {
+  const sceneOf = (tag: string) => JSON.stringify({ type: 'excalidraw', elements: [{ id: tag }] })
+  const onDisk = () => fs.readFile(join(projectWhiteboardsDir(projectCwd), 'whiteboard-1.excalidraw'), 'utf8')
+
+  it('the second of two editors that opened the same board cannot overwrite the first', async () => {
+    const loc = { projectCwd, userDataDir }
+    await saveWhiteboard(loc, 'whiteboard-1', sceneOf('start'))
+    const a = await readWhiteboard(loc, 'whiteboard-1')
+    const b = await readWhiteboard(loc, 'whiteboard-1')
+    expect(a?.rev).toBeTruthy()
+    expect(a?.rev).toBe(b?.rev)
+
+    const savedB = await saveWhiteboard(loc, 'whiteboard-1', sceneOf('b'), undefined, b!.rev)
+    expect(savedB).toMatchObject({ ok: true })
+    const savedA = await saveWhiteboard(loc, 'whiteboard-1', sceneOf('a'), undefined, a!.rev)
+    expect(savedA).toMatchObject({ ok: false, conflict: true, currentRev: (savedB as { rev: string }).rev })
+    expect(await onDisk()).toBe(sceneOf('b'))
+  })
+
+  it('a save returns the new revision, and saving again against it succeeds', async () => {
+    const loc = { projectCwd, userDataDir }
+    const first = await saveWhiteboard(loc, 'whiteboard-1', sceneOf('1'), undefined, null)
+    expect(first).toMatchObject({ ok: true })
+    const rev = (first as { rev: string }).rev
+    expect((await readWhiteboard(loc, 'whiteboard-1'))?.rev).toBe(rev)
+    expect(await saveWhiteboard(loc, 'whiteboard-1', sceneOf('2'), undefined, rev)).toMatchObject({ ok: true })
+    expect(await onDisk()).toBe(sceneOf('2'))
+  })
+
+  it('a null revision means "I have no board of my own": one that appeared meanwhile is kept', async () => {
+    const loc = { projectCwd, userDataDir }
+    await saveWhiteboard(loc, 'whiteboard-1', sceneOf('theirs'))
+    expect(await saveWhiteboard(loc, 'whiteboard-1', sceneOf('mine'), undefined, null)).toMatchObject({
+      ok: false,
+      conflict: true
+    })
+    expect(await onDisk()).toBe(sceneOf('theirs'))
+  })
+
+  it('the revision changes on every write, even a same-size rewrite in the same millisecond', async () => {
+    const loc = { projectCwd, userDataDir }
+    const revs = new Set<string>()
+    for (const tag of ['aa', 'bb', 'cc']) {
+      const saved = await saveWhiteboard(loc, 'whiteboard-1', sceneOf(tag))
+      revs.add((saved as { rev: string }).rev)
+    }
+    expect(revs.size).toBe(3)
+  })
+
+  it('two saves racing in one core are serialized: exactly one of them wins', async () => {
+    const loc = { projectCwd, userDataDir }
+    const start = await saveWhiteboard(loc, 'whiteboard-1', sceneOf('start'))
+    const rev = (start as { rev: string }).rev
+    const results = await Promise.all([
+      saveWhiteboard(loc, 'whiteboard-1', sceneOf('x'), undefined, rev),
+      saveWhiteboard(loc, 'whiteboard-1', sceneOf('y'), undefined, rev)
+    ])
+    expect(results.filter((r) => r && 'ok' in r && r.ok)).toHaveLength(1)
+    expect(results.filter((r) => r && 'conflict' in r)).toHaveLength(1)
+  })
+
+  it('no revision at all (an older caller) keeps the unconditional write', async () => {
+    const loc = { projectCwd, userDataDir }
+    await saveWhiteboard(loc, 'whiteboard-1', sceneOf('one'))
+    expect(await saveWhiteboard(loc, 'whiteboard-1', sceneOf('two'))).toMatchObject({ ok: true })
+    expect(await onDisk()).toBe(sceneOf('two'))
   })
 })

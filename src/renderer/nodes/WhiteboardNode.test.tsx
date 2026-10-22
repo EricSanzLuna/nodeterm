@@ -1,0 +1,157 @@
+// @vitest-environment jsdom
+//
+// The whiteboard node's own decisions, with the real component: what it sends when it saves, what
+// it shows when a save fails or is refused. The live editor (Excalidraw) is replaced by a stub that
+// records the props the node hands it — the node is what decides those, and the editor's own logic
+// has its own test (whiteboard/WhiteboardEditor.test.tsx).
+import { act } from 'react'
+import { createRoot, type Root } from 'react-dom/client'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { ReactFlowProvider, type NodeProps } from '@xyflow/react'
+import type { CanvasNode } from '../state/workspace'
+import type { WhiteboardFile } from '@shared/whiteboard'
+
+;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+// jsdom has none; the node only uses it to follow its own box while editing.
+;(globalThis as { ResizeObserver?: unknown }).ResizeObserver ??= class {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
+interface EditorProps {
+  initialScene: string | undefined
+  readOnly?: boolean
+  onSave: (scene: string, thumbnailBase64?: string) => Promise<boolean>
+  onExit: (changed: boolean) => void
+}
+const editor: { props: EditorProps | null } = { props: null }
+vi.mock('../whiteboard/WhiteboardEditor', () => ({
+  default: (props: EditorProps) => {
+    editor.props = props
+    return <div data-testid="editor" />
+  }
+}))
+
+const files = {
+  readWhiteboard: vi.fn<(...a: unknown[]) => Promise<WhiteboardFile | null>>(),
+  saveWhiteboard: vi.fn<(...a: unknown[]) => Promise<unknown>>()
+}
+vi.mock('../session/session', () => ({
+  useSession: () => ({ id: 'local', source: 'local', api: { files } })
+}))
+
+import { WhiteboardNode } from './WhiteboardNode'
+import { useProjects } from '../state/projects'
+
+const SCENE = JSON.stringify({ type: 'excalidraw', elements: [] })
+
+let host: HTMLDivElement
+let root: Root
+
+function mount(data: Partial<CanvasNode['data']> = {}) {
+  host = document.createElement('div')
+  // The overlay is portaled into `.canvas-root` and clipped to `.flow-wrap`; the node finds both
+  // by ancestry before it mounts an editor.
+  host.className = 'canvas-root'
+  const wrap = document.createElement('div')
+  wrap.className = 'flow-wrap'
+  host.append(wrap)
+  document.body.append(host)
+  root = createRoot(wrap)
+  const props = {
+    id: 'whiteboard-1',
+    data: { title: 'Whiteboard', color: '#64d2ff', group: null, ...data },
+    selected: false,
+    positionAbsoluteX: 0,
+    positionAbsoluteY: 0,
+    width: 900,
+    height: 600
+  } as unknown as NodeProps<CanvasNode>
+  act(() =>
+    root.render(
+      <ReactFlowProvider>
+        <WhiteboardNode {...props} />
+      </ReactFlowProvider>
+    )
+  )
+}
+
+/** Let the picture read, the scene read and the lazy editor chunk all settle. */
+const settle = () => act(async () => {
+  for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0))
+})
+
+async function openEditor(): Promise<EditorProps> {
+  await settle()
+  const body = host.querySelector('.whiteboard-node__body')!
+  act(() => {
+    body.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+  })
+  await settle()
+  expect(editor.props).not.toBeNull()
+  return editor.props!
+}
+
+beforeEach(() => {
+  editor.props = null
+  files.readWhiteboard.mockReset()
+  files.saveWhiteboard.mockReset()
+  useProjects.setState({ activeProjectId: 'p1' })
+})
+
+afterEach(() => {
+  act(() => root.unmount())
+  host.remove()
+})
+
+describe('saving sends the revision the editor started from', () => {
+  it('sends the loaded revision, then the one each save returns', async () => {
+    files.readWhiteboard.mockResolvedValue({ scene: SCENE, updatedAt: 1, rev: 'r1', fromSource: false })
+    files.saveWhiteboard
+      .mockResolvedValueOnce({ ok: true, path: '/p/whiteboard-1.excalidraw', rev: 'r2' })
+      .mockResolvedValueOnce({ ok: true, path: '/p/whiteboard-1.excalidraw', rev: 'r3' })
+    mount()
+    const props = await openEditor()
+    await act(async () => void (await props.onSave(SCENE)))
+    expect(files.saveWhiteboard.mock.calls[0]?.[4]).toBe('r1')
+    await act(async () => void (await props.onSave(SCENE)))
+    expect(files.saveWhiteboard.mock.calls[1]?.[4]).toBe('r2')
+  })
+
+  it('a copy still showing its source saves as "no board of my own yet" (null)', async () => {
+    files.readWhiteboard.mockResolvedValue({ scene: SCENE, updatedAt: 1, rev: 'src-rev', fromSource: true })
+    files.saveWhiteboard.mockResolvedValue({ ok: true, path: '/p/whiteboard-1.excalidraw', rev: 'r1' })
+    mount({ whiteboardSource: 'whiteboard-0' })
+    const props = await openEditor()
+    await act(async () => void (await props.onSave(SCENE)))
+    expect(files.saveWhiteboard.mock.calls[0]?.[4]).toBeNull()
+  })
+
+  it('a refused save (someone else saved meanwhile) is a failure the header names', async () => {
+    files.readWhiteboard.mockResolvedValue({ scene: SCENE, updatedAt: 1, rev: 'r1', fromSource: false })
+    files.saveWhiteboard.mockResolvedValue({ ok: false, conflict: true, currentRev: 'r9' })
+    mount()
+    const props = await openEditor()
+    let saved: boolean | undefined
+    await act(async () => {
+      saved = await props.onSave(SCENE)
+    })
+    expect(saved).toBe(false)
+    expect(host.querySelector('.whiteboard-node__save-failed')?.textContent).toMatch(/changed elsewhere/i)
+  })
+
+  it('a core on an older build (bare path answer, no revision) still counts as saved', async () => {
+    files.readWhiteboard.mockResolvedValue({ scene: SCENE, updatedAt: 1, fromSource: false })
+    files.saveWhiteboard.mockResolvedValue('/p/whiteboard-1.excalidraw')
+    mount()
+    const props = await openEditor()
+    let saved: boolean | undefined
+    await act(async () => {
+      saved = await props.onSave(SCENE)
+    })
+    expect(saved).toBe(true)
+    expect(files.saveWhiteboard.mock.calls[0]?.[4]).toBeUndefined()
+    expect(host.querySelector('.whiteboard-node__save-failed')).toBeNull()
+  })
+})

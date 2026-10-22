@@ -1,7 +1,7 @@
 import type { ChatPromptResult, EmptyPromptResult, TextDeliveryResult } from './text-delivery'
 import type { PushWebhookMinted, PushWebhookResult, PushWebhookTokenInfo } from './push-webhook'
 import type { IdentitySeedEntry } from './agent-identity-seed'
-import type { WhiteboardFile } from './whiteboard'
+import type { WhiteboardFile, WhiteboardSaveResult } from './whiteboard'
 import type { PrWaitHold } from './pr-wait'
 import type { SessionBackend } from './session-backend'
 import type { AgentIntegrationsSettings } from './agent-integrations'
@@ -1676,10 +1676,18 @@ export interface FilesApi {
   saveCanvasImage(projectId: string, name: string, dataBase64: string): Promise<string | null>
   /**
    * Save a whiteboard node's scene (Excalidraw JSON) and the picture it shows at rest. The core
-   * derives the file from (projectId, nodeId) — beside project.json, or its own data dir — and
-   * resolves its absolute path, or null when it could not be written. See core/whiteboards.ts.
+   * derives the file from (projectId, nodeId) — beside project.json, or its own data dir. Resolves
+   * `{ok: true, path, rev}`, a conflict when the board on disk is no longer `expectedRev` (nothing
+   * written), or null when it could not be written. A core on an older build answers the bare path
+   * string and ignores `expectedRev`. See core/whiteboards.ts.
    */
-  saveWhiteboard(projectId: string, nodeId: string, scene: string, thumbnailBase64?: string): Promise<string | null>
+  saveWhiteboard(
+    projectId: string,
+    nodeId: string,
+    scene: string,
+    thumbnailBase64?: string,
+    expectedRev?: string | null
+  ): Promise<WhiteboardSaveResult | string | null>
   /** Read a whiteboard back; `sourceId` is the board a copied node falls back to until it saves.
    *  `withScene: false` reads only the picture and revision (a board at rest). */
   readWhiteboard(projectId: string, nodeId: string, sourceId?: string, withScene?: boolean): Promise<WhiteboardFile | null>
