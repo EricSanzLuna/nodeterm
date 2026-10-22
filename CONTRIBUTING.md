@@ -1205,6 +1205,11 @@ the kind union, so a new kind is a **compile error** until you route it. The kan
 `addMenuSpec.surfaces.test.ts` pins that split so "make them all consistent" stays a decision
 rather than a reflex.
 
+**A new node kind also gets a default size the user can change.** Add it to `SizableNodeKind` /
+`SIZABLE_NODE_KINDS` (`shared/default-node-size.ts`) and `BUILTIN_NODE_SIZES`, and place it with
+`placeSized(kind, …)` in its factory. A literal `*_SIZE` passed to `placeNode` compiles fine and
+quietly ignores Settings → Behavior → Default node size for that kind.
+
 **A setting read at mount reads the DEFAULT, not the user's.** `useSettings` starts on
 `DEFAULT_SETTINGS` and hydrates from disk asynchronously, while `<Canvas />` is mounted before that
 lands. A `useState(() => settings.foo ? ...)` initializer therefore reads the shipped default and
