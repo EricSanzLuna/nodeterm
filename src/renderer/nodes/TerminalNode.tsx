@@ -3684,8 +3684,10 @@ export function TerminalNode({
           // this view does not hold), a refused-launch banner about a launch into a session that
           // is not attached, and a letterbox sized to a pty that is not attached. Clear them the
           // way the neighbouring refusals set theirs, say why the pane is empty, and stop;
-          // "Refresh terminal" re-asks on demand.
-          if (unavailable === 'join-only') {
+          // "Refresh terminal" re-asks on demand. `held-elsewhere` is the same shape: core found
+          // this remote node's id held by a session that is not on its host and did not join it —
+          // nothing is offline, and "Try again" would refuse again while that session runs.
+          if (unavailable === 'join-only' || unavailable === 'held-elsewhere') {
             setCo(termKey, {
               offline: false,
               spawnError: null,
