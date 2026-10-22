@@ -35,8 +35,9 @@
  *   with DTW switched on by garbage, whisper_init_state() fails for large-v3-turbo ("tried to set
  *   alignment head on text layer 14, but model only has 4 text layers") and the app aborts in
  *   whisper_free_state. Measured on an M5 Pro, Electron 42, large-v3-turbo, 2.7 s and 21 s clips:
- *   the shipped binary crashed in 4 of 4 runs outside the app and took 7-10 s per dictation inside
- *   it; with the params initialized it took 0.56 s and 0.93 s, no crash. The fix starts from
+ *   the shipped binary crashed in 4 of 4 runs outside the app; with the params initialized it ran
+ *   without a crash (0.56 s and 0.93 s on Metal). The slow dictation seen inside the packaged app is
+ *   a separate bug (Metal cannot read its shaders inside app.asar). The fix starts from
  *   whisper_context_default_params(), exactly what whisper.cpp's own examples do.
  *
  * GUARD: src/core/speech/smart-whisper-patch.test.ts asserts both markers are present in the
