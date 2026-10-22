@@ -799,6 +799,8 @@ import { snapNodeToGrid } from '../lib/nodeSizing'
 import { snapResizeChanges } from '../lib/resizeSnap'
 import { canClearDirty, canCommitCanvas, canCreateOnCanvas, liveCanvasHolds } from '../state/persistGuards'
 import { mirrorLatest, rebaseOnLatest, useNodesEpoch } from './nodesEpoch'
+import { useFlowStoreOwner } from './flowStoreOwner'
+import { OwningProjectContext } from '../session/owning-project'
 import { boardLiveNodeIds, createKanbanPublisher } from './kanban-sync'
 import { applyToStoredCopy, createStoredCanvasPublisher } from './stored-publish'
 import { isHidden } from '../lib/ui-visibility'
@@ -2879,6 +2881,11 @@ export function Canvas() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [nodes, ephemeralNodes, keepAliveEntries]
   )
+  // The project whose nodes React Flow's STORE holds, which a switch moves one commit after
+  // `nodes` (see flowStoreOwner.ts). The node subtree's session is keyed on it, never on the
+  // active id, so the outgoing project's nodes never remount under the incoming project's session.
+  const flowOwnerProjectId = useFlowStoreOwner(allNodes, renderedProjectId)
+  const nodeSession = sessionForProject(flowOwnerProjectId ?? '')
 
   // Context-link edges, statically styled (no per-message activity in the pull model).
   const accent = settings.accent
@@ -19630,15 +19637,25 @@ export function Canvas() {
             </div>
           </div>
         )}
-        {/* The active project's node subtree runs under ITS session (local for a local tab, the
-            relay session for a remote tab). Keyed by session id so an api swap REMOUNTS the nodes
-            (obligation 3): TerminalNode/EditorNode capture `api` in []-effects, so a live
-            api change must remount them or they keep talking to the old core. For an all-local user
-            the key is always 'local', so this never remounts — zero behavior change. */}
-        <SessionProvider session={sessionForProject(activeProjectId || '')} key={sessionForProject(activeProjectId || '').id}>
+        {/* The node subtree runs under the session of the project whose nodes React Flow's STORE
+            holds (`flowOwnerProjectId`) — local for a local tab, the relay session for a remote
+            tab. Keyed by session id so an api swap REMOUNTS the nodes (obligation 3):
+            TerminalNode/EditorNode capture `api` in []-effects, so a live api change must remount
+            them or they keep talking to the old core. NOT keyed on `activeProjectId`: xyflow copies
+            the `nodes` prop into its store in a passive effect and `ReactFlowProvider` sits above
+            this provider, so a key that flipped with the active id remounted whatever the store
+            still held — the OUTGOING nodes — under the INCOMING session (a team tab's terminals
+            were created on this desktop's core). For an all-local user the key is always 'local',
+            so this never remounts. */}
+        <SessionProvider session={nodeSession} key={nodeSession.id}>
+        <OwningProjectContext.Provider value={flowOwnerProjectId}>
         <ReactFlow
           className={wallpaperBg ? 'has-wallpaper' : undefined}
           nodes={allNodes}
+          // Read only at mount. A session-changing switch remounts this <ReactFlow> (key above) one
+          // commit AFTER the load effect applied the project's camera, and the fresh pan/zoom starts
+          // here — so hand it the live camera; xyflow's default put every such switch at the origin.
+          defaultViewport={viewportRef.current}
           edges={displayEdges}
           nodeTypes={nodeTypes}
           edgeTypes={edgeTypes}
@@ -19783,6 +19800,7 @@ export function Canvas() {
             <StatusAwareMiniMap onNodeDoubleClick={goToNode} />
           </MinimapDock>
         </ReactFlow>
+        </OwningProjectContext.Provider>
         </SessionProvider>
 
         {/* MUST stay OUTSIDE <ReactFlow>. The library's wrapper carries inline

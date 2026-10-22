@@ -540,6 +540,18 @@ project's nodes only.** The contract:
   `liveCanvasHolds` (tag AND active id; otherwise the store) and queues a FUNCTIONAL update
   (`rebaseOnLatest`). Consequence for readers: code pairing the tag with the RENDERED `nodes`
   (a render-time publish, an effect keyed on `nodes`) reads `renderedProjectId`, never the ref.
+- **The node subtree's session follows the project whose nodes React Flow's STORE holds**
+  (`useFlowStoreOwner`, `canvas/flowStoreOwner.ts`), never `activeProjectId`. xyflow copies the
+  `nodes` prop into its store in a PASSIVE effect and `ReactFlowProvider` sits above the keyed
+  `SessionProvider`, so a key that flipped with the active id remounted the OUTGOING project's
+  nodes under the INCOMING session for a commit: a team tab's terminals were created on this
+  desktop's own core, and a local terminal on the relay host. Each array handed to
+  `<ReactFlow nodes>` is recorded against `renderedProjectId` and the store's array is looked up
+  (unknown ⇒ the last known owner); the same id feeds `OwningProjectContext`. A local → local
+  switch keeps the key `'local'` (no remount). A session-changing remount now lands one commit
+  AFTER the load applied the project's camera and builds a fresh pan/zoom, so `<ReactFlow>` gets
+  `defaultViewport={viewportRef.current}`, or the switch resets the camera to the origin.
+  `flowStoreOwner.test.tsx` replays the switches through real React Flow.
 - Switching away unmounts the old project's `TerminalNode`s → their tmux clients detach but
   the sessions keep running; switching back reattaches. tmux session names are per-node-id
   (globally unique), so projects never collide.
