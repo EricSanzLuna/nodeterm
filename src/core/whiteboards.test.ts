@@ -6,6 +6,7 @@ import { join } from 'path'
 import {
   WHITEBOARD_SCENE_MAX_BYTES,
   appWhiteboardsDir,
+  carryWhiteboards,
   projectWhiteboardsDir,
   readWhiteboard,
   saveWhiteboard
@@ -303,5 +304,61 @@ describe('a folder project kept in app data', () => {
     const edited = JSON.stringify({ type: 'excalidraw', elements: [{ id: 'b' }] })
     await saveWhiteboard(loc, 'whiteboard-1', edited)
     expect((await readWhiteboard(loc, 'whiteboard-1'))?.scene).toBe(edited)
+  })
+})
+
+// The move of a folder project's canvas from app data back into its folder (issue #1145) takes the
+// boards drawn or edited in app data along: the folder is read first afterwards, and its older file
+// of the same board would otherwise hide the newer one.
+describe('carryWhiteboards', () => {
+  let appRoot: string
+  beforeEach(() => {
+    appRoot = join(userDataDir, 'project-files', 'project-p1')
+  })
+  const inFolder = (name: string) => join(projectWhiteboardsDir(projectCwd), name)
+
+  it("copies every board into the folder, replacing the folder's older file, picture byte-exact", async () => {
+    const edited = JSON.stringify({ type: 'excalidraw', elements: [{ id: 'edited' }] })
+    await saveWhiteboard({ projectCwd, userDataDir }, 'whiteboard-1', scene)
+    await saveWhiteboard({ projectCwd: appRoot, createRoot: true, userDataDir }, 'whiteboard-1', edited, png)
+    await saveWhiteboard({ projectCwd: appRoot, createRoot: true, userDataDir }, 'whiteboard-2', scene)
+
+    await carryWhiteboards(appRoot, projectCwd)
+
+    expect(await fs.readFile(inFolder('whiteboard-1.excalidraw'), 'utf8')).toBe(edited)
+    expect((await fs.readFile(inFolder('whiteboard-1.png'))).equals(pngBytes)).toBe(true)
+    expect(await fs.readFile(inFolder('whiteboard-2.excalidraw'), 'utf8')).toBe(scene)
+    // The app-data copies stay: nothing is deleted on either side.
+    expect(await fs.readFile(join(projectWhiteboardsDir(appRoot), 'whiteboard-1.excalidraw'), 'utf8')).toBe(edited)
+  })
+
+  it("a carried board with no picture drops the folder's old picture rather than show it", async () => {
+    await saveWhiteboard({ projectCwd, userDataDir }, 'whiteboard-1', scene, png)
+    await saveWhiteboard({ projectCwd: appRoot, createRoot: true, userDataDir }, 'whiteboard-1', scene, '')
+    await carryWhiteboards(appRoot, projectCwd)
+    await expect(fs.stat(inFolder('whiteboard-1.png'))).rejects.toThrow()
+  })
+
+  it('does nothing, and creates nothing in the folder, when there is no board to carry', async () => {
+    await carryWhiteboards(appRoot, projectCwd)
+    expect(await fs.readdir(projectCwd)).toEqual([])
+  })
+
+  it.skipIf(process.platform === 'win32')('never carries a symlink, and never writes through one', async () => {
+    const secret = join(root, 'secret.txt')
+    await fs.writeFile(secret, 'private key material')
+    const from = projectWhiteboardsDir(appRoot)
+    await fs.mkdir(from, { recursive: true })
+    await fs.symlink(secret, join(from, 'whiteboard-evil.excalidraw'))
+    await carryWhiteboards(appRoot, projectCwd)
+    await expect(fs.stat(inFolder('whiteboard-evil.excalidraw'))).rejects.toThrow()
+
+    const outside = join(root, 'outside')
+    await fs.mkdir(outside)
+    await saveWhiteboard({ projectCwd: appRoot, createRoot: true, userDataDir }, 'whiteboard-1', scene)
+    await fs.mkdir(join(projectCwd, '.nodeterm'), { recursive: true })
+    await fs.symlink(outside, projectWhiteboardsDir(projectCwd))
+    await carryWhiteboards(appRoot, projectCwd)
+    expect(await fs.readdir(outside)).toEqual([])
   })
 })

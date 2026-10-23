@@ -448,6 +448,29 @@ describe('the move steps', () => {
     expect((await store.readProjectSettings('project-p1'))?.shared?.terminal?.shell).toBe('/bin/fish')
   })
 
+  it('a round trip with a board edited in app data opens the edited board, not the folder copy', async () => {
+    const store = new WorkspaceStore()
+    const board = () => ({ ...store.whiteboardLocationForProject('project-p1'), userDataDir: userData })
+    const sceneOf = (tag: string) => JSON.stringify({ type: 'excalidraw', elements: [{ id: tag }] })
+    // Drawn while the canvas was in the folder, then moved into app data and edited there…
+    await store.save(ws([project({ storeInAppData: undefined })]))
+    await saveWhiteboard(board(), 'whiteboard-1', sceneOf('before'))
+    await store.save(ws([project()]))
+    await store.releaseFolderFiles('project-p1', false)
+    const opened = await readWhiteboard(board(), 'whiteboard-1')
+    expect(opened?.scene).toBe(sceneOf('before'))
+    expect(await saveWhiteboard(board(), 'whiteboard-1', sceneOf('edited'), undefined, opened!.rev)).toMatchObject({ ok: true })
+    // The folder still holds the board as it was before the move.
+    const inFolder = path.join(folder, '.nodeterm', 'whiteboards', 'whiteboard-1.excalidraw')
+    expect(await fs.readFile(inFolder, 'utf-8')).toBe(sceneOf('before'))
+
+    // …and moved back: the edit comes with it.
+    expect(await store.prepareFolderStorage('project-p1')).toEqual({ ok: true })
+    await store.save(ws([project({ storeInAppData: undefined })]))
+    expect((await readWhiteboard(board(), 'whiteboard-1'))?.scene).toBe(sceneOf('edited'))
+    expect(await fs.readFile(inFolder, 'utf-8')).toBe(sceneOf('edited'))
+  })
+
   it('a move back that skipped prepare keeps the app-data settings', async () => {
     const store = new WorkspaceStore()
     await store.save(ws([project()]))

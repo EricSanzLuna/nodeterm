@@ -257,6 +257,40 @@ async function readIn(
 }
 
 /**
+ * Copy the boards under `fromRoot`'s `.nodeterm/whiteboards/` into `toRoot`'s, replacing a file of the
+ * same name. Run when a folder project's canvas moves from app data back into its folder (issue
+ * #1145): the folder is read first afterwards, and its older file of a board edited in app data
+ * would hide the edit. Nothing is deleted on either side. A board is read with symlinks refused and
+ * the folder is bound by its real path, like every other board read and write, and the folder's
+ * whiteboards directory is made only once there is a board to put in it. One that cannot be read or
+ * written stays where it is. Never throws.
+ */
+export async function carryWhiteboards(fromRoot: string, toRoot: string): Promise<void> {
+  const from = await projectBoardsDir(fromRoot, false).catch(() => null)
+  if (!from) return
+  const ids = (await fs.readdir(from).catch((): string[] => []))
+    .filter((name) => name.endsWith('.excalidraw'))
+    .map((name) => name.slice(0, -'.excalidraw'.length))
+    .filter(safeId)
+  let to: string | null | undefined
+  for (const id of ids) {
+    const board = await readRegularFileBytesNoFollow(join(from, `${id}.excalidraw`), WHITEBOARD_SCENE_MAX_BYTES)
+    if (!board?.bytes) continue
+    const picture = await readRegularFileBytesNoFollow(join(from, `${id}.png`), WHITEBOARD_THUMB_MAX_BYTES)
+    if (to === undefined) to = await projectBoardsDir(toRoot, true).catch(() => null)
+    if (!to) return
+    try {
+      await writeBytesAtomic(join(to, `${id}.excalidraw`), board.bytes)
+      // A board with no picture is an empty one: the folder's old picture must not stand in for it.
+      if (picture?.bytes) await writeBytesAtomic(join(to, `${id}.png`), picture.bytes)
+      else await fs.rm(join(to, `${id}.png`), { force: true })
+    } catch {
+      // this board stays in app data, where a read still reaches it when the folder has none
+    }
+  }
+}
+
+/**
  * Read a board. `sourceId` is the board a duplicated or reopened node was copied from: until the
  * node saves its own file, it shows (and starts editing from) the source's — so a copy never
  * needed a file copy, and no board file is ever deleted out from under an undo or a reopen.

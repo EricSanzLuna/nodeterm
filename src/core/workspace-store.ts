@@ -23,7 +23,7 @@ import {
 } from './workspace-files'
 import { projectSettingsPath, readProjectSettingsFile, writeProjectSettingsFile } from './project-settings-files'
 import { gitTracksFile } from './git-tracked'
-import type { WhiteboardLocation } from './whiteboards'
+import { carryWhiteboards, type WhiteboardLocation } from './whiteboards'
 import type { PrepareFolderStorageResult, ProjectStorageKind, ReleaseFolderFilesResult } from '../shared/project-storage'
 import {
   parseProjectSettingsFile, sameProjectSettingsContent, sanitizeProjectLocalSettings,
@@ -1937,7 +1937,9 @@ export class WorkspaceStore {
    * folder already holds a project.json (the save would overwrite that canvas — the same
    * probe-before-bind rule as "Set folder…") or a settings.json (this project's own would be lost),
    * and an unreadable file is never taken for an absent one. Otherwise carry the project's
-   * app-data settings into the folder, so they are there the moment the canvas is.
+   * app-data settings into the folder, so they are there the moment the canvas is, and its
+   * whiteboards (`carryWhiteboards`), so a board edited in app data is not hidden by the folder's
+   * older copy once the folder is read first again.
    */
   /**
    * Where this store has a project's canvas, answered after any save in flight (queued on
@@ -1973,6 +1975,7 @@ export class WorkspaceStore {
           return { ok: false, reason: 'settings-unreadable' }
         }
       }
+      await carryWhiteboards(appDataProjectRoot(e.id), e.cwd)
     }
     return { ok: true }
   }
