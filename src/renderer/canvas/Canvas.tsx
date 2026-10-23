@@ -307,6 +307,12 @@ import { conductorPrompt } from '../lib/spawnTeamPrompt'
 import { NotifyConsentDialog } from '../components/NotifyConsentDialog'
 import { SessionsSidebar } from '../components/SessionsSidebar'
 import type { SessionNodeInput } from '../lib/sessionList'
+import {
+  needsYouQueue,
+  nextNeedingYou,
+  noAgentWaitingNotice,
+  waitingBeforeRestart
+} from '../lib/nextNeedingYou'
 import { liveProjectJumpTarget, projectJumpDigit } from '../lib/projectJump'
 import {
   liveZoomShortcutAction,
@@ -5663,7 +5669,10 @@ export function Canvas() {
             // The fresh session is now bound to the tab (openRelayTab rebound the SAME project id),
             // so it is finally safe to drop the stale offline session it replaced. Disposing only
             // AFTER a successful rebind is what keeps a FAILED reconnect reconnectable: if approval
-            // never lands, the offline session stays bound and the tab stays greyed-clickable.
+            // never lands, the stale session stays bound, so the next attempt still finds it
+            // (`boundSessionForProject` in reconnectRelay) and a hosted remount still finds the tabs
+            // it served (`projectIdsBoundToSession` in placeProjects). The tab stays greyed either
+            // way: an unbound remote tab resolves to the offline relay session.
             if (staleSessionId) {
               disposeSession(staleSessionId)
               if (hosted) useHostedTeams.getState().forget(staleSessionId)
@@ -10653,6 +10662,53 @@ export function Canvas() {
   }, [sessionsPinned, sessionsDismissed, explorerOpen, explorer.pinned, fitMaximizedToUsableArea])
 
   /**
+   * "Go to next agent needing you" (`node.nextNeedingYou`, ⌘K): one chord to a waiting agent in
+   * another project. The queue is built ON DEMAND from `getState()` reads — Canvas never
+   * subscribes to the status store's `byId` (every working/waiting flip would re-render the whole
+   * canvas; see StatusAwareMiniMap). The cycle
+   * cursor is memory only: a restart starts again at the oldest wait, which is the right answer.
+   * Travel is `travelToNodeRef` (declared above this point; the callback itself is defined much
+   * further down) so a closed-project hop keeps travelToNode's hosted-team reopen guard.
+   */
+  const needsYouCursorRef = useRef<string | null>(null)
+  const needsYouInputs = useCallback(() => {
+    const { projects, activeProjectId: active } = useProjects.getState()
+    // The live canvas only when it is the ACTIVE project's (the epoch pair): mid-switch nodesRef
+    // still holds the outgoing project's nodes. Live adds a just-created node the store has not
+    // committed yet; without it the persisted nodes are used, exactly as the closed sidebar does.
+    const live: SessionNodeInput[] | null =
+      nodesProjectIdRef.current === active
+        ? nodesRef.current
+            .filter((n) => (n.type ?? 'terminal') === 'terminal')
+            .map((n) => ({
+              id: n.id,
+              kind: 'terminal' as const,
+              title: n.data.title ?? n.id,
+              color: n.data.color ?? '#888'
+            }))
+        : null
+    return [projects, live, active, useAgentStatus.getState().byId] as const
+  }, [nodesRef, nodesProjectIdRef])
+  const needsYouQueueNow = useCallback((): string[] => needsYouQueue(...needsYouInputs()), [needsYouInputs])
+  const goToNextNeedingYou = useCallback((): void => {
+    const target = nextNeedingYou(
+      needsYouQueueNow(),
+      needsYouCursorRef.current,
+      useAgentStatus.getState().activeId
+    )
+    if (!target) {
+      // Claimed even when empty: from a focused terminal xterm has already withheld the chord
+      // (terminalChordBubbles), so declining would not hand it back — it would only make a chord
+      // the user bound on purpose do nothing, silently. After a restart an agent already at its
+      // prompt sends no new hook, so the notice says how many were waiting before it.
+      setNotice({ kind: 'info', text: noAgentWaitingNotice(waitingBeforeRestart(...needsYouInputs())) })
+      return
+    }
+    needsYouCursorRef.current = target
+    travelToNodeRef.current(target)
+  }, [needsYouQueueNow, needsYouInputs])
+
+  /**
    * Zone snap (issue #394 v1): place `nodeId` (or the placement target, for the keyboard chords)
    * into a zone of the visible canvas. Same declines as maximize; no toggle state — the node has
    * simply been moved, exactly as if by hand (see `placeNodeInRect`).
@@ -10771,6 +10827,7 @@ export function Canvas() {
       'node.focusRight': () => moveNodeFocus('right'),
       'node.focusUp': () => moveNodeFocus('up'),
       'node.focusDown': () => moveNodeFocus('down'),
+      'node.nextNeedingYou': () => { goToNextNeedingYou(); return true },
       'node.maximize': toggleMaximizeCommand,
       // Every zone, halves through quarters, from the one table (issue #1169).
       ...Object.fromEntries(
@@ -19161,6 +19218,22 @@ export function Canvas() {
         icon: <IconFit />,
         run: toggleFocusMode
       },
+      // The ⌘K twin of `node.nextNeedingYou` (same function, so they share the cycle cursor).
+      // Hidden when nothing waits, like Tidy canvas below: it could only report "no agent".
+      ...((): Command[] => {
+        const waiting = needsYouQueueNow().length
+        return waiting > 0
+          ? [
+              {
+                id: 'next-needing-you',
+                label: 'Go to next agent needing you',
+                hint: `${waiting} waiting · attention blocked permission`,
+                icon: <IconJump />,
+                run: goToNextNeedingYou
+              }
+            ]
+          : []
+      })(),
       { id: 'fit', label: 'Fit view', icon: <IconFit />, run: fitAll },
       // Hidden below 2 top-level nodes — see arrangeAllNodes.
       ...(hasArrangeableNodes()
@@ -19392,6 +19465,8 @@ export function Canvas() {
     saveCanvasLayout,
     restoreCanvasLayout,
     toggleFocusMode,
+    needsYouQueueNow,
+    goToNextNeedingYou,
     hostedBookmarks,
     copyHostedInviteCode,
     forgetHostedTeam,

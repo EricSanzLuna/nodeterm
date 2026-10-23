@@ -652,6 +652,13 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   SSH node became a local shell in this machine's `$HOME`. CLAUDE.md, "A remote node is NEVER
   spawned locally".
 
+- **Relay backpressure is undone by a drain sweep, never by the next chunk of output.** A paused
+  pty produces no next chunk, so a resume that waits for one never comes: that froze the phone's
+  terminal for good after a single >8 MB burst. `host-service.ts` arms a 250 ms sweep while a stream
+  is paused, then repaints with a snapshot before it resumes — the same drain-sweep pattern as
+  `core/ui-sink-registry.ts` (whose self-paced sinks never drop). A new paused path needs the same
+  trigger. CLAUDE.md, "Remote access".
+
 - **An SSH project's node runs on the project's host — ask the project, not the node.** Node
   fields like `sshRemoteTmux` arrive through a shared `project.json` that the host's own desktop and
   teammates also write, so a node without them must still never become a local shell (issue #1186).
@@ -1024,6 +1031,13 @@ shipped: managed-account `CLAUDE_CONFIG_DIR` leaked into system-account sessions
 env either joins `ACCOUNT_SCOPE_UPDATE_ENV` / the gateway list, or rides `-e` — and gets a
 real-tmux test (`account-env.realtmux.test.ts` is the pattern).
 
+**A synchronous tmux call on main always has a timeout.** Use `PtyManager.runTmuxSync` (2 s,
+`TMUX_BOOT_CMD_TIMEOUT_MS`), never a bare `execFileSync` on the tmux socket: one runs before the
+first window exists, and a wedged server held an unbounded call for as long as it stayed wedged
+(4.05 s in a repro). Warn on a timeout and fail open; keep "no server yet" silent.
+A call that runs on every spawn also needs a cooldown after a timeout
+(`TMUX_UPDATE_ENV_COOLDOWN_MS`), or each spawn waits out the same wedge again.
+
 **The same goes for the CWD: a tmux client never runs in the node's directory.** The server keeps
 the cwd of the client that started it, and from tmux 3.7 a new pane's `-c` is silently dropped once
 that directory is deleted — every new terminal then opens in the deleted dir (issue #1131, measured
@@ -1047,6 +1061,10 @@ make it show up; a command with no effective binding is omitted rather than list
 `ShortcutsPanel.test.tsx` is the watchdog and reds if a command fails to surface. The panel it
 replaced hand-listed 24 ids against a 45-command registry and had drifted four live chords behind
 — if you find yourself typing a command id into that file, that is the bug reappearing.
+
+**`keybindings-handler-parity.test.ts` checks only the ids in its `checkedIds`.** Add a new
+ships-unbound command there, or nothing catches a missing `'<id>':` handler entry in Canvas.tsx
+(the handlers map is `Partial`).
 
 **Comments explain WHY, and name the failure they prevent.** The codebase is deliberately dense with
 reasoning. A comment that restates the code is noise; one that says "do not simplify this back,
@@ -1098,6 +1116,13 @@ to kill the process. The stack it carries was captured at the write, so the cras
 happened synchronously at your `console.log`, and wrapping that call in `try/catch` changes nothing
 (measured on node 22). If you write to a stream that can go away, attach an `'error'` listener and
 latch the writer off — `installLogSink` (`src/core/log-sink.ts`) is the worked example. Issue #382.
+
+**A dead or hung process is logged, never acted on.** `child-process-gone`, window
+`unresponsive`/`responsive` and external WebGL context losses each write one tagged line to the
+debug log ring (`main/process-health-log.ts`, `[webgl]` in `terminal/webgl-budget.ts`) and nothing
+else. Chromium respawns its own GPU process; a reload or relaunch on top of that turns a GPU reset
+into a lost session. If you add a loss path, report it through `handle.contextLost(kind)` so the
+external counts stay apart from our own `loseWebglContexts` releases.
 
 **A retry budget must measure the thing it is waiting for, and running out must be VISIBLE.** The
 armed-launch loop (canvas-control `--after`, and the cold open a `--project` node gets) delivered its
@@ -1431,6 +1456,24 @@ bite most often:
 - `handleNodesChange` must not call `onNodesChange` with an empty batch (it re-renders the canvas
   every frame through React Flow's ResizeObserver).
 - Work done per terminal on a project switch must be coalesced and on-screen-first.
+- macOS memory pressure comes from the kernel's level (`onKernelPressure` in
+  `core/memory-pressure.ts`), fired on escalations only, and at the same severity at most once per
+  `KERNEL_LEVER_GAP_MS` (a level flapping normal/warn re-arms it every fall). Never re-fire it on a
+  held level, and never route it through `hostMemReader`/`MemInfo`: the session reaper shares that reader.
+- A terminal under the kanban board must not draw. CSS can't stop xterm; its render pause is
+  `terminal/board-render-pause.ts`. Every "is the board up" check includes the Omni board
+  (`isGlobalKanbanOpen()`), and the board never feeds the visibility verdict that drives
+  hibernation and the WebGL budget.
+- Search big in-memory text with one escaped `RegExp(q, 'iu')` per query, never `toLowerCase()`
+  per entry (transcript index: 20-52 ms + 7-15 MB garbage → 2-13 ms + 0 MB per search).
+- Dispose every Monaco model your node creates when it unmounts. The TS/JS worker (a whole
+  compiler isolate) is only stopped once no TS/JS model is left (`renderer/editor/tsWorkerReaper.ts`).
+
+**`ssh2` and `electron-updater` load on first use, never at main's module scope**, which runs
+before Chromium's `ready` (together ~50–70 ms warm on every launch). Use `import
+type` for their types; values come from `ssh2()` in `native-mux.ts` and `initUpdater`'s
+`loadUpdater`. `src/main/lazy-deps.source.test.ts` goes red on a value import. A `require()` is
+not reached by `vi.mock`, so a test injects its double (see the updater tests).
 
 **SSH projects on Windows** run over an in-process transport (`src/core/remote-ssh/native/`),
 not the ssh binary. If you add an ssh call site, route it through `useNativeSsh()` like the
@@ -1445,6 +1488,10 @@ there, and esbuild fails on a `.node` require it cannot resolve (or, where the a
 on a file it has no loader for). No CI job builds the server bundle, but
 `src/server/server-build.test.ts` builds it in both views and goes red. The server runs from a
 `node_modules` tree, so an external is resolved at runtime.
+
+**Never fill `swapTotalMb`/`swapFreeMb` on darwin.** The reaper's swap term reads them, and a Mac
+can keep most of its swap in use for hours, so it would fire all day; the RAM pill's swap figure
+lives in `MemInfo.display`, which nothing else reads. CLAUDE.md, Session memory.
 
 ## Testing
 
@@ -1563,8 +1610,10 @@ the step is at the FIRST animation, not the twentieth. Two consequences when you
 `animation-play-state: var(--nt-anim-state);` right after the shorthand so it joins the idle-window
 gate (`src/renderer/styles.animation-gate.test.ts` fails if you forget, because one ungated
 animation takes the whole win back), and prefer a static state to a pulse wherever the pulse is not
-carrying information the user needs at a glance. The full measurement table and the reasoning are
-in CLAUDE.md § Idle energy.
+carrying information the user needs at a glance. A dependency's stylesheet counts too: React Flow's
+`dashdraw` on animated edges is gated by a rule in `styles.css` that repeats xyflow's selectors, and
+the same test scans `@xyflow/react/dist/style.css` so an upgrade that adds an infinite animation
+fails there. The full measurement table and the reasoning are in CLAUDE.md § Idle energy.
 
 ## Pull requests
 
