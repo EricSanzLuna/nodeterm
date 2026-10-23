@@ -32,4 +32,13 @@ describe('PTY refusal presentation', () => {
         "a session with this terminal's id is already running somewhere other than its host, so it was not joined — nothing was started"
     })
   })
+  // A relay guest's create for a node it added found a session already running under that name. The
+  // project is healthy: read as `connectionLost` the node would show "not connected" and retry into
+  // the same refusal.
+  it('a new-only refusal is not a lost connection, and says nothing was joined or started', () => {
+    expect(ptyRefusal('new-only')).toEqual({
+      connectionLost: false,
+      message: "a session with this terminal's id already exists on the host, so it was not joined — nothing was started"
+    })
+  })
 })

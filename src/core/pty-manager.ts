@@ -121,6 +121,8 @@ import {
   TMUX_SOCKET,
   sessionName,
   isSessionName,
+  exactPaneTarget,
+  exactSessionTarget,
   localPasteDelivery,
   localTmuxEnterArgs,
   pasteBufferName,
@@ -2588,6 +2590,12 @@ export class PtyManager {
         pendingRecycle.waiters.push({ clientId, options, resolve, reject })
       })
     }
+    // A NEW-ONLY create (a relay guest's node it introduced, `PtyCreateOptions.newOnly`) may only
+    // spawn: a spawn already in flight for this name, or a session this process already holds for it
+    // (the co-attach `join` below, a plain shell that carries the id as `nodeId`), is somebody's
+    // terminal, and joining it is exactly what this option exists to refuse.
+    if (options.newOnly && (this.inflight.get(key) || this.liveSessionForNode(key)))
+      return { sessionId: '', fresh: false, unavailable: 'new-only' }
     // Same-tick race: spawnNew() awaits a `tmux has-session` SUBPROCESS (tens of ms, not a
     // microtask) before spawnSession registers the session in `byPersistKey`, so two clients
     // opening the same node in that window would BOTH miss the index and both spawn — and the
@@ -2886,7 +2894,7 @@ export class PtyManager {
     // the create on to `new-session -A`, which CREATES the session if it was really gone, and the
     // owner's next open then reads `fresh:false` and skips its cold restore.
     const joinOnlyLocalVerdict =
-      options.joinOnly && !options.sshRemote && !warmWindowsBackend && tmuxBacked
+      (options.joinOnly || options.newOnly) && !options.sshRemote && !warmWindowsBackend && tmuxBacked
         ? await this.strictTmuxVerdict(options.persistKey as string)
         : undefined
     // The same strict question for a node whose terminals live in the SESSION HOST (Windows, or no
@@ -2952,6 +2960,24 @@ export class PtyManager {
         zellijChoice?.state === 'unknown'
     if (options.joinOnly && joinRefused)
       return { sessionId: '', fresh: false, unavailable: 'join-only' }
+    // A NEW-ONLY create spawns only where nothing runs under this name: a session we positively saw
+    // ABSENT (the strict local probe, the remote listing, Zellij's own answer). A live session, and a
+    // probe that could not answer, are both refused — never `new-session -A`, which would attach to
+    // (and `-D` detach the other clients of) whatever holds the name. The session host's own
+    // attach-or-create IS its probe, so it is asked first, strictly, and re-checked after `ready`.
+    if (options.newOnly) {
+      const newRefused = options.sshRemote
+        ? remoteVerdict !== 'absent'
+        : zellijChoice?.use
+          ? !zellijChoice.fresh
+          : zellijChoice?.state === 'unknown' ||
+            (tmuxBacked && joinOnlyLocalVerdict !== 'absent') ||
+            (!tmuxBacked &&
+              !!options.persistKey &&
+              this.hostBackendEligible() &&
+              (await sessionHostHasSession(sessionName(options.persistKey)).catch(() => true)))
+      if (newRefused) return { sessionId: '', fresh: false, unavailable: 'new-only' }
+    }
     // A watcher's own client is a read-only TMUX client (`attach-session -E -f ignore-size,read-only`),
     // and a Zellij session has no such client to spawn: refused, never a Zellij attach (which would be
     // a full, typing client). A watcher still co-attaches to a Zellij session this process holds (the
@@ -3121,6 +3147,13 @@ export class PtyManager {
     // (`persisted` in spawnSession) — i.e. exactly "this session survives losing its client",
     // which is what the renderer's cache-dispose levers must not assume. See PtyCreateResult.
     const persistent = !!spawned?.persistKey
+    // A NEW-ONLY create that turned out to land on an existing session (the session host answers
+    // `fresh` only from its own attach, and a name can appear between our probe and the spawn): drop
+    // this client's view of it — the session itself keeps running untouched — and refuse.
+    if (options.newOnly && !fresh) {
+      this.kill(clientId, sessionId, options.viewerId)
+      return { sessionId: '', fresh: false, unavailable: 'new-only' }
+    }
     // Stale-cwd probe (issue #464), WARM local-tmux reattach only: `new-session -A` reattached a
     // session whose shell may sit on a DELETED directory inode (a re-created same-named folder is
     // a different inode, so the getcwd errors never self-heal). A fresh spawn already validated
@@ -3643,7 +3676,10 @@ export class PtyManager {
   private async tmuxSessionExists(persistKey: string): Promise<boolean> {
     if (!this.tmuxPath) return false
     try {
-      await runAsync(this.tmuxPath, ['-L', TMUX_SOCKET, 'has-session', '-t', sessionName(persistKey)], {
+      // Exact (`=name`): a bare target prefix-matches a LONGER live session when this one is gone,
+      // which read as "warm" and skipped this node's cold restore (and, for a relay peer's prefix
+      // id, admitted a session it does not own). See `exactSessionTarget`.
+      await runAsync(this.tmuxPath, ['-L', TMUX_SOCKET, 'has-session', '-t', exactSessionTarget(sessionName(persistKey))], {
         timeout: PROBE_TIMEOUT_MS
       })
       return true
@@ -3658,8 +3694,7 @@ export class PtyManager {
   /**
    * Is the tmux session for `persistKey` running, by the EXACT target (`=nt-<id>`)? Public for
    * `team resume`, which must never start a second agent on a conversation whose session exists.
-   * `sessionExists` cannot answer this: its tmux leg prefix-matches, and it folds "could not tell"
-   * into "exists". No tmux at all answers 'absent' (nothing can be running there).
+   * `sessionExists` cannot answer this: it folds "could not tell" into "exists". No tmux at all answers 'absent' (nothing can be running there).
    */
   sessionVerdict(persistKey: string): Promise<'present' | 'absent' | 'unknown'> {
     return this.strictTmuxVerdict(persistKey)
@@ -3681,7 +3716,7 @@ export class PtyManager {
     try {
       await this.confirmedProcessRun(
         this.tmuxPath,
-        ['-L', TMUX_SOCKET, 'has-session', '-t', `=${sessionName(persistKey)}`],
+        ['-L', TMUX_SOCKET, 'has-session', '-t', exactSessionTarget(sessionName(persistKey))],
         { timeout: PROBE_TIMEOUT_MS }
       )
       return 'present'
@@ -3699,7 +3734,7 @@ export class PtyManager {
     try {
       await this.confirmedProcessRun(
         this.tmuxPath,
-        ['-L', TMUX_SOCKET, 'has-session', '-t', sessionName(persistKey)],
+        ['-L', TMUX_SOCKET, 'has-session', '-t', exactSessionTarget(sessionName(persistKey))],
         { timeout: PROBE_TIMEOUT_MS }
       )
       return true
@@ -4105,7 +4140,7 @@ export class PtyManager {
               if (!(await sessionHostWriteDetached(target, rawKeyBytes(key)))) return false
             }
           } else {
-            await runAsync(this.tmuxPath, ['-L', TMUX_SOCKET, 'send-keys', '-t', target, ...tmuxKeyArgs(key)])
+            await runAsync(this.tmuxPath, ['-L', TMUX_SOCKET, 'send-keys', '-t', exactPaneTarget(target), ...tmuxKeyArgs(key)])
           }
         } catch {
           return false
@@ -4147,7 +4182,7 @@ export class PtyManager {
     try {
       const { stdout } = await runAsync(
         this.tmuxPath,
-        ['-L', TMUX_SOCKET, 'capture-pane', '-p', '-e', '-t', sessionName(persistKey)],
+        ['-L', TMUX_SOCKET, 'capture-pane', '-p', '-e', '-t', exactPaneTarget(sessionName(persistKey))],
         { encoding: 'utf-8', maxBuffer: 50 * 1024 * 1024 }
       )
       return stdout
@@ -4812,7 +4847,9 @@ export class PtyManager {
           // `-d` detaches other clients, so it follows `tmuxAttachFlags`' mirror rule.
           ...(sinks || options.joinOnly ? [] : ['-d']),
           '-t',
-          sessionName(options.persistKey)
+          // Exact: an attach-only reattach must reach THIS node's proven session, never a longer
+          // one its name prefixes (`exactSessionTarget`).
+          exactSessionTarget(sessionName(options.persistKey))
         ]
       } else if (isWatcherCreate(options)) {
         // A live link watcher's own client: attach-only, `-E`, `ignore-size,read-only`, exact target
@@ -5769,7 +5806,7 @@ export class PtyManager {
     try {
       const { stdout } = await runAsync(
         this.tmuxPath,
-        ['-L', TMUX_SOCKET, 'capture-pane', '-p', '-t', sessionName(persistKey), '-S', full ? '-' : '-200'],
+        ['-L', TMUX_SOCKET, 'capture-pane', '-p', '-t', exactPaneTarget(sessionName(persistKey)), '-S', full ? '-' : '-200'],
         { encoding: 'utf-8', maxBuffer: 50 * 1024 * 1024 }
       )
       return stdout
@@ -6290,7 +6327,7 @@ export class PtyManager {
         'display-message',
         '-p',
         '-t',
-        target,
+        exactPaneTarget(target),
         '#{cursor_x} #{cursor_y} #{cursor_flag}'
       ])
       return parsePaneCursor(stdout)
@@ -6367,7 +6404,7 @@ export class PtyManager {
     try {
       const { stdout } = await runAsync(
         this.tmuxPath,
-        ['-L', TMUX_SOCKET, 'capture-pane', '-p', '-e', '-t', sessionName(persistKey), '-S', '-1500'],
+        ['-L', TMUX_SOCKET, 'capture-pane', '-p', '-e', '-t', exactPaneTarget(sessionName(persistKey)), '-S', '-1500'],
         { encoding: 'utf-8', maxBuffer: 50 * 1024 * 1024 }
       )
       return stdout ? await this.writeScrollbackIfChanged(persistKey, stdout) : true
@@ -6790,7 +6827,7 @@ export class PtyManager {
         'display-message',
         '-p',
         '-t',
-        target,
+        exactPaneTarget(target),
         '#{pane_current_command}'
       ])
       return stdout.trim() || null
@@ -6841,7 +6878,7 @@ export class PtyManager {
         'display-message',
         '-p',
         '-t',
-        target,
+        exactPaneTarget(target),
         '#{pane_current_path}'
       ])
       return stdout.trim() || null
@@ -6981,7 +7018,7 @@ export class PtyManager {
         'display-message',
         '-p',
         '-t',
-        target,
+        exactPaneTarget(target),
         '#{pane_pid}|#{pane_current_command}'
       ])
       const pane = parsePaneProcess(stdout)
@@ -7093,7 +7130,7 @@ export class PtyManager {
         'display-message',
         '-p',
         '-t',
-        target,
+        exactPaneTarget(target),
         PANE_OWNER_FMT
       ])
       const identity = parsePaneOwner(first.stdout)

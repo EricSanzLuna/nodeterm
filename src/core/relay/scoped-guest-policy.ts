@@ -72,6 +72,7 @@ const PATH_OUTSIDE = 'Only files inside the shared project folder are reachable.
 const NO_ROOT = 'This shared project has no folder on the host.'
 const HOST_DATA = "The host app's own data folder is not reachable."
 const NOT_SCOPED = 'That is not available in a shared-project session.'
+const TOO_MANY_NEW = 'Too many new nodes in this session. Reconnect to add more.'
 
 const defaultRealpath = (p: string): string | null => {
   try {
@@ -89,23 +90,71 @@ const defaultLexists = (p: string): boolean => {
   }
 }
 
+/**
+ * A node id THIS guest introduced over `canvas:mut` while no project held it (the host renderer saves
+ * on a debounce, so a brand-new terminal's first `pty:create` routinely arrives before the node is
+ * on disk).
+ *  - `pending`: introduced, but its terminal is not proven to be the guest's own. It reaches
+ *    `canvas:mut` and a `pty:create` that may only SPAWN (`newOnly`) — never a node-keyed pty verb,
+ *    never the outbound stream, and that holds even after the host has saved the node into the
+ *    shared project: being on the canvas is the guest's own doing, not evidence of ownership.
+ *  - `created`: this session's own `pty:create` for it spawned a FRESH session (the response said
+ *    so: `fresh: true`, see `noteCreate`). From then on it is a node of the shared project.
+ *
+ * Why pending is not enough (security audit F1, 2026-10): `canvas:mut` is a cast, admitted before
+ * the reflector validates anything, so ANY id no project holds could be recorded — a PREFIX of
+ * another project's node id (tmux then prefix-matched the longer, live session on every bare
+ * `-t`), an orphan session's exact id, or an id an unreadable project's file holds. For an SSH
+ * project's guest, whose own terminals never run locally, that reached the host's LOCAL sessions.
+ * Exact tmux targets (tmux-naming.ts `exactPaneTarget`) close the prefix half; this closes the
+ * "claim a live session by naming it" half: a pending id unlocks only a spawn of its own.
+ */
+type Introduced = 'pending' | 'created'
+
+/** How many ids one session may introduce. A memory bound, not a security one (a pending id grants
+ *  nothing but its own spawn); past it, new ids are refused until the guest reconnects. */
+export const INTRODUCED_MAX = 256
+
 /** Everything a check needs about ONE session, built once per session. */
 interface Scope {
   projectId: string
   deps: Required<Pick<ScopedGuestDeps, 'realpath' | 'lexists'>> & ScopedGuestDeps
-  /** Node ids this guest introduced into the shared project over `canvas:mut` that no persisted
-   *  canvas holds yet (the host renderer saves on a debounce, so a brand-new terminal's first
-   *  `pty:create` routinely arrives before the node is on disk). Only ids NO project holds are
-   *  recorded, so this can never adopt another project's node. */
-  newNodes: Set<string>
+  /** See `Introduced`. Bounded at INTRODUCED_MAX; insertion order = age. */
+  introduced: Map<string, Introduced>
 }
 
-/** Every project holding `id`, with this session's own fresh nodes counted as the shared project's. */
+const NO_PROJECTS: readonly string[] = Object.freeze([])
+
+/**
+ * Every project holding `id` as far as THIS session may act on it. A pending id holds nothing (see
+ * `Introduced`) whatever the persisted canvases say; a created one counts as the shared project's
+ * until a save puts it on disk.
+ */
 function projectsOf(id: string, s: Scope): readonly string[] {
+  const mine = s.introduced.get(id)
+  if (mine === 'pending') return NO_PROJECTS
   const held = s.deps.projectsOfNode(id)
   if (held.length > 0) return held
-  return s.newNodes.has(id) ? [s.projectId] : held
+  return mine === 'created' ? [s.projectId] : held
 }
+
+/** A pending id this guest may still spawn its own terminal for: introduced here, and no OTHER
+ *  project has taken the id since (a git pull can put it in one). */
+function pendingHere(id: unknown, s: Scope): id is string {
+  return (
+    typeof id === 'string' &&
+    s.introduced.get(id) === 'pending' &&
+    s.deps.projectsOfNode(id).every((p) => p === s.projectId)
+  )
+}
+
+/**
+ * The alphabet a guest-introduced node id may use: the ids the app itself mints (`nextId`,
+ * `uuid()`), never a character `sessionName` rewrites. `nt-` + id is then the session name with no
+ * substitution, so two different ids cannot name one tmux session (`a.b` and `a_b` both map to
+ * `nt-a_b`). Ids that already exist in a project are not judged by it.
+ */
+const INTRODUCIBLE_ID = /^[A-Za-z0-9-]{1,128}$/
 
 /** A node is in scope only when EVERY project holding its id is the shared one: node ids travel in
  *  git-shared project files, so an id copied into another project must not ride this session. */
@@ -254,7 +303,12 @@ const ptyCreate: Check = (a, s) => {
   const o = a[0]
   if (!o || typeof o !== 'object' || Array.isArray(o)) return no(NODE_OUTSIDE)
   const opts = { ...(o as Record<string, unknown>) }
-  if (!nodeInScope(opts.persistKey, s)) return no(NODE_OUTSIDE)
+  // A node this guest introduced and has not yet proven: the create may only SPAWN a fresh session
+  // (`newOnly`: core refuses a join, a reattach and any session that already exists under that
+  // name). Its response, read in `noteCreate`, is what promotes the id to `created`.
+  const pending = pendingHere(opts.persistKey, s)
+  if (!pending && !nodeInScope(opts.persistKey, s)) return no(NODE_OUTSIDE)
+  if (pending) opts.newOnly = true
   if (opts.ownerProjectId !== undefined && opts.ownerProjectId !== s.projectId) return no(OUTSIDE)
   delete opts.sshRemote
   // The local-login exemption from the SSH-project refusal is this machine's own UI's mark, never
@@ -286,8 +340,12 @@ const canvasMut: Check = (a, s) => {
   const id = mut.op === 'remove' ? mut.id : mut.node?.id
   if (typeof id !== 'string' || !id) return no(OUTSIDE)
   if (nodeInScope(id, s)) return OK
-  if (mut.op === 'upsert' && s.deps.projectsOfNode(id).length === 0) {
-    s.newNodes.add(id)
+  // Its own new node, still pending: moving or removing it is a canvas edit like any other.
+  if (pendingHere(id, s)) return OK
+  if (mut.op === 'upsert' && s.deps.projectsOfNode(id).length === 0 && !s.introduced.has(id)) {
+    if (!INTRODUCIBLE_ID.test(id)) return no(NODE_OUTSIDE)
+    if (s.introduced.size >= INTRODUCED_MAX) return no(TOO_MANY_NEW)
+    s.introduced.set(id, 'pending')
     return OK
   }
   return no(NODE_OUTSIDE)
@@ -525,8 +583,23 @@ function makeScope(projectId: string, deps: ScopedGuestDeps): Scope {
   return {
     projectId,
     deps: { ...deps, realpath: deps.realpath ?? defaultRealpath, lexists: deps.lexists ?? defaultLexists },
-    newNodes: new Set()
+    introduced: new Map()
   }
+}
+
+/**
+ * A `pty:create` this session asked for came back. Promote its node from pending to created only on
+ * the core's own word that it SPAWNED the session: `fresh: true`, no `unavailable`, no
+ * `freshUnverified`, and a session id the pty manager maps to that node. Anything else (a refusal,
+ * a join, a guess) leaves it pending. Exported for the test.
+ */
+export function noteCreate(result: unknown, s: Scope): void {
+  if (result === null || typeof result !== 'object') return
+  const r = result as { sessionId?: unknown; fresh?: unknown; unavailable?: unknown; freshUnverified?: unknown }
+  if (r.fresh !== true || r.unavailable !== undefined || r.freshUnverified === true) return
+  if (typeof r.sessionId !== 'string' || !r.sessionId) return
+  const node = s.deps.nodeOfSession(r.sessionId)
+  if (node !== undefined && pendingHere(node, s)) s.introduced.set(node, 'created')
 }
 
 function decideWith(method: string, args: unknown[], s: Scope): AccessDecision {
@@ -617,7 +690,10 @@ export function scopedGuestHooks(projectId: string, deps: ScopedGuestDeps): Rela
         bufferedAmount: () => sink.bufferedAmount?.() ?? 0
       }
     },
-    narrowResponse: (_session, method, result) => narrowResponseForRole(method, result, viewCtx(s))
+    narrowResponse: (_session, method, result) => {
+      if (method === IPC.ptyCreate) noteCreate(result, s)
+      return narrowResponseForRole(method, result, viewCtx(s))
+    }
   }
 }
 
