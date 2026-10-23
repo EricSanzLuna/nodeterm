@@ -6828,7 +6828,17 @@ one is Pro and the backend is the gate. Reference: **`docs/live-links.md`**. Inv
 - The Control password is a scrypt hash only (no plaintext kept or logged anywhere; every scrypt run in
   one FIFO gate of 2; `timingSafeEqual`). Host throttles: 1 attempt per 2 s per viewer, 3 wrong end the
   connection, 10 wrong across the link lock it (lock AND count persisted in the record, so a restart
-  resets neither; only Allow control again clears the lock; it and a new password reset the count).
+  resets neither; it and a new password reset the count). The lock LIFTS BY ITSELF (L2: any link
+  holder could otherwise lock control for everyone for good): 15 min for the first since the owner last
+  allowed control, doubling per lock, capped at 24 h; `lockedUntil` and `lockStep` are persisted (a
+  restart neither lifts it early nor makes it permanent; a lapsed one is lifted at launch BEFORE the host
+  is built; a lock written without `lockedUntil` still waits for the owner). Allow control again lifts
+  it at once and resets the count AND the backoff. Viewers are told `lockedForMs`; the owner's notice
+  names who tipped it (a claim). The unlock is SEALED to a per-connection X25519 key pair offered in that
+  connection's meta (`unlockKey`, `shared/watch-link/unlock-seal.ts`, L3), because every link holder can
+  derive the tunnel's keys; the client seals by itself and never sends the password in the clear on a
+  connection that offered a key; a plain unlock (an older page) is still accepted, except on a
+  connection that already sealed one. Typed input is NOT sealed (residual, docs).
   Owner changes go by direction: narrowing (typing off, a new password) applies at once and is NEVER
   undone by a failed or hung write — the brake must not fail open; the owner is told `'unsaved'` (holds
   until a restart unless a later write lands; Stop ends it for good) — widening (typing on, allow again)
@@ -6863,7 +6873,12 @@ one is Pro and the backend is the gate. Reference: **`docs/live-links.md`**. Inv
   `unsupported` until it has a license layer (`src/main/watch-link-wiring.test.ts`).
 - `src/shared/watch-link/` is vendored byte for byte into nodeterm-web: siblings and `tweetnacl` only,
   no Node API, type imports spelled `import type` (`isomorphism.guard.test.ts`); a change there owes the
-  web repo a re-vendor. Chat text is stripped of controls AND bidi controls there, capped by code point.
+  web repo a re-vendor. Chat text is stripped of controls AND bidi controls there, capped by code point;
+  a NAME also loses every format character (`\p{Cf}`) and the blank letters, so look-alike names are
+  equal (L4); chat TEXT keeps only ZWJ and ZWNJ of the format characters (emoji, Persian/Indic).
+- The viewer page strips the secret fragment from the address bar after reading it (L1): kept in the
+  tab's `sessionStorage` (`nodeterm.watchLink.<linkId>`) for a reload, a Copy link button rebuilds it;
+  where storage cannot be written the fragment stays. A full link's status poll is 60 s (L6).
 - Never silent about what a viewer gets. The session host's read-only client is a negotiated
   `watch-attach` attachment (no claim, no pause ticket, host refuses its writes, never spawns, never
   indexed as the node's session; an older host means refused, never an ordinary attach). Where local
