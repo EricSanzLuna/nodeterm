@@ -356,6 +356,7 @@ import { applyIconChoice } from '../lib/nodeIconChoice'
 import { normalizeNodeIcon } from '@shared/node-icon'
 import { connectHostAttachment } from '../lib/sshAttachments'
 import { projectMayDialSsh } from '../session/relay-ssh'
+import { spawnBelongsElsewhere, useOwningProjectId } from '../session/owning-project'
 import { waitForSshRemote } from '../lib/sshRemoteWait'
 
 /** Which physical modifier the registry's abstract `Cmd` resolves to for the find-bar chord. */
@@ -1314,6 +1315,11 @@ export function TerminalNode({
   // namespaces (pty, fs) go through it; app-global ones (clipboard, shell) stay on the global.
   const session = useSession()
   const { api } = session
+  // The project whose nodes this node's subtree renders (Canvas: the project React Flow's store
+  // holds). Read by the create path in the once-mounted lifecycle effect, so a ref.
+  const owningProject = useOwningProjectId()
+  const owningProjectRef = useRef(owningProject)
+  owningProjectRef.current = owningProject
   // A hosted team tab whose role is below Editor (false everywhere else): no "Restart in folder" —
   // it recycles the session, which the host refuses for them.
   const hostedReadOnly = useHostedReadOnly(session.id)
@@ -1334,10 +1340,14 @@ export function TerminalNode({
       live = false
     }
   }, [api])
-  // The ACTIVE session's presence — where our focus/blur casts go. This node renders under Canvas's
-  // active-session provider, so a relay tab reports focus over the relay core and a local tab hits
-  // `defaultPresence` (byte-identical to before). Stable for the node's lifetime (a tab switch
-  // unmounts the node), so capturing it in the once-mounted lifecycle effect below is safe, like `api`.
+  // The ACTIVE project's presence — where our focus/blur casts go. It follows the active project,
+  // not this node's provider: Canvas keys the node subtree's SessionProvider on the project React
+  // Flow's STORE holds (`useFlowStoreOwner`), which flips one commit after the active id. A node
+  // mounts once the store holds its project, and by then that project is the active one, so the
+  // value captured by the once-mounted lifecycle effect below is the presence of the core this node
+  // runs on: a relay tab reports focus over the relay core, a local tab hits `defaultPresence`
+  // (byte-identical to before). Render-time reads may briefly see the incoming project's presence
+  // while an outgoing node waits to unmount.
   const presence = useActiveSessionPresence()
   /**
    * THIS node's agent-status store, for the memory levers that must not kill live work — resolved
@@ -3570,6 +3580,16 @@ export function TerminalNode({
       // happily start a brand-new tmux session — resurrecting a terminal its owner deliberately
       // killed, or reviving this node in our STALE cwd. The overlay explains the state instead.
       if (noSpawn) return
+      // A node of a REMOTE project (a relay / hosted team tab) under a session that is not a relay
+      // session — this desktop's own core — would create the host's node id HERE. Canvas keys the
+      // subtree on the project React Flow's store holds, and an unbound remote tab resolves to the
+      // offline relay session, so this is the last line: start nothing, before any SSH resolve.
+      if (spawnBelongsElsewhere(useProjects.getState().getProject(owningProjectRef.current ?? ''), session.source)) {
+        term.write(
+          '\r\n\x1b[90m[this terminal belongs to a remote project that is not connected here — nothing was started on this machine]\x1b[0m\r\n'
+        )
+        return
+      }
       // SSH-project terminal: the project's live ControlMaster controlPath is established by
       // Canvas's active-project effect. On a cold app load child effects run before that parent
       // connect, so wait for it (briefly) before spawning. In Phase 1 a node only exists in the
@@ -3630,10 +3650,11 @@ export function TerminalNode({
           persistKey: id,
           // The project that OWNS this node, for the runtime pane-ownership ledger (agent
           // messaging, src/core/agents/pane-ownership.ts): the ssh project's own scope for a remote
-          // node, else the active project whose canvas this node lives on. Recorded main-side ONLY
-          // on a genuine fresh spawn, so a second project opening another's live node id cannot
-          // claim it. Machine-local id, never the git-shared project.json id.
-          ownerProjectId: sshProjectId ?? useProjects.getState().activeProjectId,
+          // node, else the project whose nodes this subtree renders (`OwningProjectContext` — not
+          // necessarily the active one during a switch), else the active project. Recorded
+          // main-side ONLY on a genuine fresh spawn, so a second project opening another's live
+          // node id cannot claim it. Machine-local id, never the git-shared project.json id.
+          ownerProjectId: sshProjectId ?? owningProjectRef.current ?? useProjects.getState().activeProjectId,
           // Only orders the remote spawn queue: on-screen terminals attach before offscreen ones
           // on a project switch (terminal/on-screen.ts, core/remote-ssh/pty-spawn-gate.ts).
           onScreen: elementOnScreen(container),

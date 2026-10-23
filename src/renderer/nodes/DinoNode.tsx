@@ -30,9 +30,11 @@ export function DinoNode({ id, data, selected }: NodeProps<CanvasNode>) {
   const hostRef = useRef<HTMLDivElement>(null)
   const gameRef = useRef<ReturnType<typeof createDinoGame> | null>(null)
 
-  // The active session's presence. DinoNode renders under Canvas's active-session provider, which is
-  // KEYED on `session.id` (Canvas.tsx), so this node REMOUNTS on a session swap — the mount-time
-  // `presence` capture below is therefore always the current session's, no ref needed.
+  // The active project's presence. DinoNode renders under the SessionProvider Canvas keys on the
+  // session of the project React Flow's STORE holds (`useFlowStoreOwner`, Canvas.tsx), so this node
+  // REMOUNTS on a session swap — once the store holds the incoming project, which by then is also the
+  // active one. The mount-time `presence` capture below is therefore the current session's, no ref
+  // needed.
   const presence = useActiveSessionPresence()
   // The peer (if any) broadcasting a live dino for THIS node, and our own id for the tiebreak.
   // selectDino excludes self and already applies the lowest-clientId rule, so `peer` is the one

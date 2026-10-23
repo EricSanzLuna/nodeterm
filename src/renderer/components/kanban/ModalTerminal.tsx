@@ -21,6 +21,7 @@ import { FindBar } from '../FindBar'
 import { useAgentStatus } from '../../state/agentStatus'
 import { useProjects } from '../../state/projects'
 import { useSession } from '../../session/session'
+import { spawnBelongsElsewhere, useOwningProjectId } from '../../session/owning-project'
 import { isHostedReadOnly } from '../../state/hostedTeams'
 import { useSettings } from '../../state/settings'
 import { isMacPlatform, isWindowsPlatform } from '@shared/platform-utils'
@@ -161,6 +162,11 @@ export function ModalTerminal({
   // Read at click time from the lifecycle effect, which runs once per mount.
   const projectIdRef = useRef(projectId)
   projectIdRef.current = projectId
+  // MIRROR TerminalNode: the project this viewer's node belongs to, as the board's
+  // `ProjectSessionScope` provides it — read by the create path below, which runs once per mount.
+  const owningProject = useOwningProjectId()
+  const owningProjectRef = useRef(owningProject)
+  owningProjectRef.current = owningProject
   const onOpenFileRef = useRef(onOpenFile)
   onOpenFileRef.current = onOpenFile
   // MIRROR TerminalNode: the path dialect belongs to the core that owns the filesystem, never this
@@ -491,18 +497,34 @@ export function ModalTerminal({
       return false
     })
 
+    // MIRROR TerminalNode's `dialsSsh`: a RELAY card's SSH-project node lives on the HOST's side,
+    // so this machine never dials for it (session/relay-ssh.ts). Its create goes to the host's
+    // core with `requireRemote`, which joins the session when the host holds it live and refuses
+    // otherwise. This machine has no master to resolve for it and must not refuse it for lacking one.
+    const dialsSsh = !!spawn.sshRemoteTmux && session.source !== 'relay'
     void (async () => {
-      // Read here, not at click time: a modal only ever opens over the ACTIVE project, and the
-      // reconnect coordinator is keyed by CONNECTION SCOPE (same choice resolveSshRemote makes) —
-      // the project's own id, or the host attachment when this card's session is on a machine the
-      // project isn't.
+      // MIRROR TerminalNode: a node of a REMOTE project (a relay / hosted team tab) under a session
+      // that is not a relay session would create the host's node id on THIS desktop's core. The
+      // board mounts the modal under the card's project session (`ProjectSessionScope`), so this
+      // is the defensive half: start nothing, before any SSH resolve.
+      const owner = owningProjectRef.current
+      if (spawnBelongsElsewhere(useProjects.getState().getProject(owner ?? ''), session.source)) {
+        term.write(
+          '\r\n\x1b[90m[this terminal belongs to a remote project that is not connected here — nothing was started on this machine]\x1b[0m\r\n'
+        )
+        return
+      }
+      // Read here, not at click time. A dialing node's reconnect coordinator is keyed by CONNECTION
+      // SCOPE (same choice resolveSshRemote makes) — the project's own id, or the host attachment
+      // when this card's session is on a machine the project isn't. Any other node's pane is owned
+      // by the CARD's project (the Omni board opens cards of every project), else the active one.
       const projectId =
-        spawn.sshRemoteTmux && spawn.ssh
+        dialsSsh && spawn.ssh
           ? sshConnectionScope(spawn.ssh)
-          : useProjects.getState().activeProjectId
+          : (owner ?? useProjects.getState().activeProjectId)
       // SSH-project node: resolve the live ControlMaster (may not be up yet on a cold load).
       const sshRemote =
-        spawn.sshRemoteTmux && spawn.ssh
+        dialsSsh && spawn.ssh
           ? await resolveSshRemote(spawn.ssh, spawn.cwd, { nodeId, pty: api.pty })
           : undefined
       if (dead) return
@@ -510,7 +532,7 @@ export function ModalTerminal({
       // core's LOCAL tmux branch, and opening a card for a remote session would silently start a
       // local shell under that node's id — see PtyCreateOptions.requireRemote. The card says so
       // and the node is queued for the reconnect coordinator, exactly like the canvas node.
-      if (spawn.sshRemoteTmux && !sshRemote) {
+      if (dialsSsh && !sshRemote) {
         term.write(
           `\r\n\x1b[90m[not connected — this session lives on ${spawn.ssh ? `${spawn.ssh.user}@${spawn.ssh.host}` : 'the remote host'}; nothing was started locally]\x1b[0m\r\n`
         )
@@ -556,7 +578,7 @@ export function ModalTerminal({
       if (res.unavailable) {
         const refusal = ptyRefusal(res.unavailable)
         term.write(`\r\n\x1b[90m[${refusal.message}]\x1b[0m\r\n`)
-        if (refusal.connectionLost && projectId) reportSshDrop(projectId, nodeId)
+        if (refusal.connectionLost && projectId && dialsSsh) reportSshDrop(projectId, nodeId)
         return
       }
       // Another client permanently deleted this node's session — never resurrect it (no live session
