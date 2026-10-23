@@ -206,7 +206,8 @@ The codebase is split by Electron process boundary — keep code on the correct 
   (`src/shared/rpc.ts`) that a browser-side `window.nodeTerminal` shim
   (`src/renderer/bridge/`) consumes. Boots the same core services via
   `ServerPlatform` (`src/server/platform-server.ts`). Single-user auth
-  (scrypt + httpOnly cookie + Origin check). `npm run server:dev` to try;
+  (scrypt + httpOnly cookie + Origin check; the rules a refactor must keep are under
+  **Server Edition sign-in** below). `npm run server:dev` to try;
   docs/SERVER.md for details. `src/server` must not import electron or
   `src/main` (enforced by `src/server/no-electron.test.ts`). **Phase 3a** also
   serves fs/git/commit handlers (editor/diff/source-control now work in the
@@ -269,6 +270,36 @@ a fresh addon) — and writes one `[webgl]` warn per loss carrying the session t
 `console-message` mirror puts in the ring. Our own `loseWebglContexts` releases are counted as
 `released` and never logged per event (routine churn on every pan). A Server Edition tab has no
 main, so its `[webgl]` lines stay in the browser console.
+
+### Server Edition sign-in (security audit 2026-10)
+
+The browser edition is reachable by anyone who can reach its login page, so its auth layer carries
+rules that look like over-engineering and are not. Each was a measured finding; tests pin each
+(`src/server/http-auth.test.ts`, `auth.test.ts`, `ws.test.ts`, `proxy-trust.test.ts`).
+- **A login attempt reserves its rate-limit slot BEFORE the body is read** (`Auth.beginLoginAttempt`,
+  settled exactly once as success / failure / abandoned), and the budget counts attempts in flight.
+  Checked-before-body + charged-after-verify let 60 of 60 held-body guesses through. The lock is per
+  CLIENT (5 → 1 min, doubling to 1 h) with a global ceiling (50 per 5 min, in-flight included) as the
+  backstop; one global counter let a stranger lock the owner out. The client key is
+  `client-address.ts`: the TCP peer, or — only when the peer is loopback/private/CGNAT/ULA or in the
+  trust nets — the LAST `X-Forwarded-For` entry, never an earlier one (the caller wrote those).
+- **Password verification is the async `crypto.scrypt` behind a 2-slot FIFO gate.** There is no
+  synchronous verify on purpose: a `scryptSync` per guess froze every terminal's WebSocket.
+- **Every `POST /auth/*` and the WS upgrade pass ONE same-origin rule** (`src/server/origin.ts`).
+  A new auth POST route goes under `/auth/` or it skips the check.
+- **Sign-out is server-side.** `/auth/logout` deletes the presented session, `/auth/logout-all`
+  deletes all (signed-in callers only), and `ws.ts` closes a cookie socket (4401) when its session is
+  revoked (`Auth.onSessionsRevoked`) or found expired on a heartbeat. The browser UI is
+  Settings → Sign-in, Server Edition only (`nav.ts` `browserOnly`).
+- **Header trust from loopback needs the proxy secret.** On loopback every local process is "the
+  proxy", so `resolveConfig` turns header trust OFF (and the boot says what to set) when the nets
+  cover loopback and `NODETERM_TRUST_PROXY_SECRET` is unset, and `proxyAuthDecision` refuses a
+  loopback peer without a secret whatever the config. The secret is env-only (argv is world-readable)
+  and never logged.
+- **`NODETERM_PUBLIC_ORIGIN`** forces `Secure` + HSTS; without it `Secure` follows
+  `X-Forwarded-Proto` and the first non-loopback `Host` logs a warning. Every response refuses framing
+  by HTTP header (the app CSP is a `<meta>`, where `frame-ancestors` is ignored), and the served
+  `connect-src` is `'self'` (same-origin ws/wss, CSP3; Chrome-verified).
 
 ## Key abstraction: TerminalTransport
 

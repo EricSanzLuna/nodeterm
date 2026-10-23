@@ -890,6 +890,13 @@ ANSWER) into "the ControlMaster is down" (a NON-answer, session still running). 
 the debt down and settle it later (`core/pending-remote-kills.ts`). Silently dropping it is the one
 option that is never available.
 
+**Server Edition sign-in rules are load-bearing** (security audit 2026-10; see CLAUDE.md →
+Server Edition sign-in). A login attempt reserves its rate-limit slot before its body is read and
+verifies with the async scrypt behind a 2-slot gate — never `scryptSync`, which stalls every
+terminal. A new auth POST lives under `/auth/` so the shared same-origin check (`src/server/origin.ts`)
+covers it. Header trust from a loopback peer needs `NODETERM_TRUST_PROXY_SECRET`, which is read from
+the environment only and never logged.
+
 **A Server Edition agent owns only nodes it freshly opened in this server run.** The
 creator ledger is process-local and must never be rebuilt from `.nodeterm/project.json`, titles,
 hook history, or a surviving tmux name: all are writable or stale. A restart therefore clears

@@ -10,7 +10,7 @@ import { ServerPlatform } from './platform-server'
 import { Auth } from './auth'
 import { createHttpHandler } from './http'
 import { attachWsServer } from './ws'
-import { describeTrustedNets } from './proxy-trust'
+import { authBootMessages } from './auth-boot-messages'
 import type { ServerConfig } from './config'
 
 import { initPlatform } from '../core/platform'
@@ -232,15 +232,13 @@ export async function startServer(
 
   const auth = new Auth(config.dataDir)
   if (config.passwordSeed && !auth.isConfigured()) auth.setPassword(config.passwordSeed)
-  if (config.trustProxy) {
-    // Loud on purpose: this line is the operator's one chance to notice a trust
-    // misconfiguration (wrong header name, or nets wider than the proxy's own subnet).
-    console.log(
-      `⚠️  Proxy header trust ENABLED: requests from [${describeTrustedNets(config.trustProxy.nets)}] ` +
-        `carrying a non-empty "${config.trustProxy.header}" header are authenticated WITHOUT a ` +
-        `password. Ensure ONLY your SSO reverse proxy can reach this server from those networks, ` +
-        `and that it strips/overwrites this header on client requests.`
-    )
+  // Loud on purpose: these lines are the operator's one chance to notice a sign-in
+  // misconfiguration (header trust refused for want of a secret, nets wider than the proxy's own
+  // subnet, a short seeded password). See auth-boot-messages.ts.
+  {
+    const { errors, notices } = authBootMessages(config)
+    for (const line of errors) console.error(line)
+    for (const line of notices) console.log(line)
   }
   if (!config.headless && !auth.isConfigured()) {
     // No password set yet: print the one-time setup URL so the operator can bootstrap.
@@ -1234,6 +1232,7 @@ export async function startServer(
       auth,
       rendererDir: config.rendererDir,
       trustProxy: config.trustProxy,
+      publicOrigin: config.publicOrigin,
       downloadTickets
     })
   )
@@ -1243,7 +1242,8 @@ export async function startServer(
     platform,
     auth,
     onClientGone: dropUiClient,
-    trustProxy: config.trustProxy
+    trustProxy: config.trustProxy,
+    publicOrigin: config.publicOrigin
   })
 
   await new Promise<void>((resolve, reject) => {
