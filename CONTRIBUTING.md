@@ -648,6 +648,25 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   terminal goes through those, not through the node's fields alone. CLAUDE.md, "A remote node is
   NEVER spawned locally".
 
+- **A relay / team tab's node runs on the host, and the SESSION it mounts under decides that — the
+  node may carry nothing that says "remote".** A project shared from SSH with a team is adopted by
+  the host, which drops `sshRemoteTmux`/`ssh` from its nodes, so they reach the tab as plain
+  terminals. Four rules keep them off this core (bug F: a team tab's terminals became local tmux
+  sessions here):
+  - A node's session follows the project React Flow's STORE holds (`useFlowStoreOwner`); never key
+    a node subtree's `SessionProvider` on `activeProjectId`. xyflow copies nodes into its store one
+    commit late, so a key on the active id remounts the outgoing nodes under the incoming session.
+  - An unbound remote project resolves to the OFFLINE relay session (`sessionForProject`), never the
+    local one. Code asking "which live session is bound to this tab?" asks `boundSessionForProject`.
+  - A surface that mounts a terminal outside the canvas (the kanban card modal — both boards live
+    under App's LOCAL provider) runs under `sessionForProject(<its project>)` and provides
+    `OwningProjectContext`: wrap it in `ProjectSessionScope` (`session/owning-project.ts`). A new
+    terminal-creating path also asks `spawnBelongsElsewhere` before its first create.
+  - Core `join` refuses (`held-elsewhere`) a `requireRemote` create onto a held session that is
+    local or on another host. Never join by node id alone.
+  Do not "fix" this by re-stamping `sshRemoteTmux` onto those nodes: the host would then refuse its
+  own sessions. CLAUDE.md, "Projects (tabs)".
+
 - **Phone keys and store links are platform-neutral.** New paired keys are stamped
   `nodeterm-mobile-<id>`, but revoke must keep matching the legacy `nodeterm-ios-<id>` stamp every
   existing iPhone carries (`src/main/pairing-core.ts`). Link to a store only through
