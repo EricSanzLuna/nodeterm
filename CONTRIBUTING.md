@@ -30,6 +30,9 @@ Run `npm run rebuild`. node-pty 1.1.0 leaks a pty device per spawn on macOS
 conhost alive per killed session (its exit thread deletes the ConPTY baton without closing the
 HPCON); we patch both sources before `electron-rebuild` compiles them, and that test guards the
 patches surviving upgrades.
+The same goes for `src/core/speech/smart-whisper-patch.test.ts`: `scripts/patch-smart-whisper.mjs`
+adds an AVX2 build of whisper.cpp beside the baseline on Linux x64 (issue #1267, ~10× faster
+dictation), and `npm run rebuild` applies it.
 After the rebuild, `scripts/stage-conpty-dll.mjs` copies node-pty's bundled `conpty.dll` +
 `OpenConsole.exe` back beside `build/Release/conpty.node` on Windows (the rebuild deletes them);
 without them Windows terminals fall back to the inbox ConPTY, where a fullscreen TUI cannot scroll.
@@ -267,6 +270,13 @@ priority, labels, the phone's label verb) rebuilds the entry from a fixed list a
 anything else. Board-level fields survive every transform — `pullLinks` is one.
 
 ## House rules
+
+- **Check `src/shared` before writing a two-line helper.** A JSON-object guard (`isRecord`), an
+  error's message (`errorText`), `sleep`, the root-space parent walk (`rootPositionWith`) and the
+  credential-store temp sweep (`sweepForeignTempFiles` in `core/fs-atomic.ts`) each existed in five
+  to twenty-one hand-typed copies until #1252's follow-up, and the parent walk's copies had already
+  drifted apart on corrupt canvases. A local helper that shares a name but behaves differently
+  (zellij's `errorText`, windows-conpty's array-accepting guard) is not a copy; leave it alone.
 
 - **Typing into a pane by node id goes through `PtyManager.sendPaneKeys`, and an SSH-project node
   is never read or typed into on the local tmux socket.** An unmounted remote node resolves through
@@ -645,6 +655,33 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   terminal goes through those, not through the node's fields alone. CLAUDE.md, "A remote node is
   NEVER spawned locally".
 
+- **A relay / team tab's node runs on the host, and the SESSION it mounts under decides that — the
+  node may carry nothing that says "remote".** A project shared from SSH with a team is adopted by
+  the host, which drops `sshRemoteTmux`/`ssh` from its nodes, so they reach the tab as plain
+  terminals. Four rules keep them off this core (bug F: a team tab's terminals became local tmux
+  sessions here):
+  - A node's session follows the project React Flow's STORE holds (`useFlowStoreOwner`); never key
+    a node subtree's `SessionProvider` on `activeProjectId`. xyflow copies nodes into its store one
+    commit late, so a key on the active id remounts the outgoing nodes under the incoming session.
+  - An unbound remote project resolves to the OFFLINE relay session (`sessionForProject`), never the
+    local one. Code asking "which live session is bound to this tab?" asks `boundSessionForProject`.
+  - A surface that mounts a terminal outside the canvas (the kanban card modal — both boards live
+    under App's LOCAL provider) runs under `sessionForProject(<its project>)` and provides
+    `OwningProjectContext`: wrap it in `ProjectSessionScope` (`session/owning-project.ts`). A new
+    terminal-creating path also asks `spawnBelongsElsewhere(isRemoteProjectId(<owning project>),
+    session.source)` before its first create; ask `isRemoteProjectId` (session.ts), never
+    `getProject(id)?.remote`, which misses a tab the store deleted. A component
+    under it that keys data by project (the board log, card metadata, pull requests) reads
+    `useOwningProjectId() ?? activeProjectId`, never `activeProjectId` alone: on the Omni board the
+    card's project is not the active one, and its `useSession()` api answers for the card's project.
+  - Core `join` refuses (`held-elsewhere`) a `requireRemote` create onto a held session that is
+    local or on another host, but a create that names no `sshRemote` still attaches to a held
+    REMOTE session, so core alone does not stop a caller that names only a node id. A new caller
+    that creates a remote node passes `requireRemote` plus the `sshRemote` it has, and treats
+    `held-elsewhere` as a refusal that is NOT a lost connection (no reconnect, no drop report).
+  Do not "fix" this by re-stamping `sshRemoteTmux` onto those nodes: the host would then refuse its
+  own sessions. CLAUDE.md, "Projects (tabs)".
+
 - **Phone keys and store links are platform-neutral.** New paired keys are stamped
   `nodeterm-mobile-<id>`, but revoke must keep matching the legacy `nodeterm-ios-<id>` stamp every
   existing iPhone carries (`src/main/pairing-core.ts`). Link to a store only through
@@ -861,6 +898,17 @@ mutations and message delivery validate every target before writing anything; mi
 named refusal. Validate Server upgrades against a disposable data directory and port. Restarting a
 shared live service is
 an explicit operator action, never a test or an automatic repair step.
+
+**A canvas-control verb you add in `Canvas.tsx` does not exist on the Server Edition.** The verbs
+run in the DESKTOP renderer's dispatch; the browser bridge never subscribes to `onAgentControl`, and
+the Server Edition answers `/control/*` itself (`src/server/control-unsupported.ts`), serving only
+`SERVER_V1_VERBS` through the headless node factory. Everything else — `list`, `arrange`, `move`,
+`resize`, `place` included — gets the named permanent `control-unsupported-on-this-edition` refusal.
+So "it is in the renderer, so both shells have it" is false here; either add a headless action or
+leave the refusal, and pin which in `control-unsupported.test.ts`. A new verb's flag gate goes in
+`src/shared` and is called from desktop main's control handler too (it never runs
+`parseControlRequest`), and a new verb should refuse a flag it does not read by name (#539) rather
+than ignore it.
 
 **A plain terminal is not a Claude node.** It may carry the generic node/endpoint wiring needed for
 a hand-launched agent to report hooks, but it gets no `NODETERM_AGENT_ID` and no
@@ -1139,7 +1187,16 @@ account, breadcrumbs, closed-session history, per-node `shell` and held `pending
 And **`workspace.json` is one file with last-writer-wins semantics, so it may not be the only home
 of any content**: that is precisely what let a second app instance erase a cwd-less canvas. Between
 two instances the arbiter is the file's `rev` — a lower rev never overwrites a higher one — and
-there is no merge; if you add a fourth kind, give it a file and say which rev wins.
+there is no merge; if you add a fourth kind, give it a file and say which rev wins. The fourth is the
+folder-data-ref (issue #1145: a folder project whose canvas lives in app data): its file is the
+inline one, `writeDataFile`'s rule decides between instances, and the rev continues across a move
+between the folder and app data. Anything that reads or writes `<cwd>/.nodeterm/` must ask
+`folderFileCwd(e)` (or the side-file accessors), never `e.cwd` alone — a project can have a cwd and
+nothing in its folder. Such a project's side files keyed by node id (whiteboards) go under its own
+app-data root, never into a folder every project shares: two folders holding one committed canvas
+share node ids. And `lastWritten` is a record, not evidence that a file is on disk: a file
+can leave a folder behind the store's back (`git rm`, a checkout), so nothing may be deleted
+because the store remembers writing its replacement. The data-file sweep asks what THIS save wrote.
 
 **A project with no folder is a real project — degrade explicitly, never silently.** "New project"
 creates a cwd-less canvas, so every folder-shaped feature meets one. Keep the affordance and
@@ -1219,6 +1276,22 @@ the kind union, so a new kind is a **compile error** until you route it. The kan
 "+ New session" is deliberately not a consumer — it can only offer kinds that become a card — and
 `addMenuSpec.surfaces.test.ts` pins that split so "make them all consistent" stays a decision
 rather than a reflex.
+
+**A surface that takes the whole keyboard marks itself `data-nt-keyboard-owner`.** The canvas
+decides "is the user typing" from the focused element (`isTypingTarget` and friends), and a canvas-
+or div-based editor — the whiteboard's Excalidraw — is not a text field to that check, so Space,
+Delete and ⌘Z reached canvas commands over it. The attribute is honoured by every typing-aware key
+site through `isKeyboardOwnerTarget` (`lib/keyContext.ts`); add new sites to it, not a class list.
+
+**Files a node owns are addressed by id, never by a path from node data.** `project.json` is
+git-shared and hand-editable, so a path in it is attacker-controlled: a whiteboard's side file is
+derived by the core from (project, node id) (`core/whiteboards.ts`), and the id must be a string
+passing `isSafeNodeId`. A copy refers to its original by id (`whiteboardSource`), not by path.
+
+**A new node kind also gets a default size the user can change.** Add it to `SizableNodeKind` /
+`SIZABLE_NODE_KINDS` (`shared/default-node-size.ts`) and `BUILTIN_NODE_SIZES`, and place it with
+`placeSized(kind, …)` in its factory. A literal `*_SIZE` passed to `placeNode` compiles fine and
+quietly ignores Settings → Behavior → Default node size for that kind.
 
 **A setting read at mount reads the DEFAULT, not the user's.** `useSettings` starts on
 `DEFAULT_SETTINGS` and hydrates from disk asynchronously, while `<Canvas />` is mounted before that

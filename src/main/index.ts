@@ -358,6 +358,7 @@ import { DRY_RUN_VERBS, dryRunRequested, dryRunRefusal } from '../shared/control
 import { browserFlagRefusal, issueFlagRefusal } from '../core/canvas-control-core'
 import { afterPrFlagRefusal } from '../shared/pr-wait'
 import { arrangeArgsRefusal } from '../shared/arrange-verb'
+import { geometryArgsRefusal } from '../shared/geometry-verbs'
 import { CONTROL_REQUEST_TIMEOUT_MS } from '../shared/control-confirm'
 import { createControlForwarder, type ControlForwardReply } from './control-forward'
 import { claimOpenedBrowser } from './browser-open-claim'
@@ -384,7 +385,7 @@ import { registerGrokCliIpc } from '../core/grok-cli'
 import { registerCursorCliIpc } from '../core/cursor-cli'
 import { refreshCodexIdentityCaps, registerCodexIdentityIpc } from '../core/codex-identity-caps'
 import { codexCliCaps, registerCodexCliIpc } from '../core/codex-cli'
-import { registerWallpaperIpc, setWallpaperImageOps } from '../core/wallpaper'
+import { registerWallpaperIpc, setWallpaperImageOps, setWallpaperMediaUrl } from '../core/wallpaper'
 import { nativeImageWallpaperOps } from './wallpaper-native-image'
 import { registerRunConfigIpc, stopAllRunWatches } from '../core/run-service'
 import { registerSimulatorIpc, setSimulatorNodeRefusal, shutdownOwnedSimulators, stopAllSimulators } from '../core/simulator/simulator-service'
@@ -1757,6 +1758,9 @@ app.whenReady().then(async () => {
   // Windows has no sips: convert (thumbnails, Windows stills, oversized imports) with Chromium's
   // own decoder. macOS keeps sips and Linux keeps no converter, byte for byte.
   if (process.platform === 'win32') setWallpaperImageOps(nativeImageWallpaperOps)
+  // Aerial wallpapers (macOS) stream through nt-media://; core allowlists only the clips and
+  // thumbnails its own manifest scan found.
+  setWallpaperMediaUrl(allowMediaPath)
   registerWallpaperIpc(settingsStore)
   registerRunConfigIpc()
   registerSimulatorIpc()
@@ -2142,8 +2146,11 @@ app.whenReady().then(async () => {
   // `localProjectCwd` is how a canvas image finds the project's own `.nodeterm/images/`. It
   // answers undefined for an SSH project (its cwd is on the host, and the image node reads
   // locally) and for a relay tab (not in this index at all) — both take the app-local fallback.
+  // `whiteboardLocation` is the same idea for a whiteboard, except that a folder project kept in app
+  // data keeps its boards in its own app-data root (see `whiteboardLocationForProject`).
   registerFsHandlers(corePlatform, {
-    localProjectCwd: (projectId: string) => workspaceStore.localCwdForProject(projectId)
+    localProjectCwd: (projectId: string) => workspaceStore.sideFilesFolderForProject(projectId),
+    whiteboardLocation: (projectId: string) => workspaceStore.whiteboardLocationForProject(projectId)
   })
 
   const githubSecret = new ElectronGitHubSecretStore(app.getPath('userData'), safeStorage)
@@ -2236,7 +2243,7 @@ app.whenReady().then(async () => {
         }
         return { kind: 'remote', remoteCwd: ref.remoteCwd, exec, fingerprint }
       }
-      const cwd = workspaceStore.localCwdForProject(projectId)
+      const cwd = workspaceStore.boardLogRootForProject(projectId)
       if (cwd) return { kind: 'local', cwd }
       return { kind: 'unsupported' }
     }
@@ -4605,6 +4612,11 @@ app.whenReady().then(async () => {
     // ran as a grid.
     const arrangeRefusal = verb === 'arrange' ? arrangeArgsRefusal(args) : null
     if (arrangeRefusal) return { ok: false, error: arrangeRefusal, message: arrangeRefusal }
+    // `resize` / `place` / `list --geometry` / a coordinate or size flag on `move` (issue #1288): same
+    // placement, same reason — without it `move --nodes a --x 10` reached the renderer and pulled a
+    // framed node out to the top level, and a bad `--width` would be the renderer's to explain.
+    const geometryRefusal = geometryArgsRefusal(verb, args)
+    if (geometryRefusal) return { ok: false, error: geometryRefusal, message: geometryRefusal }
     // A station's report about ITSELF: recorded in main's store, board-logged on its own card, and
     // never forwarded — there is no canvas work in it, and the renderer hears the store's push.
     if (verb === 'report-outcome') {
