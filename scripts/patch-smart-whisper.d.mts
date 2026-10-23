@@ -3,5 +3,6 @@
 export declare const PATCH_MARKER: string
 export declare const VARIANT_TARGET: string
 export declare const SIMD_FLAGS: readonly string[]
+export declare const CTX_PARAMS_MARKER: string
 export declare function patchSmartWhisper(dir: string): 'patched' | 'already-patched'
 export declare const METAL_MARKER: string

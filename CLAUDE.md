@@ -10088,6 +10088,17 @@ Voice-to-text input captured via microphone, turned into terminal text via on-de
   on an M5 Pro, large-v3-turbo, 2.7 s clip: 5.97 s on the CPU, 0.64 s on Metal; in the app, dictation
   went from several seconds to under one. A dev install and an explicit `GGML_METAL_PATH_RESOURCES`
   are unchanged.
+- **smart-whisper's model params are patched to start from whisper.cpp's defaults** (third patch in
+  `scripts/patch-smart-whisper.mjs`, marker `NODETERM-PATCH(smart-whisper-ctx-params)`, every
+  platform). Its `LoadModel` declared `whisper_context_params params;` and set only `use_gpu`, so DTW,
+  `gpu_device`, `flash_attn` and the rest were uninitialized stack memory and the result depended on
+  what was there. MEASURED on an M5 Pro, Electron 42, large-v3-turbo: the shipped binary crashed in 4
+  of 4 runs outside the app (`aheads_masks_init` then a crash in `whisper_free_state`, because garbage
+  switched DTW on with large-v3's alignment heads); with the defaults it ran without a crash, 0.56 s
+  for a 2.7 s clip and 0.93 s for 21 s on Metal. The slow dictation inside the packaged app is a
+  separate bug: Metal cannot read its shaders inside app.asar. A newer whisper.cpp is
+  faster again (0.22 s / 0.43 s, measured the same way) but needs a build change on every platform;
+  that is a separate follow-up.
 
 ## Packaging & auto-update
 

@@ -2,7 +2,14 @@ import { describe, expect, it } from 'vitest'
 import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
-import { METAL_MARKER, PATCH_MARKER, SIMD_FLAGS, VARIANT_TARGET, patchSmartWhisper } from '../../../scripts/patch-smart-whisper.mjs'
+import {
+  CTX_PARAMS_MARKER,
+  METAL_MARKER,
+  PATCH_MARKER,
+  SIMD_FLAGS,
+  VARIANT_TARGET,
+  patchSmartWhisper
+} from '../../../scripts/patch-smart-whisper.mjs'
 import { WHISPER_SIMD_FLAGS } from './speech-service'
 import { testTmpDir } from '../test-tmp'
 
@@ -14,7 +21,7 @@ import { testTmpDir } from '../test-tmp'
  */
 const PKG = path.resolve(__dirname, '../../../node_modules/smart-whisper')
 const installed = fs.existsSync(path.join(PKG, 'binding.gyp'))
-/** Pristine smart-whisper 0.8.1 binding.gyp + the loader lines of its dist/index.js (dist-index.js). */
+/** Pristine smart-whisper 0.8.1 binding.gyp, src/binding/model.cc, and its dist/index.js (dist-index.js). */
 const FIXTURE = path.resolve(__dirname, '__fixtures__/smart-whisper-0.8.1')
 
 function copyPackage(dir = testTmpDir('sw-patch-')): string {
@@ -22,6 +29,8 @@ function copyPackage(dir = testTmpDir('sw-patch-')): string {
   fs.copyFileSync(path.join(FIXTURE, 'binding.gyp'), path.join(dir, 'binding.gyp'))
   // Stored flat: the repo's .gitignore drops every dist/ directory.
   fs.copyFileSync(path.join(FIXTURE, 'dist-index.js'), path.join(dir, 'dist', 'index.js'))
+  fs.mkdirSync(path.join(dir, 'src', 'binding'), { recursive: true })
+  fs.copyFileSync(path.join(FIXTURE, 'model.cc'), path.join(dir, 'src', 'binding', 'model.cc'))
   return dir
 }
 
@@ -31,6 +40,27 @@ describe('patch-smart-whisper', () => {
     expect(fs.readFileSync(path.join(PKG, 'binding.gyp'), 'utf8'), howto).toContain(PATCH_MARKER)
     expect(fs.readFileSync(path.join(PKG, 'dist', 'index.js'), 'utf8'), howto).toContain(PATCH_MARKER)
     expect(fs.readFileSync(path.join(PKG, 'dist', 'index.js'), 'utf8'), howto).toContain(METAL_MARKER)
+    expect(fs.readFileSync(path.join(PKG, 'src', 'binding', 'model.cc'), 'utf8'), howto).toContain(CTX_PARAMS_MARKER)
+  })
+
+  it('starts the model context params from whisper.cpp defaults and is idempotent', () => {
+    // The pristine declaration leaves every field but use_gpu as stack garbage (DTW among them).
+    const dir = copyPackage()
+    const modelPath = path.join(dir, 'src', 'binding', 'model.cc')
+    expect(fs.readFileSync(modelPath, 'utf8')).toMatch(/^\s*whisper_context_params params;$/m)
+    expect(patchSmartWhisper(dir)).toBe('patched')
+    const model = fs.readFileSync(modelPath, 'utf8')
+    expect(model).toContain('whisper_context_params params = whisper_context_default_params();')
+    expect(model).not.toMatch(/^\s*whisper_context_params params;$/m)
+    expect(model).toContain('params.use_gpu = info.Length() == 2')
+    expect(patchSmartWhisper(dir)).toBe('already-patched')
+    expect(fs.readFileSync(modelPath, 'utf8')).toBe(model)
+  })
+
+  it('refuses a model.cc whose params declaration moved', () => {
+    const dir = copyPackage()
+    fs.writeFileSync(path.join(dir, 'src', 'binding', 'model.cc'), '// rewritten upstream\n')
+    expect(() => patchSmartWhisper(dir)).toThrow(/anchor "model.cc context params"/)
   })
 
   it('builds for exactly the CPU flags the runtime checks', () => {
