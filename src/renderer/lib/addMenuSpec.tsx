@@ -46,6 +46,7 @@ import {
   IconRemote,
   IconTerminal,
   IconWeb,
+  IconWhiteboard,
   IconBellFilled
 } from '../components/icons'
 
@@ -65,6 +66,7 @@ export type AddItem =
   | { kind: 'browser' }
   | { kind: 'web' }
   | { kind: 'sticky' }
+  | { kind: 'whiteboard' }
   | { kind: 'files' } // requiresCwd
   | { kind: 'dino' }
   | { kind: 'trigger' }
@@ -85,6 +87,7 @@ export const CONTENT_ADD_ITEMS: readonly AddItem[] = [
   { kind: 'remote' },
   { kind: 'run' },
   { kind: 'simulator' },
+  { kind: 'whiteboard' },
   { kind: 'browser' },
   { kind: 'web' },
   { kind: 'sticky' },
@@ -131,6 +134,7 @@ export interface AddHandlers {
   sticky: (at?: AddPos) => void
   files: (at?: AddPos) => void
   dino: (at?: AddPos) => void
+  whiteboard: (at?: AddPos) => void
   /** Adds a trigger node (issue #493) — a canvas-owned schedule that fires into another node. */
   trigger: (at?: AddPos) => void
   openFile: (at?: AddPos) => void
@@ -259,6 +263,9 @@ export function contentAddItemsToMenuItems(
           onClick: () => handlers.files(at)
         })
         break
+      case 'whiteboard':
+        out.push({ label: 'New whiteboard', icon: <IconWhiteboard />, onClick: () => handlers.whiteboard(at) })
+        break
       case 'dino':
         out.push({ label: 'New dino game', icon: <IconDino />, onClick: () => handlers.dino(at) })
         break
@@ -377,6 +384,9 @@ export function contentAddItemsToDockRows(
           onClick: () => handlers.files()
         })
         break
+      case 'whiteboard':
+        out.push({ kind: 'whiteboard', label: 'Whiteboard', icon: <IconWhiteboard />, onClick: () => handlers.whiteboard() })
+        break
       case 'dino':
         out.push({ kind: 'dino', label: 'Dino Game', icon: <IconDino />, onClick: () => handlers.dino() })
         break
@@ -456,6 +466,7 @@ export const ADD_ITEM_GROUP: Record<AddItem['kind'], AddGroupId> = {
   sticky: 'view',
   files: 'view',
   dino: 'view',
+  whiteboard: 'view',
   'open-file': 'files',
   'new-file': 'files',
   'spawn-team': 'orchestrate',

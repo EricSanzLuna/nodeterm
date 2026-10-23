@@ -147,10 +147,12 @@ import {
   TYPING_NAMES_MAX,
   WATCH_CHAT_CAST,
   WATCH_EVENT,
+  WATCH_HISTORY_CAST,
   WATCH_INPUT_CAST,
   WATCH_PROTOCOL_VERSION,
   WATCH_RELEASE_CAST,
   WATCH_UNLOCK_CAST,
+  readHistoryRequest,
   sanitizeChatName,
   sanitizeChatText,
   type WatchChatMessage,
@@ -165,6 +167,7 @@ import { createInputSplitter, createTypingTracker, type InputSplitter } from './
 import { PANE_INPUT_DEADLINE_MS, WATCHER_INPUT_ROUTES, type ControlInputChunk, type WatcherInputRoute } from './pane-input'
 import { isTerminalReport } from '../terminal-reports'
 import { createStreamFilter, type StreamFilter } from './stream-filter'
+import { historyPageFrom, type HistoryRead } from './history'
 import { createTokenBucket, type TokenBucket } from './token-bucket'
 import {
   WATCHER_BUFFER_LIMIT,
@@ -174,6 +177,7 @@ import {
   wrapWatcherSink
 } from './watcher-policy'
 import { CONTROL_WRONG_MAX, type WatchLinkRecord } from './store'
+import { errorText } from '../../shared/error-text'
 
 export const MAX_VIEWERS_PER_LINK = 10
 /** While the link is full (no idle listener, so no mint), how often the API is asked whether the link
@@ -213,6 +217,10 @@ export const INPUT_CHUNKS_MAX = 64
 export const TYPING_EVENT_MIN_MS = 1000
 /** A viewer is told its input was dropped at most this often. */
 export const DROPPED_NOTICE_MIN_MS = 10_000
+/** Read-back reads start at most this often per viewer; one runs at a time, and a request that arrives
+ *  meanwhile waits (the newest one wins). Each read is a transcript read on the host (an ssh round trip
+ *  for an SSH node), so a viewer that asks in a loop must not turn into a read loop. */
+export const HISTORY_MIN_INTERVAL_MS = 500
 /** Input from a connection that stopped controlling this recently is dropped silently: keystrokes in
  *  flight when control ended are not a breach. Later than this, they are. */
 export const INPUT_GRACE_MS = 5000
@@ -292,6 +300,12 @@ export interface LinkHostDeps {
    *  on `record.control.wrong` and writes it (the 10th rides the lock's own write), so a restart does
    *  not reset it. Called before `onControlLocked`. */
   onWrongAttempt(count: number): void
+  /** Read-back (`watch:history`, ./history.ts): one transcript page of the link's node ending at
+   *  `before` (null: the newest). Rejects on a failed read. Absent: every request is answered
+   *  `unsupported`. The cutoff at the link's creation is applied HERE, not by the reader. */
+  history?(before: number | null): Promise<HistoryRead>
+  /** Whether the node is an agent with a readable conversation; asked for every (re)join's meta. */
+  historySupported?(): boolean
 }
 export type LinkRuntimeStatus = 'live' | 'reconnecting' | 'refused'
 export interface LinkViewer {
@@ -396,6 +410,12 @@ interface Conn {
   stableTimer: unknown
   rejoinAttempt: number
   rejoinTimer: unknown
+  /** Read-back: a read is running; the request that arrived meanwhile (the newest wins); when the last
+   *  read started; the timer holding the next one to HISTORY_MIN_INTERVAL_MS. */
+  historyBusy: boolean
+  historyNext: { before: number | null } | null
+  historyLastAt: number
+  historyTimer: unknown
   warned: Set<string>
 }
 
@@ -412,7 +432,6 @@ interface CaptureSlot {
   next: { result: Promise<VisibleCapture>; start(): void } | null
 }
 
-const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err))
 /** The same members, in any order (the typing set is a set: a new order alone is no news). */
 function sameMembers(a: string[], b: string[]): boolean {
   if (a.length !== b.length) return false
@@ -575,8 +594,9 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
     if (c.ended) return
     c.ended = true
     conns.delete(c)
-    for (const h of [c.confirmTimer, c.rejoinTimer, c.keyframeTimer, c.settleTimer, c.stableTimer]) clearTimer(h)
-    c.confirmTimer = c.rejoinTimer = c.keyframeTimer = c.settleTimer = c.stableTimer = null
+    for (const h of [c.confirmTimer, c.rejoinTimer, c.keyframeTimer, c.settleTimer, c.stableTimer, c.historyTimer]) clearTimer(h)
+    c.confirmTimer = c.rejoinTimer = c.keyframeTimer = c.settleTimer = c.stableTimer = c.historyTimer = null
+    c.historyNext = null
     const sid = c.sessionId
     c.sessionId = null
     c.streaming = false
@@ -819,6 +839,7 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
     }
     // A Control link's state for THIS viewer rides every (re)join; absent on every other role.
     if (record.role === 'controller') meta.control = controlStateFor(c)
+    if (historySupported()) meta.history = true
     if (!send(c, WATCH_EVENT.meta, meta)) return
     // The typing set is otherwise sent only when it changes: a viewer (re)joining mid-typing would
     // never learn it.
@@ -891,6 +912,10 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
   }
   function onViewerCast(c: Conn, method: string, args: unknown[]): void {
     // relay-host's access hook admits exactly these (watcherAccess); anything else got past it.
+    if (method === WATCH_HISTORY_CAST) {
+      onHistory(c, args)
+      return
+    }
     if (method === WATCH_CHAT_CAST && (record.role === 'commenter' || record.role === 'controller')) {
       onChat(c, args)
       return
@@ -924,6 +949,56 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
     c.lastChatAt = now
     c.name = name
     publish({ id: bytesToHex(nacl.randomBytes(8)), name, text, at: now, from: 'viewer' })
+  }
+
+  // --- read-back (./history.ts) ---------------------------------------------------------------------
+
+  function historySupported(): boolean {
+    try {
+      return deps.historySupported?.() === true
+    } catch (err) {
+      warn(null, 'asking whether read-back is there failed', errorText(err))
+      return false
+    }
+  }
+  function onHistory(c: Conn, args: unknown[]): void {
+    if (c.ended || c.joinedAt === null || stopped) return
+    // A malformed request is ignored, like a malformed chat line: the cast itself is admitted.
+    const req = readHistoryRequest(args[0])
+    if (!req) return
+    c.historyNext = req
+    pumpHistory(c)
+  }
+  function pumpHistory(c: Conn): void {
+    if (c.ended || stopped || c.historyBusy || c.historyTimer !== null || c.historyNext === null) return
+    const wait = HISTORY_MIN_INTERVAL_MS - (deps.now() - c.historyLastAt)
+    if (wait > 0) {
+      c.historyTimer = deps.setTimeout(() => {
+        c.historyTimer = null
+        pumpHistory(c)
+      }, wait)
+      return
+    }
+    const { before } = c.historyNext
+    c.historyNext = null
+    c.historyBusy = true
+    c.historyLastAt = deps.now()
+    const read = async (): Promise<HistoryRead | null> => {
+      if (!deps.history) return { kind: 'unsupported' }
+      try {
+        return await deps.history(before)
+      } catch (err) {
+        warn(c, 'a read-back failed', errorText(err))
+        return null
+      }
+    }
+    void read().then((r) => {
+      c.historyBusy = false
+      if (c.ended || stopped) return
+      // The record is read now: the cutoff is the link's creation, whatever the reader returned.
+      send(c, WATCH_EVENT.history, historyPageFrom(r, record.createdAt, before))
+      pumpHistory(c)
+    })
   }
 
   // --- control (a Control link) -----------------------------------------------------------------------
@@ -1327,6 +1402,10 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
       stableTimer: null,
       rejoinAttempt: 0,
       rejoinTimer: null,
+      historyBusy: false,
+      historyNext: null,
+      historyLastAt: -Infinity,
+      historyTimer: null,
       warned: new Set()
     }
     conns.add(c)

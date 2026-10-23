@@ -90,6 +90,7 @@ import {
 import { controlPasswordProblem } from '../../shared/watch-link-password'
 import type { HostTokenResult, WatchLinkApi as WatchLinkApiClient } from './api'
 import { WRONG_PER_LINK, createLinkHost, type LinkHost, type QuietClients, type WatchPty } from './link-host'
+import type { HistoryRead } from './history'
 import { hashControlPassword, verifyControlPassword, type ControlPasswordHash } from './password'
 import {
   WatchLinkStoreUnreadable,
@@ -98,6 +99,7 @@ import {
   type WatchLinkStore
 } from './store'
 import type { RelayTransport } from '../relay/relay-socket'
+import { errorText } from '../../shared/error-text'
 
 /** setTimeout's own ceiling (a longer delay fires at once). A link lives ≤ 24 h, far below it. */
 const MAX_DELAY_MS = 2_147_483_647
@@ -132,6 +134,13 @@ export interface WatchLinkServiceDeps {
   /** Can this node's terminal take a Control link's input (`PtyManager.nodeControlSupport`)? Absent,
    *  throwing or anything else answers `unknown`, which leaves the create to decide. */
   controlSupport?(nodeId: string): ControlSupport
+  /** Read-back (`watch:history`): one transcript page of `nodeId`'s conversation ending at `before`
+   *  (null: the newest), through the SAME reader as the ⌘M panel and the phone's `chat.page`. Rejects
+   *  on a failed read. The link host cuts every page at the link's creation (./history.ts); the reader
+   *  knows nothing of links. Absent: viewers are told read-back is not available. */
+  history?(nodeId: string, before: number | null): Promise<HistoryRead>
+  /** Is `nodeId` an agent whose conversation `history` can read? Rides every join's meta. */
+  historySupported?(nodeId: string): boolean
   /** This shell cannot host links (the Server Edition until it has a license layer — R43). */
   unsupported?: boolean
   now?(): number
@@ -287,7 +296,6 @@ export function sendToOwners(
   for (const id of p.clientIds()) if (p.isOwnerClient?.(id) === true) p.sendTo(id, channel, ...args)
 }
 
-const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err))
 /** An error's NAME only: what failed around a password (its hash, its check) may be in the message. */
 const errorName = (err: unknown): string => (err instanceof Error ? err.name : 'not an Error')
 const TIMEOUT = Symbol('timeout')
@@ -565,6 +573,9 @@ export function createWatchLinkService(deps: WatchLinkServiceDeps): WatchLinkSer
           notice({ kind: 'joined', linkId: r.linkId, nodeId: r.nodeId, title: stripBidiControls(r.title), viewers: count }),
         onGone: (reason) => end(r.linkId, reason, { serverRevoke: false, notify: true }),
         verifyPassword: (pw) => checkPassword(r, pw),
+        // Bound to THIS link's node: a viewer names no node, only a cursor.
+        ...(deps.history ? { history: (before: number | null) => deps.history!(r.nodeId, before) } : {}),
+        ...(deps.historySupported ? { historySupported: () => deps.historySupported!(r.nodeId) } : {}),
         onControlTaken: (name) => {
           notice({
             kind: 'control-taken',

@@ -131,6 +131,8 @@ interface Opts {
   verifyPassword?: (pw: string, h: ControlPasswordHash) => Promise<boolean>
   /** The REAL link host (and a relay transport no test reaches) instead of the fake. */
   realHost?: boolean
+  history?: WatchLinkServiceDeps['history']
+  historySupported?: WatchLinkServiceDeps['historySupported']
 }
 function service(o: Opts = {}) {
   const file = join(testTmpDir('wls-'), 'watch-links.json')
@@ -162,6 +164,8 @@ function service(o: Opts = {}) {
     ...(o.hashPassword ? { hashPassword: o.hashPassword } : {}),
     ...(o.verifyPassword ? { verifyPassword: o.verifyPassword } : {}),
     ...(o.unsupported ? { unsupported: true } : {}),
+    ...(o.history ? { history: o.history } : {}),
+    ...(o.historySupported ? { historySupported: o.historySupported } : {}),
     ...(o.persistTimeoutMs ? { persistTimeoutMs: o.persistTimeoutMs } : {}),
     ...(o.workspaceWaitMs ? { workspaceWaitMs: o.workspaceWaitMs } : {}),
     ...(o.now ? { now: o.now } : {})
@@ -559,6 +563,27 @@ describe('createWatchLinkService — ending a link', () => {
     t.s.onWorkspaceChanged()
     await flush()
     expect(t.s.list()).toHaveLength(1)
+  })
+
+  it('binds read-back to the link\'s own node: a viewer names only a cursor', async () => {
+    const reads: [string, number | null][] = []
+    const t = service({
+      history: async (nodeId, before) => {
+        reads.push([nodeId, before])
+        return { kind: 'unsupported' }
+      },
+      historySupported: (nodeId) => nodeId === 'n2'
+    })
+    expect((await t.s.create(req({ nodeId: 'n2' }))).ok).toBe(true)
+    const deps = t.hosts.made[0].deps
+    expect(deps.historySupported?.()).toBe(true)
+    await deps.history?.(77)
+    expect(reads).toEqual([['n2', 77]])
+    // Without the shell's reader there is no read-back at all.
+    const bare = service()
+    expect((await bare.s.create(req())).ok).toBe(true)
+    expect(bare.hosts.made[0].deps.history).toBeUndefined()
+    expect(bare.hosts.made[0].deps.historySupported).toBeUndefined()
   })
 
   it('a server-side end (onGone) ends the link locally, tells the owner, and does not revoke again', async () => {

@@ -53,6 +53,7 @@ link"**, the code says **`watchLink`** (owner IPC, `src/core/watch-link/`), the 
 | Output filter | `src/core/watch-link/stream-filter.ts` | Strips string-type escape sequences from the viewer's stream. |
 | Token bucket | `src/core/watch-link/token-bucket.ts` | Per viewer, 256 KB/s sustained, 1 MB burst, for the stream. A controller's input has its own: 64 KiB/s, 256 KiB burst. |
 | Visible capture | `src/core/watch-link/capture-route.ts` + `PtyManager.captureVisible` | The keyframe. Never history. |
+| Read-back | `src/core/watch-link/history.ts` + the desktop's `history` dep (host-chat's `page`) | An agent's CONVERSATION since the link was created, as text (`watch:history`). Never the terminal's history. See "Read-back". |
 | Watcher's own tmux client | `src/core/watch-link/watcher-client.ts` + `PtyManager.joinAsWatcher` / `syncWatcherClientSize` | Only when no owner `Session` is held for the node. |
 | Pty seam | `src/core/watch-link/pty-seam.ts` (`createWatchPty`) | ONE definition of the join rules, both shells wire it. |
 | Store | `src/core/watch-link/store.ts` | `<userData>/watch-links.json`; the secret is sealed, a Control link's password hash is not. |
@@ -130,8 +131,8 @@ A viewer is a core client, so the risk of this design is that some existing outb
 Two independent layers close that, plus deny-by-default in both directions.
 
 **Inbound** (`watcherAccess`): every request and every cast is refused, except these **casts** (never
-requests): `watch:chat` on a Commenter or Control link, and `watch:unlock`, `watch:input` and
-`watch:release` on a Control link. The policy knows only the role. Whether THIS viewer may type is
+requests): `watch:history` on every link (see "Read-back"), `watch:chat` on a Commenter or Control link,
+and `watch:unlock`, `watch:input` and `watch:release` on a Control link. The policy knows only the role. Whether THIS viewer may type is
 the link host's state for this connection (`controlling`, set by a right password), and the link host
 treats input from a viewer that is not controlling as a breach (except within 5 s of losing control,
 see "The Control role"). Host-only channels are refused `E_FORBIDDEN` by relay-host before the hook
@@ -285,6 +286,44 @@ share a capture already running, any other keyframe needs one started after it a
 sequence makes sure an older result is never painted after a newer one. A session found gone after a
 join or a capture (`alive()`, R30) takes the lifecycle path, not a keyframe. Split panes: a keyframe
 captures the ACTIVE pane only; the stream repairs the rest as tmux redraws.
+
+## Read-back (`watch:history`)
+
+A viewer could not scroll at all, and that is structural, not a missing scrollbar: the stream is a tmux
+CLIENT, which paints on the alternate screen, so the page's emulator never holds a line above the
+screen, and a keyframe is the visible screen only. On an agent node even tmux has nothing: Claude's
+fullscreen TUI keeps its conversation on the pane's own alternate screen, where tmux records no history.
+And letting a viewer drive tmux copy-mode is not an option: copy-mode belongs to the PANE, so the
+viewer would scroll the owner's screen too.
+
+So a viewer reads back the agent's CONVERSATION instead, as text, in a panel laid over the live terminal.
+
+- **The cutoff is the link's creation, enforced on the host.** `historyPageFrom` (`history.ts`) keeps a
+  message only when its time is at or after `record.createdAt`; a message with no time is never sent
+  (nothing proves it came after), and paging stops at the first window that reaches back past the link.
+  `readHistoryPage` (protocol.ts, vendored) applies the same cutoff again on BOTH ends. An agent whose
+  reader records no times (grok) answers `untimed` rather than an empty "nothing yet".
+- **What travels:** user prompts and assistant text, tool NAMES and their short argument (the chip's
+  200-char `arg`), and a plan/question body (the screen shows it in full). Never a tool RESULT and never
+  thinking. Every string is cleaned (controls, ESC, bidi), capped per part (20,000 units), per page (200
+  messages, 400,000 units, newest kept). Measured on a real 3.8 MB transcript: a 512 KB window held 44
+  messages, the cut at its middle sent 22, 9.6 KB of JSON, and none of the window's 22 tool results.
+- **The read is the phone Chat screen's** (`host-chat.ts` → `readChatTranscript`): the node from this
+  machine's records, the renderer's session id first, an SSH node read on its host and never here (a
+  remote read that cannot happen is an `error` page). The service binds it to the link's own node: a
+  viewer sends only a cursor (`{ before }`, the previous page's `olderCursor`). `watch:meta` carries
+  `history: true` when the node's agent is `canChat`.
+- **Bounded per viewer:** one read at a time, at most one every 500 ms (`HISTORY_MIN_INTERVAL_MS`); a
+  request that arrives meanwhile waits and the newest one wins, so a viewer asking in a loop never
+  becomes a read loop. A malformed request is ignored (the cast is admitted, like a malformed chat line).
+  A failed read is an `error` page, never an empty one.
+- **Clock skew:** `createdAt` is this machine's clock and a remote agent's timestamps are its host's. A
+  host clock ahead of ours can show a message from just before the link; one behind can hide one from
+  just after. The skew between two NTP-synced machines is milliseconds.
+- **Surfaces:** Desktop wires it (`main/index.ts`, late-bound to `hostBridge.chat`, pinned by
+  `watch-link-wiring.test.ts`). The Server Edition hosts no links. A plain terminal has no read-back
+  (no `history` in its meta; the viewer page offers nothing). Mobile: N/A (the phone does not view
+  links).
 
 ## The watcher's own tmux client and sizing
 
@@ -679,6 +718,14 @@ control again to type.". While typing:
   keyboard trap.
 - The wheel does nothing on the alternate screen (xterm would turn it into arrow keys, which would
   recall prompt history into the input line).
+
+**Scroll back** (every role, when the meta says `history: true`): a header button, and scrolling UP over
+the terminal on the alternate screen while NOT typing, open a reading panel over the terminal: "Since
+the link was shared", prompts and the agent's replies with times, tool chips, older pages loaded when
+the viewer reaches the top, and a line saying where it starts ("The link was shared at 14:02. Nothing
+before that is shared." / "Start of the conversation."). **Back to live** or Escape closes it; the
+stream keeps running underneath. A request lost with a dropped connection is sent again on the next
+one. While typing, the wheel never opens it (the button still does).
 - Mouse tracking stays swallowed: no mouse input is ever sent, and selection stays local.
 - On a phone, a grant after a script moved the focus opens no keyboard, so the page asks for a tap
   ("Tap the terminal to type.").
@@ -1390,3 +1437,17 @@ The final review's fixes:
     pastes in under 20 ms (a script on the viewer page). Expect: the first 64 chunks land, the rest of that
     batch does not, the viewer sees "Some of your input didn't reach the terminal.", and typing right after
     works.
+
+Read-back (`watch:history`):
+
+98. **Claude node, Viewer link:** share a Claude node, have it answer two prompts, open the link, scroll
+    up over the terminal. Expect: "Since the link was shared" opens with both prompts and replies, tool
+    chips without their output, and "The link was shared at …" at the top; a prompt from before the
+    link is not there. Back to live returns to the terminal, which kept streaming.
+99. **Long session:** a link on a node whose conversation since sharing is longer than one page. Expect:
+    scrolling to the top of the panel loads earlier messages without jumping, and stops at the share line.
+100. **SSH node:** the same over an SSH project's Claude node. With the ControlMaster down, the panel says
+    "Couldn't read the conversation." with Try again — never an empty conversation.
+101. **Plain terminal / grok:** a plain terminal's link shows no Scroll back button; a grok node's says
+    its conversation records no times.
+102. **Phone:** Scroll back on a phone opens a panel tall enough to read and scrolls inside it.

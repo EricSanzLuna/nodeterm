@@ -343,7 +343,9 @@ export function buildStubApi(): Omit<
       // are pure CSS and need no bridge), and import refuses.
       listStills: () => Promise.resolve([]),
       load: () => Promise.resolve(null),
-      importImage: U('wallpaper.importImage')
+      importImage: U('wallpaper.importImage'),
+      listAerials: () => Promise.resolve([]),
+      aerialClips: () => Promise.resolve([])
     },
     simulator: {
       devices: () => Promise.resolve({ devices: [] }),

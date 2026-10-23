@@ -18,6 +18,7 @@ import {
   INPUT_MAX,
   TYPING_NAMES_MAX,
   WATCH_EVENT,
+  WATCH_HISTORY_CAST,
   WATCH_INPUT_CAST,
   WATCH_RELEASE_CAST,
   WATCH_UNLOCK_CAST,
@@ -57,6 +58,9 @@ import type { WatchLinkControlRecord, WatchLinkRecord } from './store'
 import type { UiSink } from '../ui-sink-registry'
 import type { ControlInputChunk, WatcherInputRoute } from './pane-input'
 import { PASTE_END, PASTE_START, TYPING_WINDOW_MS } from './control-input'
+import type { HistoryRead } from './history'
+import type { ChatMessage } from '../../shared/types'
+import type { WatchHistoryPage } from '../../shared/watch-link/protocol'
 
 const ESC = '\x1b'
 const TRUST_CONFIRM = '{"t":"cast","method":"trust:confirm","args":[]}'
@@ -134,6 +138,9 @@ interface SetupOpts {
   route?: WatcherInputRoute | 'missing'
   mint?: () => Promise<HostTokenResult>
   status?: () => Promise<'live' | 'revoked' | 'expired' | 'unknown'>
+  /** The read-back seam (`LinkHostDeps.history`); absent = no read-back. Every call is recorded. */
+  history?: (before: number | null) => Promise<HistoryRead>
+  historySupported?: () => boolean
 }
 
 function setup(o: SetupOpts = {}) {
@@ -195,7 +202,18 @@ function setup(o: SetupOpts = {}) {
   const chats: unknown[] = []
   const joined: number[] = []
   const gone: string[] = []
+  /** Every read-back read, by the cursor it was asked for. */
+  const reads: (number | null)[] = []
   const host = createLinkHost(record, {
+    ...(o.history
+      ? {
+          history: (before: number | null) => {
+            reads.push(before)
+            return o.history!(before)
+          }
+        }
+      : {}),
+    ...(o.historySupported ? { historySupported: o.historySupported } : {}),
     relayUrl: 'wss://relay.test',
     mint: async () => {
       mints++
@@ -251,7 +269,7 @@ function setup(o: SetupOpts = {}) {
   })
   hosts.push(host)
   return {
-    record, host, peers, sinks, left, calls, joinArgs, joinTimes, inputs, currents, wrongs, chats, joined, gone,
+    record, host, peers, sinks, left, calls, joinArgs, joinTimes, inputs, currents, wrongs, chats, joined, gone, reads,
     keys: deriveWatchLinkKeys(secret),
     mints: () => mints,
     /** How many times the host reported a change to the registry (`onChange`). */
@@ -1059,6 +1077,112 @@ describe('createLinkHost — ending', () => {
     })
     expect(t.sinks.size).toBe(0)
     expect(t.left).toHaveLength(MAX_VIEWERS_PER_LINK)
+  })
+})
+
+describe('createLinkHost — read-back (watch:history)', () => {
+  const say = (role: 'user' | 'assistant', at: number, text: string): ChatMessage => ({ role, at, parts: [{ kind: 'text', text }] })
+  const page = (messages: ChatMessage[], olderCursor: number | null = null): HistoryRead => ({
+    kind: 'page',
+    result: { messages, found: true, olderCursor, unmatchedResults: [] }
+  })
+  const pages = (v: Viewer) => v.named(WATCH_EVENT.history) as WatchHistoryPage[]
+
+  it('tells the viewer in its meta whether read-back is there, on every link', async () => {
+    const on = setup({ role: 'viewer', historySupported: () => true })
+    on.host.start()
+    const a = await openViewer(on)
+    expect((a.named(WATCH_EVENT.meta)[0] as WatchMeta).history).toBe(true)
+    const off = setup({ role: 'viewer' })
+    off.host.start()
+    const b = await openViewer(off)
+    expect((b.named(WATCH_EVENT.meta)[0] as WatchMeta).history).toBeUndefined()
+    const throws = setup({ role: 'viewer', historySupported: () => { throw new Error('boom') } })
+    throws.host.start()
+    const c = await openViewer(throws)
+    expect((c.named(WATCH_EVENT.meta)[0] as WatchMeta).history).toBeUndefined()
+  })
+
+  it('answers a Viewer link with what was written after the link was created, and nothing before', async () => {
+    const t = setup({ role: 'viewer', history: async () => page([say('user', 9_000, 'before the link'), say('assistant', 12_000, 'after the link')], 64) })
+    t.record.createdAt = 10_000
+    t.host.start()
+    const v = await openViewer(t)
+    expect(v.c.requestHistory()).toBe(true)
+    await vi.waitFor(() => expect(pages(v)).toHaveLength(1))
+    expect(t.reads).toEqual([null])
+    expect(pages(v)[0]).toMatchObject({ before: null, status: 'ok', since: 10_000, olderCursor: null, start: 'shared' })
+    expect(JSON.stringify(pages(v)[0])).not.toContain('before the link')
+    expect(pages(v)[0].messages.map((m) => (m.parts[0] as { text: string }).text)).toEqual(['after the link'])
+    // Only the asker hears the answer: it is not a broadcast.
+    expect(t.host.viewers()).toHaveLength(1)
+  })
+
+  it('passes the cursor through, and answers it with the page it asked for', async () => {
+    const t = setup({ role: 'commenter', history: async (before) => page([say('user', 5_000, `b${before}`)], 0) })
+    t.host.start()
+    const v = await openViewer(t)
+    v.c.requestHistory(4096)
+    await vi.waitFor(() => expect(pages(v)).toHaveLength(1))
+    expect(t.reads).toEqual([4096])
+    expect(pages(v)[0]).toMatchObject({ before: 4096, olderCursor: 0, start: null })
+  })
+
+  it('says unsupported with no reader, and error on a failed read; the viewer stays connected', async () => {
+    const none = setup({ role: 'viewer' })
+    none.host.start()
+    const a = await openViewer(none)
+    a.c.requestHistory()
+    await vi.waitFor(() => expect(pages(a)).toHaveLength(1))
+    expect(pages(a)[0].status).toBe('unsupported')
+    const failing = setup({ role: 'viewer', history: async () => { throw new Error('ssh: master is gone') } })
+    failing.host.start()
+    const b = await openViewer(failing)
+    b.c.requestHistory()
+    await vi.waitFor(() => expect(pages(b)).toHaveLength(1))
+    expect(pages(b)[0]).toMatchObject({ status: 'error', messages: [] })
+    expect(b.log.closed).toBe(0)
+    expect(failing.host.viewers()).toHaveLength(1)
+  })
+
+  it('reads one page at a time per viewer, and runs only the latest request that waited', async () => {
+    let release!: () => void
+    const held = new Promise<void>((r) => (release = r))
+    let first = true
+    const t = setup({
+      role: 'viewer',
+      history: async (before) => {
+        if (first) {
+          first = false
+          await held
+        }
+        return page([say('user', 5_000, `b${before}`)], null)
+      }
+    })
+    t.host.start()
+    const v = await openViewer(t)
+    v.c.requestHistory()
+    await vi.waitFor(() => expect(t.reads).toEqual([null]))
+    v.c.requestHistory(10)
+    v.c.requestHistory(20)
+    await settleReal()
+    expect(t.reads).toEqual([null])
+    release()
+    await vi.waitFor(() => expect(pages(v)).toHaveLength(2), { timeout: 3000 })
+    expect(t.reads).toEqual([null, 20])
+    expect(pages(v).map((p) => p.before)).toEqual([null, 20])
+  })
+
+  it('ignores a malformed request: no read, no answer, no disconnect', async () => {
+    const t = setup({ role: 'viewer', history: async () => page([]) })
+    t.host.start()
+    const p = await openRaw(t)
+    p.cast(WATCH_HISTORY_CAST, [{ before: -5 }])
+    p.cast(WATCH_HISTORY_CAST, ['nope'])
+    await settleReal()
+    expect(t.reads).toEqual([])
+    expect(p.named(WATCH_EVENT.history)).toHaveLength(0)
+    expect(p.closed()).toBe(0)
   })
 })
 

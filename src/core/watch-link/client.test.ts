@@ -149,6 +149,23 @@ describe('connectWatchClient against the real relay socket', () => {
     expect(h.tunnel.at(-1)).toBe(JSON.stringify({ t: 'cast', method: 'watch:chat', args: [{ name: 'Ada', text: 'hi' }] }))
   })
 
+  it('asks for read-back only while open, with the cursor only when one is given', async () => {
+    const h = hostWith()
+    const c = connectWatchClient({ socket: h.peerT, keys: h.keys, events: events().ev })
+    expect(c.requestHistory()).toBe(false)
+    await vi.waitFor(() => expect(h.tunnel).toContain(TRUST_CONFIRM_JSON))
+    h.confirm()
+    expect(c.requestHistory()).toBe(true)
+    expect(h.tunnel.at(-1)).toBe('{"t":"cast","method":"watch:history","args":[{}]}')
+    expect(c.requestHistory(4096)).toBe(true)
+    expect(h.tunnel.at(-1)).toBe('{"t":"cast","method":"watch:history","args":[{"before":4096}]}')
+    // A cursor the host would refuse never leaves the client.
+    const n = h.tunnel.length
+    expect(c.requestHistory(-1)).toBe(false)
+    expect(c.requestHistory(1.5)).toBe(false)
+    expect(h.tunnel).toHaveLength(n)
+  })
+
   it('sends the control casts only while open, exactly as the host reads them', async () => {
     const h = hostWith()
     const { socket, sent } = counting(h.peerT)
