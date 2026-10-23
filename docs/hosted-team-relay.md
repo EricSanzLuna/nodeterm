@@ -349,11 +349,15 @@ host is a handover that started and did not finish, and the same guard applies.
 Reopening the project from "Recently closed", with ⇧⌘T, or by opening the same host and folder as an
 SSH project again, warns first:
 
-> <name> is now managed by team <team> on <host>. Open it from the team tab, or run "team unshare
-> <projectId>" on the server first.
+> <name> was handed to team <team> on <host>. The server keeps its canvas and keeps running its
+> agents, even after it is unshared. Opening it here gives one canvas two editors that can overwrite
+> each other, and its agents would start the same conversations the server is running.
 >
-> Open it here anyway? Two copies editing one canvas can overwrite each other, and its agents would
-> start the same conversations the server is running. Its agents are not resumed here automatically.
+> Open it here anyway? Its agents are not resumed here automatically.
+
+The warning offers no other way out on purpose: `team unshare` only stops sharing the project, and
+the server keeps it and its running agents, so neither the team tab (gone once it is unshared) nor
+the command gives the project back to this desktop.
 
 or, for a handover that did not finish:
 
