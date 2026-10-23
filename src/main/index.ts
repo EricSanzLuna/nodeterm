@@ -349,6 +349,7 @@ import { DRY_RUN_VERBS, dryRunRequested, dryRunRefusal } from '../shared/control
 import { browserFlagRefusal, issueFlagRefusal } from '../core/canvas-control-core'
 import { afterPrFlagRefusal } from '../shared/pr-wait'
 import { arrangeArgsRefusal } from '../shared/arrange-verb'
+import { geometryArgsRefusal } from '../shared/geometry-verbs'
 import { CONTROL_REQUEST_TIMEOUT_MS } from '../shared/control-confirm'
 import { createControlForwarder, type ControlForwardReply } from './control-forward'
 import { claimOpenedBrowser } from './browser-open-claim'
@@ -4568,6 +4569,11 @@ app.whenReady().then(async () => {
     // ran as a grid.
     const arrangeRefusal = verb === 'arrange' ? arrangeArgsRefusal(args) : null
     if (arrangeRefusal) return { ok: false, error: arrangeRefusal, message: arrangeRefusal }
+    // `resize` / `place` / `list --geometry` / a coordinate or size flag on `move` (issue #1288): same
+    // placement, same reason — without it `move --nodes a --x 10` reached the renderer and pulled a
+    // framed node out to the top level, and a bad `--width` would be the renderer's to explain.
+    const geometryRefusal = geometryArgsRefusal(verb, args)
+    if (geometryRefusal) return { ok: false, error: geometryRefusal, message: geometryRefusal }
     // A station's report about ITSELF: recorded in main's store, board-logged on its own card, and
     // never forwarded — there is no canvas work in it, and the renderer hears the store's push.
     if (verb === 'report-outcome') {

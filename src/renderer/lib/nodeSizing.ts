@@ -29,6 +29,9 @@ export const NODE_MIN_SIZES: Record<NodeKind, { width: number; height: number }>
   whiteboard: { width: 320, height: 220 }
 }
 
+/** Height of a node when collapsed (header only). Re-exported by `state/workspace`. */
+export const COLLAPSED_HEIGHT = 40
+
 export interface Rect {
   x: number
   y: number

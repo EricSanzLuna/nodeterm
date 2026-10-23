@@ -24,7 +24,7 @@ import { agentAccountColor } from '@shared/agents/account-color'
 import { boundAccountId } from '@shared/agents/account-binding'
 import { agentEnvSnapshot } from '../lib/agentEnv'
 import { uuid } from '@renderer/lib/uuid'
-import { expandRectToGrid, NODE_MIN_SIZES, snapNodeToGrid, type Rect } from '../lib/nodeSizing'
+import { COLLAPSED_HEIGHT, expandRectToGrid, NODE_MIN_SIZES, snapNodeToGrid, type Rect } from '../lib/nodeSizing'
 import { claudeCliCapsNow, grokCliCapsNow } from './permissionMode'
 import { ensureGrokTakenIds, grokTakenIdsNow } from './grokSessionIds'
 import { mintFreeGrokSessionId } from '@shared/agents/grok-session-mint'
@@ -89,8 +89,9 @@ const SIMULATOR_SIZE = { width: 360, height: 760 }
 /** Landscape and roomy: a whiteboard is for sketching, and the board pans and zooms inside itself. */
 const WHITEBOARD_SIZE = { width: 900, height: 600 }
 
-/** Height of a node when collapsed (header only). */
-export const COLLAPSED_HEIGHT = 40
+// Height of a node when collapsed (header only). Defined in lib/nodeSizing (a light module, so the
+// control listing can report a collapsed node's size without importing this one) and re-exported.
+export { COLLAPSED_HEIGHT }
 
 /** The node kinds that render a header-only collapsed state. Any other kind squashed to
  *  COLLAPSED_HEIGHT crushes its content (a group frame strands its children outside it), so
@@ -1519,6 +1520,7 @@ function groupBox(
 }
 
 import type { ArrangeLayout, GroupArrangeLayout } from '@shared/arrange-verb'
+import { ARRANGE_GAP_DEFAULT } from '@shared/arrange-verb'
 export type { ArrangeLayout, GroupArrangeLayout }
 export { GROUP_ARRANGE_LAYOUTS } from '@shared/arrange-verb'
 
@@ -1564,7 +1566,7 @@ export function arrangeNodes(
   byId = new Map(nodes.map((nd) => [nd.id, nd]))
   members = [...memberIds].flatMap((id) => byId.get(id) ?? [])
   const layout = opts?.layout ?? 'grid'
-  const gap = opts?.gap ?? 40
+  const gap = opts?.gap ?? ARRANGE_GAP_DEFAULT
   const origin = opts?.origin ?? {
     x: Math.min(...members.map((m) => m.position.x)),
     y: Math.min(...members.map((m) => m.position.y))
@@ -1779,7 +1781,7 @@ export function arrangeByLineage(
   nodes = restoreMaximizedWhere(nodes, (nd) => (nd.parentId ?? null) === containerId)
   const topLevel = nodes.filter((nd) => (nd.parentId ?? null) === containerId)
 
-  const gap = opts?.gap ?? 40
+  const gap = opts?.gap ?? ARRANGE_GAP_DEFAULT
   const origin = opts?.origin ?? {
     x: Math.min(...topLevel.map((nd) => nd.position.x)),
     y: Math.min(...topLevel.map((nd) => nd.position.y))
@@ -1871,7 +1873,7 @@ export function tidyCanvas(
   // Every unit moves, and a frame is packed at the size its (maximized) child inflated it to.
   nodes = restoreMaximizedWhere(nodes, () => true)
   const units = nodes.filter((nd) => !nd.parentId).sort(byReadingPosition)
-  const gap = opts?.gap ?? 40
+  const gap = opts?.gap ?? ARRANGE_GAP_DEFAULT
   const order = new Map(units.map((u, i) => [u.id, i]))
   const unitOf = containerAncestors(nodes, null)
 
@@ -2243,6 +2245,206 @@ export function placeNodeInRect(
 function clampToMinSize(node: CanvasNode, rect: { width: number; height: number }) {
   const min = NODE_MIN_SIZES[node.type ?? 'terminal'] ?? { width: 0, height: 0 }
   return { width: Math.max(rect.width, min.width), height: Math.max(rect.height, min.height) }
+}
+
+/** What `resizeNodes` did to one node: the size it now has, and what the reply must say about it. */
+export interface ResizeApplied {
+  id: string
+  width: number
+  /** For a COLLAPSED node this is the height it will expand to — it still draws header-only. */
+  height: number
+  /** A requested axis was outside [kind minimum, NODE_SIZE_MAX] and was held to the bound. */
+  clamped: boolean
+  /** Header-only: the width applied now, the height was recorded for when it is expanded. */
+  collapsed: boolean
+  /** It was maximized, and went back to its own rect before the new size was applied. */
+  restored: boolean
+}
+
+export type ResizeOutcome =
+  | { ok: false; error: string }
+  | {
+      ok: true
+      /** The SAME array when nothing changed — the caller's signal to skip the write. */
+      nodes: CanvasNode[]
+      applied: ResizeApplied[]
+      /** Ids that name no node, skipped (the rest still applied, like `group`). */
+      unknown: string[]
+    }
+
+/**
+ * `resize` (issue #1288): give existing nodes an explicit size, one axis or both. Pure.
+ *
+ * - **Clamped, never refused, on size**: each REQUESTED axis is held between the kind's resizer
+ *   minimum (`NODE_MIN_SIZES` — the smallest the user can drag it to; a programmatic resize bypasses
+ *   the resizer, lib/nodeSizing.ts) and `NODE_SIZE_MAX` (the ceiling of the default-size setting,
+ *   `terminalNodeSize`). An axis the caller did not name is kept as it is. `clamped` tells the reply
+ *   to say what was actually applied.
+ * - **Exact, no grid snapping.** The caller named the pixels; a snapped size is one it did not ask
+ *   for. (Align-to-grid is there for whoever wants it.)
+ * - **A group frame refuses the WHOLE call**, naming the frame: a frame is sized by what it holds
+ *   (`fitGroupToChildren`), so any size given to it is undone by the next fit. Refusing beats
+ *   resizing the rest — a refusal means nothing happened.
+ * - **Collapsed** (header-only): the width applies now; the height becomes `expandedHeight`, which
+ *   is what the expand gives back and what `flowToNodeStates` persists for a collapsed node. The
+ *   node keeps its collapsed look — expanding it is the user's call, not a side effect of sizing.
+ * - **Maximized**: restored to its own rect first, then sized. Left maximized, the explicit size
+ *   would be undone by the next panel-pin refit (`refitMaximizedNode` re-claims the viewport for
+ *   any node holding `premaxRect`), and the restore button would later teleport it back to the
+ *   old rect. Same rule every layout pass follows (`restoreMaximizedWhere`).
+ * - The stale `measured` is dropped in the same tick (as `withNodeRect` does): `flowToNodeStates`
+ *   prefers it, and a save racing the re-measure would persist the OLD size. A terminal's cols/rows
+ *   follow through its own ResizeObserver — there is no second path to tmux here.
+ * - A framed node's frame — and every frame around it — re-fits (`fitAncestorChain`), or
+ *   `extent:'parent'` clamps a child that outgrew its frame into an inverted range.
+ */
+export function resizeNodes(
+  nodes: CanvasNode[],
+  ids: readonly string[],
+  size: { width?: number; height?: number },
+  grid = 0
+): ResizeOutcome {
+  const wanted = [...new Set(ids)]
+  const byId = new Map(nodes.map((n) => [n.id, n]))
+  const unknown = wanted.filter((id) => !byId.has(id))
+  const known = wanted.filter((id) => byId.has(id))
+  if (known.length === 0) return { ok: false, error: 'resize: none of the given node ids exist' }
+  const frame = known.find((id) => byId.get(id)!.type === 'group')
+  if (frame) {
+    return {
+      ok: false,
+      error: `resize: ${frame} is a group frame — a frame sizes itself to what it holds; resize the nodes inside it, or \`arrange --group ${frame}\``
+    }
+  }
+  const set = new Set(known)
+  const wasMaximized = new Set(known.filter((id) => !!byId.get(id)!.data.premaxRect))
+  let next = restoreMaximizedWhere(nodes, (n) => set.has(n.id))
+  const applied: ResizeApplied[] = []
+  const touchedParents = new Set<string>()
+  let changed = wasMaximized.size > 0
+  next = next.map((n) => {
+    if (!set.has(n.id)) return n
+    const kind = n.type ?? 'terminal'
+    const min = NODE_MIN_SIZES[kind] ?? { width: 0, height: 0 }
+    const collapsed = !!n.data.collapsed
+    const curW = nodeW(n) || (n.style?.width as number) || 0
+    const curH = collapsed
+      ? ((n.data.expandedHeight as number | undefined) ?? COLLAPSED_FALLBACK_HEIGHT[kind] ?? 300)
+      : nodeH(n) || (n.style?.height as number) || 0
+    const hold = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v))
+    const width = size.width === undefined ? curW : hold(size.width, min.width, NODE_SIZE_MAX.width)
+    const height = size.height === undefined ? curH : hold(size.height, min.height, NODE_SIZE_MAX.height)
+    const clamped =
+      (size.width !== undefined && width !== size.width) || (size.height !== undefined && height !== size.height)
+    const restored = wasMaximized.has(n.id)
+    applied.push({ id: n.id, width, height, clamped, collapsed, restored })
+    if (samePx(curW, width) && samePx(curH, height)) return n
+    changed = true
+    if (n.parentId) touchedParents.add(n.parentId)
+    // Collapsed: it keeps drawing header-only, so only the width and the recorded expand height move.
+    const drawnH = collapsed ? ((n.height as number | undefined) ?? COLLAPSED_HEIGHT) : height
+    return {
+      ...n,
+      width,
+      height: drawnH,
+      style: { ...n.style, width, height: drawnH },
+      measured: undefined,
+      data: { ...n.data, expandedHeight: height }
+    }
+  })
+  if (!changed) return { ok: true, nodes, applied, unknown }
+  for (const parentId of touchedParents) next = fitAncestorChain(next, parentId, grid)
+  return { ok: true, nodes: next, applied, unknown }
+}
+
+/** Where `placeNodes` put one of the nodes it was asked to move, in ROOT (canvas) space. */
+export interface PlaceApplied {
+  id: string
+  x: number
+  y: number
+  /** It was maximized, and went back to its own size before it was placed. */
+  restored: boolean
+}
+
+export type PlaceOutcome =
+  | { ok: false; error: string }
+  | {
+      ok: true
+      /** The SAME array when nothing moved — the caller's signal to skip the write. */
+      nodes: CanvasNode[]
+      placed: PlaceApplied[]
+      unknown: string[]
+      /** Listed ids that rode along inside a listed frame instead of being moved twice. */
+      carried: string[]
+    }
+
+/**
+ * `place` (issue #1288): put nodes at canvas coordinates, or shift them by an offset. Pure.
+ *
+ * - **Root space in, parent kept.** `x`/`y` are canvas coordinates — the numbers `list` reports —
+ *   and a framed node STAYS in its frame: the root-space delta is applied to its parent-relative
+ *   position (the two differ by the parent chain's origin, which is not moving), and its frame plus
+ *   every frame around it re-fit to hold it (`fitAncestorChain`, which keeps root positions fixed —
+ *   so the node ends exactly where it was put). That is why this is not `move --x`: `move` without
+ *   `--group` means "to the top level".
+ * - **Several ids with `x`/`y` move as ONE block**: the set keeps its own shape and its bounding
+ *   box's top-left lands on (x, y). It is the only reading in which the call is a placement rather
+ *   than a collision — every node at the same point is not a layout — and it makes "pin this
+ *   arranged block to the corner" one call. With `dx`/`dy` each node simply shifts.
+ * - **A frame carries its subtree**: a listed frame moves with everything in it, and a listed
+ *   descendant of a listed frame is NOT moved a second time (`selectedRootIds`) — it is reported as
+ *   `carried`.
+ * - **Maximized** nodes in what moves are restored first (same reason as `resizeNodes`: left
+ *   maximized, the next panel-pin refit would put them back over the viewport). Collapsed nodes need
+ *   nothing: placement does not touch a size.
+ * - **Exact, no grid snapping** — only a frame's own re-fit snaps (to the grid, as every frame does),
+ *   and that never moves what it holds.
+ */
+export function placeNodes(
+  nodes: CanvasNode[],
+  ids: readonly string[],
+  to: { x?: number; y?: number; dx?: number; dy?: number },
+  grid = 0
+): PlaceOutcome {
+  const wanted = [...new Set(ids)]
+  const known = wanted.filter((id) => nodes.some((n) => n.id === id))
+  const unknown = wanted.filter((id) => !known.includes(id))
+  if (known.length === 0) return { ok: false, error: 'place: none of the given node ids exist' }
+  const roots = selectedRootIds(nodes, known)
+  const rootSet = new Set(roots)
+  const carried = known.filter((id) => !rootSet.has(id))
+  const moves = (n: CanvasNode): boolean => rootSet.has(n.id) || roots.some((r) => isDescendant(nodes, n.id, r))
+  const wasMaximized = new Set(roots.filter((id) => !!nodes.find((n) => n.id === id)!.data.premaxRect))
+  const restoredAny = nodes.some((n) => !!n.data.premaxRect && moves(n))
+  let next = restoreMaximizedWhere(nodes, moves)
+  const at = new Map(roots.map((id) => [id, rootPosition(next.find((n) => n.id === id)!, next)]))
+  let dx = to.dx ?? 0
+  let dy = to.dy ?? 0
+  if (to.x !== undefined || to.y !== undefined) {
+    const xs = [...at.values()].map((p) => p.x)
+    const ys = [...at.values()].map((p) => p.y)
+    dx = to.x === undefined ? 0 : to.x - Math.min(...xs)
+    dy = to.y === undefined ? 0 : to.y - Math.min(...ys)
+  }
+  const placedAt = (out: CanvasNode[]): PlaceApplied[] =>
+    roots.map((id) => {
+      const p = rootPosition(out.find((n) => n.id === id)!, out)
+      return { id, x: p.x, y: p.y, restored: wasMaximized.has(id) }
+    })
+  if (dx === 0 && dy === 0) {
+    return restoredAny
+      ? { ok: true, nodes: next, placed: placedAt(next), unknown, carried }
+      : { ok: true, nodes, placed: placedAt(nodes), unknown, carried }
+  }
+  const parents = new Set<string>()
+  next = next.map((n) => {
+    if (!rootSet.has(n.id)) return n
+    if (n.parentId) parents.add(n.parentId)
+    // `+ 0` normalizes a -0 that would otherwise ride out to project.json.
+    return { ...n, position: { x: n.position.x + dx + 0, y: n.position.y + dy + 0 } }
+  })
+  for (const parentId of parents) next = fitAncestorChain(next, parentId, grid)
+  return { ok: true, nodes: next, placed: placedAt(next), unknown, carried }
 }
 
 /**

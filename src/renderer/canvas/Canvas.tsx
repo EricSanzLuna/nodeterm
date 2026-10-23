@@ -9,7 +9,10 @@ import { VisibleMiniMap } from './VisibleMiniMap'
 import { MinimapDock } from './MinimapDock'
 import { keepGlassBlurWhileMoving } from '../lib/glassContrast'
 import { LINK_ENDPOINT_NOT_FOUND } from '@shared/canvas-link'
-import { arrangeArgsRefusal, isTopLevelGroupArg, TOP_ARRANGE_LAYOUTS } from '@shared/arrange-verb'
+import { arrangeArgsRefusal, isTopLevelGroupArg, parseArrangeGap, TOP_ARRANGE_LAYOUTS } from '@shared/arrange-verb'
+import { geometryArgsRefusal, listGeometryRequested, parsePlaceArgs, parseResizeArgs } from '@shared/geometry-verbs'
+import { liveNodeGeometry } from '../lib/nodeGeometry'
+import { placeReply, resizeReply } from '../lib/geometryReply'
 import { createControlOpenBatch } from '../lib/controlOpenBatch'
 import { commitOwnedLaunchAttempt, registerLaunchCommit } from '../terminal/launch-attempt'
 import { hasLaunchWriter, launchCommand } from '../terminal/launch-command'
@@ -959,6 +962,8 @@ import {
   refitMaximizedNode,
   restoreMaximizedNode,
   placeNodeInRect,
+  placeNodes,
+  resizeNodes,
   terminalNodeSize,
   type CanvasNode
 } from '../state/workspace'
@@ -13137,6 +13142,15 @@ export function Canvas() {
       // each runs the SAME validation as a real call and stops just before the mutation.
       const dryRun = dryRunRequested(args)
       const DRY_RUN_PREFIX = 'DRY RUN — nothing was opened or changed.'
+      // The geometry flags' shape (`resize`, `place`, `list --geometry`, a coordinate on `move`):
+      // refused in main already (`geometryArgsRefusal`); this is the belt, and it sits BEFORE the
+      // routing so both `list` answers (live and stored) and every verb case read only a well-formed
+      // request — nothing below has to re-decide what a bad `--width` means.
+      const geometryRefusal = geometryArgsRefusal(verb, args)
+      if (geometryRefusal) {
+        reply({ ok: false, error: geometryRefusal })
+        return
+      }
 
       // `--issue` (open-agent / open-claude): the GitHub issue the new session is started on. Its
       // SHAPE was refused in main (`issueFlagRefusal`); what `#N` means is this renderer's question,
@@ -14015,11 +14029,13 @@ export function Canvas() {
             return
           }
           if (!needsLiveCanvas(verb)) {
+            // Stored nodes carry their persisted geometry, which the listing turns into each row's
+            // place and size (nothing off screen was measured — see lib/nodeGeometry).
             const rows = storedNodeListing(projects.find((p) => p.id === route.projectId)?.nodes ?? [], useAgentStatus.getState().byId, useLaunchDelivery.getState().byId, Date.now(), useStationOutcomes.getState().byId, useStationHandovers.getState().byId)
             reply({
               ok: true,
               result: rows,
-              message: controlListingText(rows)
+              message: controlListingText(rows, { geometry: listGeometryRequested(args) })
             })
             return
           }
@@ -14743,12 +14759,15 @@ export function Canvas() {
             // separately would be seven round trips to learn the one thing that changes what it
             // does next.
             const st = useAgentStatus.getState().byId
+            // Geometry is the MEASURED size on the live canvas (`liveNodeGeometry`), the persisted one
+            // only for a node React Flow has not measured yet.
             const list = storedNodeListing(nodesRef.current.map((n) => ({
               id: n.id, kind: n.type, title: n.data.title as string,
               pendingLaunch: n.data.pendingLaunch, agentId: n.data.agentId as string | undefined,
-              issueRef: n.data.issueRef
+              issueRef: n.data.issueRef,
+              geometry: liveNodeGeometry(n, nodesRef.current)
             })), st, useLaunchDelivery.getState().byId, Date.now(), useStationOutcomes.getState().byId, useStationHandovers.getState().byId)
-            reply({ ok: true, result: list, message: controlListingText(list) })
+            reply({ ok: true, result: list, message: controlListingText(list, { geometry: listGeometryRequested(args) }) })
             return
           }
           case 'open-terminal': {
@@ -15199,6 +15218,45 @@ export function Canvas() {
             reply({ ok: true, message: `moved ${moved.length} node(s) ${where}`, result: { moved, group: targetGroup } })
             return
           }
+          case 'resize': {
+            // Size existing nodes (issue #1288). The rules — kind minimum and canvas maximum, frames
+            // refused, collapsed/maximized handled, ancestor frames re-fitted — are all
+            // `resizeNodes`; this case only parses, writes on a change and says what was applied.
+            const req = parseResizeArgs(args)
+            if ('error' in req) {
+              reply({ ok: false, error: req.error })
+              return
+            }
+            const live = ctlNodes()
+            const out = resizeNodes(live, req.ids, { width: req.width, height: req.height }, snapGridNow())
+            if (!out.ok) {
+              reply({ ok: false, error: out.error })
+              return
+            }
+            // The SAME array means every node already had that size: an answer, nothing to write.
+            if (out.nodes !== live) commitCtlNodes(out.nodes)
+            reply({ ok: true, ...resizeReply(out, out.nodes !== live) })
+            return
+          }
+          case 'place': {
+            // Put nodes at canvas coordinates, or shift them (issue #1288). NOT a flag on `move`:
+            // without `--group`, `move` takes a node out of its frame. `placeNodes` keeps the parent,
+            // converts root space to parent-relative and re-fits the frames around what moved.
+            const req = parsePlaceArgs(args)
+            if ('error' in req) {
+              reply({ ok: false, error: req.error })
+              return
+            }
+            const live = ctlNodes()
+            const out = placeNodes(live, req.ids, req, snapGridNow())
+            if (!out.ok) {
+              reply({ ok: false, error: out.error })
+              return
+            }
+            if (out.nodes !== live) commitCtlNodes(out.nodes)
+            reply({ ok: true, ...placeReply(out, req, out.nodes !== live) })
+            return
+          }
           case 'arrange':
           case 'align': {
             const live = ctlNodes()
@@ -15210,6 +15268,10 @@ export function Canvas() {
               reply({ ok: false, error: shapeRefusal })
               return
             }
+            // `--gap` (issue #1288), well-formed by now (the gate above): every arrange form passes it
+            // on; absent stays `undefined`, so each transform keeps its own default. `align` has none.
+            const parsedGap = parseArrangeGap(args.gap)
+            const gap = 'gap' in parsedGap ? parsedGap.gap : undefined
             // `arrange --group <frameId>`: name the FRAME instead of listing its children. The
             // whole rule set is `arrangeGroupChildren` — the same transform the frame's menu rows
             // and the palette run — so this branch only parses, refuses by name and replies.
@@ -15225,7 +15287,7 @@ export function Canvas() {
               // that owns the caller — the same pure transforms the pane menu runs.
               if (isTopLevelGroupArg(gid)) {
                 const topLayout = TOP_ARRANGE_LAYOUTS.find((l) => l === args.layout) ?? 'tidy'
-                const next = topLayout === 'lineage' ? arrangeByLineage(live, edges) : tidyCanvas(live, edges)
+                const next = topLayout === 'lineage' ? arrangeByLineage(live, edges, { gap }) : tidyCanvas(live, edges, { gap })
                 const count = live.filter((nd) => !nd.parentId).length
                 if (next !== live) commitCtlNodes(next)
                 reply({
@@ -15249,7 +15311,7 @@ export function Canvas() {
                 return
               }
               const cols = args.cols ? parseInt(args.cols, 10) || undefined : undefined
-              const next = arrangeGroupChildren(live, gid, { layout: groupLayout, cols, edges, grid: snapGridNow() })
+              const next = arrangeGroupChildren(live, gid, { layout: groupLayout, cols, gap, edges, grid: snapGridNow() })
               const count = live.filter((nd) => nd.parentId === gid).length
               // The SAME array means every item already sat where the layout puts it: an answer,
               // not a failure — and nothing to write.
@@ -15295,7 +15357,7 @@ export function Canvas() {
             const layout = (['grid', 'row', 'column'] as const).find((l) => l === args.layout) ?? 'grid'
             const cols = args.cols ? parseInt(args.cols, 10) || undefined : undefined
             let next = verb === 'arrange'
-              ? arrangeNodes(live, ids, { layout, cols })
+              ? arrangeNodes(live, ids, { layout, cols, gap })
               : alignNodes(live, ids, edge!)
             // Tidying a frame's children usually leaves the frame the wrong size (it was sized to
             // their old scattered spots) — hug the new layout, and re-fit every ANCESTOR frame too:

@@ -892,6 +892,17 @@ named refusal. Validate Server upgrades against a disposable data directory and 
 shared live service is
 an explicit operator action, never a test or an automatic repair step.
 
+**A canvas-control verb you add in `Canvas.tsx` does not exist on the Server Edition.** The verbs
+run in the DESKTOP renderer's dispatch; the browser bridge never subscribes to `onAgentControl`, and
+the Server Edition answers `/control/*` itself (`src/server/control-unsupported.ts`), serving only
+`SERVER_V1_VERBS` through the headless node factory. Everything else — `list`, `arrange`, `move`,
+`resize`, `place` included — gets the named permanent `control-unsupported-on-this-edition` refusal.
+So "it is in the renderer, so both shells have it" is false here; either add a headless action or
+leave the refusal, and pin which in `control-unsupported.test.ts`. A new verb's flag gate goes in
+`src/shared` and is called from desktop main's control handler too (it never runs
+`parseControlRequest`), and a new verb should refuse a flag it does not read by name (#539) rather
+than ignore it.
+
 **A plain terminal is not a Claude node.** It may carry the generic node/endpoint wiring needed for
 a hand-launched agent to report hooks, but it gets no `NODETERM_AGENT_ID` and no
 `NODETERM_CANVAS_CONTROL` until the serialized node explicitly names an agent.
