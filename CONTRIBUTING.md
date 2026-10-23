@@ -661,7 +661,9 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   - A surface that mounts a terminal outside the canvas (the kanban card modal — both boards live
     under App's LOCAL provider) runs under `sessionForProject(<its project>)` and provides
     `OwningProjectContext`: wrap it in `ProjectSessionScope` (`session/owning-project.ts`). A new
-    terminal-creating path also asks `spawnBelongsElsewhere` before its first create. A component
+    terminal-creating path also asks `spawnBelongsElsewhere(isRemoteProjectId(<owning project>),
+    session.source)` before its first create; ask `isRemoteProjectId` (session.ts), never
+    `getProject(id)?.remote`, which misses a tab the store deleted. A component
     under it that keys data by project (the board log, card metadata, pull requests) reads
     `useOwningProjectId() ?? activeProjectId`, never `activeProjectId` alone: on the Omni board the
     card's project is not the active one, and its `useSession()` api answers for the card's project.

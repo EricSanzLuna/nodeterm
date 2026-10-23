@@ -574,29 +574,44 @@ project's nodes only.** The contract:
   layers besides the keying above:
   (1) `sessionForProject` resolves a REMOTE project (`remote` in the store, or bound while remote in
   this run) with no live binding to the OFFLINE relay session (`OFFLINE_RELAY_SESSION_ID`,
-  `session/offline-relay-session.ts`: `source 'relay'`, `status 'offline'`, every core call
-  rejects), never the local one. Lifecycle code asking "which session is bound to this tab?" (dispose
-  it, reconnect it) asks `boundSessionForProject`, which never answers the sentinel.
+  `session/offline-relay-session.ts`: `source 'relay'`, `status 'offline'`), never the local one.
+  Its core-bound calls (pty, fs, git, workspace, …) reject, so no terminal can be created here; it
+  is not a wall around this machine, since its api spreads `...local` like a live relay tab's (the
+  local namespaces — contextLink, transcripts, handoff, media — still act here, and its `boardLog`
+  read answers `unsupported`). "Is this project remote?" is ONE predicate, `isRemoteProjectId`
+  (session.ts), shared by this resolution and the spawn refusal in (3). Lifecycle code asking "which
+  session is bound to this tab?" (dispose it, reconnect it) asks `boundSessionForProject`, which
+  never answers the sentinel.
   (2) A surface that mounts a project's node OUTSIDE Canvas's node subtree runs under that project's
   session. Both kanban boards render under App's LOCAL provider, so each mounts its card modal
   through `ProjectSessionScope` (`session/owning-project.ts`: `sessionForProject(<card's project>)`,
   keyed by session id, plus `OwningProjectContext`). Before it, opening a team tab's terminal card
-  created the host's node id on this desktop every time. Nothing under the modal reads or writes
-  this machine's core for the host's node any more: the terminal runs under the card project's
-  session, the comments panel and the card metadata key the board log on the card's project
-  (`useOwningProjectId() ?? activeProjectId` — on the Omni board a lane is not the active project,
-  and pairing the lane's api with the active id blanked its comments and saved new ones nowhere), a
-  relay card's file links are switched off (`cardFileLinkRoute`) and its ⌘M chat is refused
-  (`stub.chat`, `E_UNSUPPORTED`). The session is resolved at render, so a reconnect while a modal is
-  open takes effect at the board's next render.
-  (3) TerminalNode and ModalTerminal ask `spawnBelongsElsewhere(project, session.source)` (the
-  project from `OwningProjectContext`) before any SSH resolve or create: a remote project under a
+  created the host's node id on this desktop every time. The terminal, the comments, the metadata
+  strip and the pull-request panel now act on the card's project (`useOwningProjectId() ??
+  activeProjectId`): the terminal runs under the card project's session, the comments panel reads
+  and writes that project's board log, the metadata strip's member pool reads it, and the
+  pull-request panel reads that project's pull requests, SSH flag and auto-move target. On the Omni
+  board a lane is not the active project: pairing the lane's api with the active id blanked a relay
+  lane's comments and saved new ones nowhere, and on a local lane filed them into the ACTIVE
+  project's board log. A relay card's file links are switched off (`cardFileLinkRoute`) and its ⌘M
+  chat is refused (`stub.chat`, `E_UNSUPPORTED`). **Known exceptions (pre-existing, follow-up):** the
+  icon picker (`NodeIconPicker.chooseImage` resolves the ACTIVE project, so a team lane's card
+  opened while a local project is active copies the picked image into the local project's
+  `.nodeterm/images/`), and dictation and file-drop uploads in a relay card, which act on this
+  machine. The session is resolved at render, so a reconnect while a modal is open takes effect at
+  the board's next render.
+  (3) TerminalNode and ModalTerminal ask `spawnBelongsElsewhere(isRemoteProjectId(owner),
+  session.source)` (`owner` from `OwningProjectContext`; the predicate is the one (1) uses, so a tab
+  the store deleted still counts) before any SSH resolve or create: a remote project under a
   non-relay session starts nothing and writes a gray "belongs to a remote project that is not
   connected here" line. ModalTerminal mirrors TerminalNode's `dialsSsh` (a relay card's SSH-project
   node is joined by the HOST with `requireRemote`; this machine dials, refuses and reports nothing
   for it), and a non-dialing node's `ownerProjectId` is the owning project, else the active one.
-  `components/kanban/cardModalSession.test.tsx` renders both boards' modals under real sessions;
-  `session/offline-relay-session.test.ts` replays the switches.
+  `components/kanban/cardModalSession.test.tsx` renders both boards with real sessions and a probe
+  in place of CardModal, asserting which session and owning project each modal mount gets, plus
+  source pins for the two terminals; `components/kanban/boardLogPanelSession.test.tsx` and
+  `cardOwnerProject.test.tsx` render the real comments panel, metadata strip and pull-request panel
+  under a lane's `ProjectSessionScope`; `session/offline-relay-session.test.ts` replays the switches.
 - Switching away unmounts the old project's `TerminalNode`s → their tmux clients detach but
   the sessions keep running; switching back reattaches. tmux session names are per-node-id
   (globally unique), so projects never collide.
@@ -9896,7 +9911,8 @@ under one `$HOME`, with different bytes; the last writer wins.
 `context:update` metadata (deploy one core per team); a viewer's socket backlog over 1 MB still
 pauses the shared pty through Stage 2 backpressure; the canvas authority's own limits (a project's
 non-content fields stay last writer wins between tabs, the share-time window, oversized nodes, board
-edits to another core, load-time repairs that are never cast) are under "Known limits" in the doc.
+edits to another core, load-time repairs that are never cast, the GitHub issue summary modal's
+"Agent runs" log on a relay tab) are under "Known limits" in the doc.
 
 **Surfaces:** Desktop is full (joiner, plus approval and invite code in an owner's hosted tab, plus
 Share with team from any desktop OS onto a Linux host). Server Edition is the host (the `team` CLI,

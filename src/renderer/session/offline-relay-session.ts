@@ -32,8 +32,11 @@ export function deadRelayTransport(): FrameTransport {
 /**
  * The api of the offline relay session an unbound REMOTE project resolves to (session.ts,
  * `sessionForProject`). It is a real relay api — the same core-bound / local split a live relay tab
- * has — over a dead carrier, so everything core-bound (pty, fs, git, workspace, files, …) rejects and
- * nothing a node mounts can reach THIS machine's core under a node id that lives on another machine.
+ * has — over a dead carrier, so every core-bound call (pty, fs, git, workspace, files, …) rejects:
+ * no terminal can be created on THIS machine's core under a node id that lives on another machine.
+ * It is not a wall around this machine: like a live relay tab's api it spreads `...local`, so the
+ * namespaces a relay tab keeps local (contextLink, transcripts, handoff, media, the app-global ones)
+ * still act here, and its `boardLog` read answers `unsupported: true` rather than rejecting.
  * Built here rather than in session.ts because relay-api imports session.ts.
  */
 export function offlineRelayApi(): NodeTerminalApi {
