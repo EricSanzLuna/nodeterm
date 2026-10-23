@@ -12,6 +12,7 @@ import path from 'path'
 import { initPlatform, resetPlatformForTests } from './platform'
 import { fakePlatform } from './platform-fake'
 import { WorkspaceStore } from './workspace-store'
+import { readWhiteboard, saveWhiteboard } from './whiteboards'
 import type { CanvasNodeState, Project, Workspace } from '../shared/types'
 
 let userData: string
@@ -169,6 +170,48 @@ describe('its side files', () => {
     expect(store.sideFilesFolderForProject('project-ref')).toBe(folder + '-b')
     expect(store.boardLogRootForProject('project-ref')).toBe(folder + '-b')
     await fs.rm(folder + '-b', { recursive: true, force: true })
+  })
+
+  it("whiteboards live in its app-data root, never in the folder, and are not shared by node id", async () => {
+    // Two folders holding the same committed canvas (a worktree, a second checkout) share node ids.
+    // In their folders each board has its own file; in app data they must not share one either.
+    const store = new WorkspaceStore()
+    await store.save(ws([project(), project({ id: 'project-p2', cwd: folder + '-b' })]))
+    const board = (id: string) => ({ ...store.whiteboardLocationForProject(id), userDataDir: userData })
+    const scene = JSON.stringify({ type: 'excalidraw', elements: [{ id: 'mine' }] })
+
+    const saved = await saveWhiteboard(board('project-p1'), 'whiteboard-1', scene)
+    expect(saved).toMatchObject({
+      ok: true,
+      path: path.join(userData, 'project-files', 'project-p1', '.nodeterm', 'whiteboards', 'whiteboard-1.excalidraw')
+    })
+    expect(await fs.readdir(folder)).toEqual([])
+    expect(await readWhiteboard(board('project-p2'), 'whiteboard-1')).toBeNull()
+
+    // Deleting the project takes its boards with its other app-data side files.
+    await store.save(ws([project({ id: 'project-p2', cwd: folder + '-b' })]))
+    expect(await readWhiteboard(board('project-p1'), 'whiteboard-1')).toBeNull()
+    await fs.rm(folder + '-b', { recursive: true, force: true })
+  })
+
+  it('whiteboard locations: a folder ref writes its folder; a cwd-less canvas has none', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([
+      project({ id: 'project-ref', storeInAppData: undefined }),
+      project({ id: 'project-inline', storeInAppData: undefined, cwd: undefined })
+    ]))
+    // A folder ref writes its folder and reads, after it, what it drew while it was in app data.
+    expect(store.whiteboardLocationForProject('project-ref')).toEqual({
+      projectCwd: folder, readOnlyRoot: path.join(userData, 'project-files', 'project-ref')
+    })
+    // A cwd-less canvas (and an unknown id) takes the app folder alone.
+    expect(store.whiteboardLocationForProject('project-inline')).toEqual({})
+    expect(store.whiteboardLocationForProject('no-such-project')).toEqual({})
+    // A folder project in app data writes its app-data root and only reads its folder.
+    await store.save(ws([project({ id: 'project-ref' })]))
+    expect(store.whiteboardLocationForProject('project-ref')).toEqual({
+      projectCwd: path.join(userData, 'project-files', 'project-ref'), createRoot: true, readOnlyRoot: folder
+    })
   })
 })
 

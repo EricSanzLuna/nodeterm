@@ -11,6 +11,11 @@
 // the remote host) or a project folder that has been deleted — the same cases, for the same
 // reasons, as `canvasImageTarget` in canvas-images.ts.
 //
+// A folder project whose canvas is kept in app data (issue #1145) writes nothing into its folder:
+// its boards go to the same layout under its own app-data root (`appDataProjectRoot` in
+// workspace-store.ts), and the folder's boards — drawn before the move — are only read. See
+// `WhiteboardLocation`.
+//
 // **The path is derived HERE from (project, node id), never accepted from the renderer.** A
 // node's data comes from the git-shared project.json, which anyone with commit access can edit;
 // taking a path from it would let a crafted canvas aim a read or an overwrite anywhere this
@@ -48,7 +53,20 @@ export const WHITEBOARD_SCENE_MAX_BYTES = 64 * 1024 * 1024
 export const WHITEBOARD_THUMB_MAX_BYTES = 16 * 1024 * 1024
 
 export interface WhiteboardLocation {
+  /** The directory whose `.nodeterm/whiteboards/` takes this project's boards. */
   projectCwd?: string
+  /**
+   * `projectCwd` is the app's own directory — a folder project kept in app data, whose root is
+   * `appDataProjectRoot` — so a write creates it. Never set for a user's folder: one that is gone
+   * is not resurrected.
+   */
+  createRoot?: boolean
+  /**
+   * A root that is READ and never written: the other side of a folder project that moved its canvas
+   * between its folder and app data (issue #1145), so a board drawn before the move still opens.
+   * Read after every folder a save can land in, so a board saved since is never shadowed by it.
+   */
+  readOnlyRoot?: string
   userDataDir: string
 }
 
@@ -83,7 +101,8 @@ const within = (root: string, child: string): boolean => {
  * `.nodeterm` that links out of the project would make `whiteboards` on the other side. A project
  * folder that is GONE is refused too, so a write never resurrects a directory the user deleted.
  */
-async function projectBoardsDir(projectCwd: string, create: boolean): Promise<string | null> {
+async function projectBoardsDir(projectCwd: string, create: boolean, createRoot = false): Promise<string | null> {
+  if (create && createRoot) await fs.mkdir(projectCwd, { recursive: true }).catch(() => undefined)
   const root = await fs.realpath(projectCwd).catch(() => null)
   if (!root || !(await fs.stat(root).then((s) => s.isDirectory(), () => false))) return null
   const boards = join(root, '.nodeterm', 'whiteboards')
@@ -109,14 +128,19 @@ async function projectBoardsDir(projectCwd: string, create: boolean): Promise<st
 
 /** The folders a board may be in, most specific first. `write` creates the project's folder; a read
  *  only looks in one that exists. A project folder that cannot be used (see `projectBoardsDir`) is
- *  left out, so the board lands in — or is read from — the app folder alone. */
+ *  left out, so the board lands in — or is read from — the app folder alone. The read-only root is
+ *  never a write target, and a read reaches it last. */
 async function candidateDirs(loc: WhiteboardLocation, write: boolean): Promise<string[]> {
   const dirs: string[] = []
   if (loc.projectCwd) {
-    const dir = await projectBoardsDir(loc.projectCwd, write).catch(() => null)
+    const dir = await projectBoardsDir(loc.projectCwd, write, loc.createRoot === true).catch(() => null)
     if (dir) dirs.push(dir)
   }
   dirs.push(appWhiteboardsDir(loc.userDataDir))
+  if (!write && loc.readOnlyRoot) {
+    const dir = await projectBoardsDir(loc.readOnlyRoot, false).catch(() => null)
+    if (dir && !dirs.includes(dir)) dirs.push(dir)
+  }
   return dirs
 }
 

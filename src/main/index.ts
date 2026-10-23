@@ -2117,8 +2117,11 @@ app.whenReady().then(async () => {
   // `localProjectCwd` is how a canvas image finds the project's own `.nodeterm/images/`. It
   // answers undefined for an SSH project (its cwd is on the host, and the image node reads
   // locally) and for a relay tab (not in this index at all) — both take the app-local fallback.
+  // `whiteboardLocation` is the same idea for a whiteboard, except that a folder project kept in app
+  // data keeps its boards in its own app-data root (see `whiteboardLocationForProject`).
   registerFsHandlers(corePlatform, {
-    localProjectCwd: (projectId: string) => workspaceStore.sideFilesFolderForProject(projectId)
+    localProjectCwd: (projectId: string) => workspaceStore.sideFilesFolderForProject(projectId),
+    whiteboardLocation: (projectId: string) => workspaceStore.whiteboardLocationForProject(projectId)
   })
 
   const githubSecret = new ElectronGitHubSecretStore(app.getPath('userData'), safeStorage)

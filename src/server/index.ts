@@ -377,7 +377,8 @@ export async function startServer(
     getSettings: () => settingsStore.get(),
     onSettingsChange: (cb) => settingsStore.onChange(cb),
     downloadTickets,
-    localProjectCwd: (projectId: string) => workspaceStore.sideFilesFolderForProject(projectId)
+    localProjectCwd: (projectId: string) => workspaceStore.sideFilesFolderForProject(projectId),
+    whiteboardLocation: (projectId: string) => workspaceStore.whiteboardLocationForProject(projectId)
   })
   // Project setup/archive runner — same construction as src/main/index.ts, and the SAME
   // `registerProjectSetupHandlers` trust boundary (project-setup-handlers.ts): it derives rootPath/

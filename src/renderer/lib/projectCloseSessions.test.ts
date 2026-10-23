@@ -88,7 +88,7 @@ describe('deleteConfirmCopy', () => {
 
   it('a project stored in app data: says the canvas goes with it (#1145)', () => {
     const c = deleteConfirmCopy({ ...project({ nodes: [{ id: 't1' }] }), storeInAppData: true })
-    expect(c.message).toContain('the canvas, its project settings and its board log are: they were stored in app data')
+    expect(c.message).toContain('not deleted, but the canvas, project settings, board log and whiteboards it kept in app data are.')
     expect(c.message).not.toContain('.nodeterm/project.json')
   })
 

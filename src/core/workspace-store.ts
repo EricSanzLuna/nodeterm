@@ -23,6 +23,7 @@ import {
 } from './workspace-files'
 import { projectSettingsPath, readProjectSettingsFile, writeProjectSettingsFile } from './project-settings-files'
 import { gitTracksFile } from './git-tracked'
+import type { WhiteboardLocation } from './whiteboards'
 import type { PrepareFolderStorageResult, ProjectStorageKind, ReleaseFolderFilesResult } from '../shared/project-storage'
 import {
   parseProjectSettingsFile, sameProjectSettingsContent, sanitizeProjectLocalSettings,
@@ -2234,6 +2235,27 @@ export class WorkspaceStore {
   sideFilesFolderForProject(projectId: string): string | undefined {
     const e = this.index?.entries.find((x) => x.id === projectId)
     return e ? folderFileCwd(e) : undefined
+  }
+
+  /**
+   * Where a project's whiteboards live (core/whiteboards.ts), without the app folder every location
+   * falls back to. A folder ref writes `<cwd>/.nodeterm/whiteboards/` and reads, after it, what it
+   * drew while its canvas was kept in app data. A folder-data-ref writes the same layout under its
+   * app-data root and only READS its folder, where the boards drawn before the move still are
+   * (issue #1145: nothing is written into the folder). Not the canvas images' answer
+   * (`sideFilesFolderForProject`): the app's shared image folder is keyed by file name, while a board
+   * is keyed by node id, which two folders holding the same committed canvas share — in one shared
+   * folder, two such projects in app data would read and overwrite each other's boards. SSH and
+   * cwd-less projects answer `{}`: the app folder alone.
+   */
+  whiteboardLocationForProject(projectId: string): Omit<WhiteboardLocation, 'userDataDir'> {
+    const e = this.index?.entries.find((x) => x.id === projectId)
+    if (!e || e.ssh) return {}
+    const appData = isInlineProjectFileId(e.id) ? appDataProjectRoot(e.id) : undefined
+    if (isFolderDataRef(e)) return appData ? { projectCwd: appData, createRoot: true, readOnlyRoot: e.cwd } : {}
+    const cwd = folderFileCwd(e)
+    if (!cwd) return {}
+    return appData ? { projectCwd: cwd, readOnlyRoot: appData } : { projectCwd: cwd }
   }
 
   /**
