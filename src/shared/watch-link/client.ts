@@ -1,15 +1,15 @@
 // The browser half of a live link: the CLIENT role of src/core/relay/relay-socket.ts (handshake,
 // sealed frames, keepalive) plus the trust gate's client obligation (send our own trust:confirm,
 // open only once the host's arrives). After the handshake it sends only its own trust:confirm,
-// keepalives, and the viewer's casts: chat (`sendChat`) and, on a Control link, unlock / input /
-// release. Whether a cast is accepted is the link host's decision, and an obligation on it: chat only
+// keepalives, and the viewer's casts: read-back (`requestHistory`), chat (`sendChat`) and, on a
+// Control link, unlock / input / release. Whether a cast is accepted is the link host's decision, and an obligation on it: chat only
 // on a Commenter or Control link, input only from a viewer that unlocked with the link's password.
 // Nothing on this side enforces that; `sendInput`'s size cap only keeps an oversized cast off the wire.
 import nacl from 'tweetnacl'
 import { b64ToBytes, bytesToB64, concatBytes, utf8 } from './bytes'
 import { hkdfSha256 } from './hkdf'
 import type { WatchLinkKeys } from './keys'
-import { INPUT_MAX, WATCH_CHAT_CAST, WATCH_INPUT_CAST, WATCH_RELEASE_CAST, WATCH_UNLOCK_CAST } from './protocol'
+import { INPUT_MAX, WATCH_CHAT_CAST, WATCH_HISTORY_CAST, WATCH_INPUT_CAST, WATCH_RELEASE_CAST, WATCH_UNLOCK_CAST, readHistoryRequest } from './protocol'
 import {
   NONCE_BYTES, RELAY_SESSION_INFO, ROLE_CLIENT, ROLE_HOST, TAG_RPC, TAG_TUNNEL_BIN, TAG_TUNNEL_TEXT,
   decodePtyFrame, openBox, parseTunnelJson, readHeader, sealBox, withHeader
@@ -44,6 +44,10 @@ export interface WatchClientEvents {
  * own the client never reaches a terminal event: no `onOpen`, `onDenied` or `onClose`.
  */
 export interface WatchClient {
+  /** Ask for a page of the agent's conversation since the link was shared: the newest, or the one
+   *  before `before` (a page's `olderCursor`). The answer is a `watch:history` event. A cursor the host
+   *  would refuse is refused here (false, nothing sent). */
+  requestHistory(before?: number): boolean
   sendChat(name: string, text: string): boolean
   /** Ask to type, with the link's password. The answer is a `watch:control` event, not a return value. */
   unlock(name: string, password: string): boolean
@@ -216,6 +220,11 @@ export function connectWatchClient(opts: {
   }
 
   return {
+    requestHistory(before) {
+      const arg = before === undefined ? {} : { before }
+      if (readHistoryRequest(arg) === null) return false
+      return cast(WATCH_HISTORY_CAST, [arg])
+    },
     sendChat: (name, text) => cast(WATCH_CHAT_CAST, [{ name, text }]),
     unlock: (name, password) => cast(WATCH_UNLOCK_CAST, [{ name, password }]),
     sendInput(data) {

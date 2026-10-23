@@ -14,7 +14,9 @@ export const WATCH_EVENT = {
    *  under it (turned off, locked). The initial state rides `watch:meta`. */
   control: 'watch:control',
   /** To every joined viewer: who typed in the last few seconds (`WatchTypingEvent`). */
-  typing: 'watch:typing'
+  typing: 'watch:typing',
+  /** To ONE viewer, the answer to its `watch:history` cast (`WatchHistoryPage`). */
+  history: 'watch:history'
 } as const
 /** A viewer's chat line (Commenter and Control links). */
 export const WATCH_CHAT_CAST = 'watch:chat'
@@ -47,6 +49,20 @@ export const WATCH_UNLOCK_CAST = 'watch:unlock'
 export const WATCH_INPUT_CAST = 'watch:input'
 /** Control links only: drop the sender back to watching. No arguments. */
 export const WATCH_RELEASE_CAST = 'watch:release'
+/**
+ * Every role: one page of the watched agent's CONVERSATION, never the terminal's history. The stream
+ * is a tmux client painting on the alternate screen, so the viewer's emulator has nothing to scroll;
+ * this is how a viewer reads back. `{ before?: number }` (`readHistoryRequest`): absent for the
+ * newest page, else the `olderCursor` of the previous answer. Answered to that viewer alone with
+ * `watch:history`.
+ *
+ * THE CUTOFF. A page holds only messages written at or after the moment the link was created
+ * (`WatchHistoryPage.since`, the host's clock). A message with no time is never sent: nothing proves
+ * it came after. What the link exposes is therefore what the terminal showed while it was shared, as
+ * text, and nothing from before. Tool results are never sent (the screen shows a few lines of them
+ * at most), and neither is the agent's thinking.
+ */
+export const WATCH_HISTORY_CAST = 'watch:history'
 
 /** A Control link (`controller`) is a Commenter link plus typing for whoever unlocks it with the
  *  link's password. Every addition to this protocol is additive, so `WATCH_PROTOCOL_VERSION` stays 1:
@@ -71,6 +87,9 @@ export interface WatchMeta {
   rows: number
   /** A Control link's state for THIS viewer at join; absent on every other role. */
   control?: WatchControlEvent
+  /** Present (true) when the watched node is an agent whose conversation `watch:history` can read
+   *  back. Absent: a plain terminal, or a host older than read-back. */
+  history?: true
 }
 
 /** `controlling`: this viewer may type. `available`: a Control link this viewer may unlock.
@@ -189,3 +208,153 @@ function clean(raw: unknown, max: number): string | null {
 }
 export const sanitizeChatText = (raw: unknown): string | null => clean(raw, CHAT_TEXT_MAX)
 export const sanitizeChatName = (raw: unknown): string | null => clean(raw, CHAT_NAME_MAX)
+
+// --- read-back (`watch:history`) --------------------------------------------------------------------
+
+/** Why a page holds no messages: `unsupported` — the node is not an agent with a readable
+ *  conversation; `untimed` — its conversation states no times, so nothing in it can be shown as
+ *  written after the link was shared; `error` — the host could not read it (try again). */
+export const HISTORY_STATUSES = ['ok', 'unsupported', 'untimed', 'error'] as const
+export type WatchHistoryStatus = (typeof HISTORY_STATUSES)[number]
+/** Why there is nothing older (only when `olderCursor` is null): `shared` — the page reached the
+ *  moment the link was created; `conversation` — it reached the start of the conversation;
+ *  `cut` — the host's reader for this agent cannot page further back. */
+export const HISTORY_STARTS = ['shared', 'conversation', 'cut'] as const
+export type WatchHistoryStart = (typeof HISTORY_STARTS)[number]
+export type WatchHistoryPart = { kind: 'text'; text: string } | { kind: 'tool'; name: string; arg: string }
+export interface WatchHistoryMessage {
+  role: 'user' | 'assistant'
+  /** When the line was written, epoch ms on the host's clock; never before `since`. */
+  at: number
+  parts: WatchHistoryPart[]
+}
+export interface WatchHistoryPage {
+  /** The cursor this page answers (`null`: the newest page). */
+  before: number | null
+  status: WatchHistoryStatus
+  /** When the link was created (the host's clock): nothing older is ever on a page. */
+  since: number
+  /** Oldest first. */
+  messages: WatchHistoryMessage[]
+  /** Ask for this as `before` to read older messages; null when there is nothing older to show. */
+  olderCursor: number | null
+  /** Why there is nothing older; null while `olderCursor` is set. */
+  start: WatchHistoryStart | null
+}
+
+/** One text part, in UTF-16 units (the cut ends in `…`). */
+export const HISTORY_TEXT_MAX = 20_000
+export const HISTORY_TOOL_NAME_MAX = 64
+export const HISTORY_TOOL_ARG_MAX = 200
+export const HISTORY_PARTS_MAX = 64
+/** Messages on one page; the NEWEST are kept. */
+export const HISTORY_MESSAGES_MAX = 200
+/** All the text on one page. Past it, the OLDER messages' text is cut to `…` (they keep their place). */
+export const HISTORY_PAGE_TEXT_MAX = 400_000
+const HISTORY_CURSOR_MAX = Number.MAX_SAFE_INTEGER
+// Every C0 control but TAB and LF (CR is folded into LF first), DEL and the C1 controls. ESC goes with
+// them: the page renders text, never a terminal sequence.
+const HISTORY_CONTROLS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g
+
+const isCursor = (x: unknown): x is number => typeof x === 'number' && Number.isInteger(x) && x >= 0 && x <= HISTORY_CURSOR_MAX
+
+/** Multi-line text a viewer may read: LF and TAB kept, CR folded into LF, every other control and
+ *  every bidi control removed, at most `max` UTF-16 units (a cut ends in `…`). Null when nothing is
+ *  left. */
+export function sanitizeHistoryText(raw: unknown, max: number): string | null {
+  if (typeof raw !== 'string' || max < 2) return null
+  const s = capUnits(raw, max * RAW_FACTOR)
+    .replace(/\r\n?/g, '\n')
+    .replace(HISTORY_CONTROLS, '')
+    .replace(BIDI_CONTROLS, '')
+    .replace(/^\n+/, '')
+    .replace(/\s+$/, '')
+  if (!s) return null
+  return s.length <= max ? s : `${capUnits(s, max - 1)}…`
+}
+
+/** A `watch:history` cast's argument, or null when it is not one. */
+export function readHistoryRequest(x: unknown): { before: number | null } | null {
+  if (x === undefined) return { before: null }
+  if (!x || typeof x !== 'object') return null
+  const before = (x as Record<string, unknown>).before
+  if (before === undefined) return { before: null }
+  return isCursor(before) ? { before } : null
+}
+
+function readHistoryPart(x: unknown): WatchHistoryPart | null {
+  if (!x || typeof x !== 'object') return null
+  const p = x as Record<string, unknown>
+  if (p.kind === 'text') {
+    const text = sanitizeHistoryText(p.text, HISTORY_TEXT_MAX)
+    return text === null ? null : { kind: 'text', text }
+  }
+  if (p.kind === 'tool') {
+    const name = clean(p.name, HISTORY_TOOL_NAME_MAX)
+    if (name === null) return null
+    return { kind: 'tool', name, arg: clean(p.arg, HISTORY_TOOL_ARG_MAX) ?? '' }
+  }
+  return null
+}
+
+function readHistoryMessage(x: unknown, since: number): WatchHistoryMessage | null {
+  if (!x || typeof x !== 'object') return null
+  const m = x as Record<string, unknown>
+  if (m.role !== 'user' && m.role !== 'assistant') return null
+  // The cutoff, enforced on BOTH ends: the host builds pages with it and the page re-reads them with it.
+  if (typeof m.at !== 'number' || !Number.isFinite(m.at) || m.at < since) return null
+  if (!Array.isArray(m.parts)) return null
+  const parts: WatchHistoryPart[] = []
+  for (const raw of m.parts) {
+    if (parts.length >= HISTORY_PARTS_MAX) break
+    const part = readHistoryPart(raw)
+    if (part) parts.push(part)
+  }
+  return parts.length > 0 ? { role: m.role, at: m.at, parts } : null
+}
+
+/** A `watch:history` page, cleaned and bounded, or null when it is not one. The host builds every page
+ *  through this too, so both ends hold the same limits. */
+export function readHistoryPage(x: unknown): WatchHistoryPage | null {
+  if (!x || typeof x !== 'object') return null
+  const p = x as Record<string, unknown>
+  if (!(HISTORY_STATUSES as readonly unknown[]).includes(p.status)) return null
+  if (p.before !== null && !isCursor(p.before)) return null
+  if (p.olderCursor !== null && !isCursor(p.olderCursor)) return null
+  if (p.start !== null && !(HISTORY_STARTS as readonly unknown[]).includes(p.start)) return null
+  if (typeof p.since !== 'number' || !Number.isFinite(p.since) || p.since < 0) return null
+  const since = p.since
+  const messages: WatchHistoryMessage[] = []
+  if (p.status === 'ok' && Array.isArray(p.messages)) {
+    for (const raw of p.messages) {
+      const m = readHistoryMessage(raw, since)
+      if (m) messages.push(m)
+    }
+  }
+  const kept = messages.slice(-HISTORY_MESSAGES_MAX)
+  // The page's text budget, spent newest first: an older message past it keeps its place, as `…`.
+  let budget = HISTORY_PAGE_TEXT_MAX
+  for (let i = kept.length - 1; i >= 0; i--) {
+    kept[i] = {
+      ...kept[i],
+      parts: kept[i].parts.map((part) => {
+        if (part.kind !== 'text') return part
+        if (part.text.length <= budget) {
+          budget -= part.text.length
+          return part
+        }
+        const text = budget >= 2 ? `${capUnits(part.text, budget - 1)}…` : '…'
+        budget = 0
+        return { kind: 'text', text }
+      })
+    }
+  }
+  return {
+    before: p.before as number | null,
+    status: p.status as WatchHistoryStatus,
+    since,
+    messages: kept,
+    olderCursor: p.olderCursor as number | null,
+    start: p.start as WatchHistoryStart | null
+  }
+}
