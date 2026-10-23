@@ -29,6 +29,13 @@ capture-phase wheel listener on `.flow-wrap` (⌘-wheel and pinch always zoom th
   file stores only the board zoom;
 - is clipped to the canvas area and stacked at z 10, under the sessions sidebar (12) and Dock (20);
 - treats a press on the node's own frame (header, Maximize, title) as staying in the board.
+- keeps its events out of the node. A portal leaves the node's DOM but not its React tree, so
+  React bubbled the editor's events into React Flow's node wrapper: a right-click opened the node
+  menu over Excalidraw's own, an arrow key nudging a shape also moved the node (and every other
+  selected node), and a double-click (Excalidraw's "add text") flew the camera to the node. The
+  portal root stops click, double-click and context-menu, and only the keys the wrapper acts on
+  (arrows, Enter, Space, Escape): stopping a React event also stops the native one at the React
+  root, so every other key still reaches document and window listeners.
 
 Only one editor is ever mounted, and it unmounts when editing ends — Excalidraw keeps some state
 module-global, and one live instance costs ~3 MB the first time. Measured: no heap growth over five

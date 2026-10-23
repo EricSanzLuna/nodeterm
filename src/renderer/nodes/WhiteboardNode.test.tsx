@@ -60,7 +60,15 @@ const SCENE = JSON.stringify({ type: 'excalidraw', elements: [] })
 let host: HTMLDivElement
 let root: Root
 
-function mount(data: Partial<CanvasNode['data']> = {}) {
+/** React Flow's node wrapper, as far as the React tree is concerned: the handlers it hangs on the
+ *  node's parent element (select on click, focus on double-click, the node menu, keyboard
+ *  select/move). The editor is portaled out of the node's DOM but NOT out of this React tree. */
+type WrapperHandlers = Pick<
+  React.HTMLAttributes<HTMLDivElement>,
+  'onClick' | 'onDoubleClick' | 'onContextMenu' | 'onKeyDown'
+>
+
+function mount(data: Partial<CanvasNode['data']> = {}, wrapper: WrapperHandlers = {}) {
   host = document.createElement('div')
   // The overlay is portaled into `.canvas-root` and clipped to `.flow-wrap`; the node finds both
   // by ancestry before it mounts an editor.
@@ -82,7 +90,9 @@ function mount(data: Partial<CanvasNode['data']> = {}) {
   act(() =>
     root.render(
       <ReactFlowProvider>
-        <WhiteboardNode {...props} />
+        <div {...wrapper}>
+          <WhiteboardNode {...props} />
+        </div>
       </ReactFlowProvider>
     )
   )
@@ -200,6 +210,60 @@ describe('a save that did not land offers a way forward instead of losing the wo
     expect(discard).toBeDefined()
     await act(async () => discard!.click())
     expect(editor.discarded).toBe(1)
+  })
+})
+
+describe('the live editor keeps its events away from the canvas node', () => {
+  // Measured in the dev app: a right-click on the board opened Excalidraw's menu AND the node menu,
+  // an arrow key nudging a shape also moved the node (every selected node), and a double-click
+  // (Excalidraw's "add text") flew the camera to the node.
+  async function openWithWrapper() {
+    files.readWhiteboard.mockResolvedValue({ scene: SCENE, rev: 'r1' } as WhiteboardFile)
+    const wrapper = {
+      onClick: vi.fn(),
+      onDoubleClick: vi.fn(),
+      onContextMenu: vi.fn(),
+      onKeyDown: vi.fn()
+    }
+    mount({}, wrapper)
+    await settle()
+    act(() => {
+      host.querySelector('.whiteboard-node__body')!.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    })
+    await settle()
+    // The double-click that OPENED the board is the node's own and reaches the wrapper; only what
+    // happens inside the editor must not.
+    wrapper.onDoubleClick.mockClear()
+    const target = host.querySelector('[data-testid="editor"]')!
+    expect(target).not.toBeNull()
+    return { wrapper, target }
+  }
+
+  it('a right-click, click or double-click on the board never reaches the node', async () => {
+    const { wrapper, target } = await openWithWrapper()
+    act(() => {
+      target.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))
+      target.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      target.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    })
+    expect(wrapper.onContextMenu).not.toHaveBeenCalled()
+    expect(wrapper.onClick).not.toHaveBeenCalled()
+    expect(wrapper.onDoubleClick).not.toHaveBeenCalled()
+  })
+
+  it('the keys the node wrapper acts on (arrows, Enter, Space, Escape) stay in the board', async () => {
+    const { wrapper, target } = await openWithWrapper()
+    for (const key of ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter', ' ', 'Escape']) {
+      act(() => {
+        target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }))
+      })
+    }
+    expect(wrapper.onKeyDown).not.toHaveBeenCalled()
+    // Every other key is left alone: stopping a React event stops the native one at the root too.
+    act(() => {
+      target.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', bubbles: true }))
+    })
+    expect(wrapper.onKeyDown).toHaveBeenCalledTimes(1)
   })
 })
 
