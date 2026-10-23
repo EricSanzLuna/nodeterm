@@ -9494,6 +9494,45 @@ unix-socket forward and dev-server `-L` forward over it. POSIX keeps OpenSSH unt
 
 ## Remote access (phone relay) — free, not Pro
 
+- **Relay key intake: no low-order keys, one spelling per key, a 10-digit SAS** (security audit
+  2026-10, relay-crypto F1–F5). (1) `deriveSharedKey` (`core/relay/e2ee.ts`) refuses a peer key whose
+  RAW X25519 output is all zero (`WeakPeerKeyError`, `E_WEAK_PEER_KEY`): tweetnacl's `box.before`
+  accepts low-order points, and with one the shared key is HSalsa20(0), a public constant — a
+  secret-less client completed the handshake, both humans saw the same fixed SAS ("357 836"), and a
+  0^32 key pinned through a tampered offer/join code let anyone back in silently (`autoApprove`).
+  Check the raw X25519 output, never `box.before`'s. The host refuses in the `e2ee_hello` handler
+  WITHOUT answering and closes the socket (no throw inside the ws emit), and sets `peerPubB64` only
+  after a successful derive, so nothing can pin or auto-approve the refused key; a client throws in
+  `connectRelay` before dialing. The intakes are belts on that choke point: `decodeOffer`,
+  `decodeJoinCode`, `ownerKeyProblem`, `pinDevice`/`isPinned`, and the `/pair` `epk` (400 `bad
+  epk`) — `isLowOrderPublicKey` uses a fixed probe scalar, since any clamped scalar sends exactly
+  the low-order points to zero. Pinned by `relay-low-order.test.ts` (the audit's repro, against the
+  real host and client). (2) Keys and nonces must be CANONICAL padded base64 (`canonicalB64ToBytes`):
+  Node's decoder skips junk, so `"!!!" + key` decoded to the key, and pin stores compare strings.
+  A join code's body is canonical base64url too, after removing ASCII whitespace (wrapped mail
+  lines). Every producer (desktop, iOS, Android, web viewer) pads already. (3) The SAS is v2:
+  `pad6(BE_u32(h[0..4]) mod 1e6) + pad4(BE_u32(h[4..8]) mod 1e4)`, "NNN NNN NNNN", h =
+  SHA-512(shared). v1 (~20 bits) was grindable on both legs in seconds by whoever substitutes a
+  pinned key. The first seven characters are the v1 code, and every surface shows
+  `SAS_COMPARE_HINT` (`shared/remote/sas.ts`) under the code — the host approval dialog
+  (`shared/remote/approval.ts`), the joiner's prompt (Canvas), the hosted owner dialog and `team
+  status`. Nothing compares SAS strings in code, so mixed versions stay correct; vectors in
+  `e2ee.test.ts` and docs/ios-protocol-migration.md §3.1 (the phones owe their own release). (4) The
+  host SAS dialog has one slot: a DIFFERENT device's pending request is refused while one is open
+  (`renderer/lib/pendingPeerAdmission.ts`: a phone is rejected and retries, a relay peer is never
+  confirmed), never swapped in under the human comparing digits; the same device re-raising (#372
+  retry churn) replaces in place. (5) The pairing QR carries `sshHostKeys` (`SHA256:…` `ssh-keygen
+  -lf` spelling, ordered ed25519/ecdsa/rsa, at most 4, after `relay`, before `ssh`; always omitted
+  with `ssh:false`), so the phone pins its first SSH connect instead of TOFU
+  (`main/ssh-host-key-fingerprint.ts`; phones: nodeterm-ios#75 + Android). **COMPLETE OR ABSENT,
+  never partial**: the phones REFUSE a host key not in the set, and sshd presents whichever key the
+  client's algorithm preference picks, so a missing key locks the phone out until a new QR. The set
+  is what sshd would serve: `HostKey` lines of sshd_config + its `Include`s (else sshd's defaults),
+  each counted only if its private file exists (stat, never read), each `.pub` required to parse.
+  Any doubt drops the field — an unreadable `.pub`, `HostKeyAgent`, a relative or `%`/`~` path, a
+  glob form we do not model, more than 4 keys; an unreadable config falls back to the defaults
+  only when all three are present and consistent. A superset is harmless.
+
 - **A Team Access invite that shares ONE project is a boundary, not a label**
   (`core/relay/scoped-guest-policy.ts`, wired by `main/remote/relay-host.ts` as the core relay
   host's hooks). The invite is consent to run commands IN that project, and nothing else: inbound is
