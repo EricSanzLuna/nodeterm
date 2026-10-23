@@ -44,6 +44,27 @@ interface Geometry {
 
 const pngDataUrl = (base64: string): string => `data:image/png;base64,${base64}`
 
+/** The keys React Flow's node wrapper acts on: Enter / Space / Escape (select, unselect) and the
+ *  arrows (move every selected node). */
+const NODE_WRAPPER_KEYS = new Set(['Enter', ' ', 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'])
+
+/**
+ * The editor is portaled out of the node's DOM but not out of its React tree, so React bubbles
+ * the editor's events into React Flow's node wrapper. Measured in the dev app: a right-click on
+ * the board opened the node menu over Excalidraw's own, an arrow key nudging a shape also moved
+ * the node (and every other selected node), and a double-click (Excalidraw's "add text") flew the
+ * camera to the node. Excalidraw's handlers sit below this point and run first.
+ *
+ * Stopping a React event also stops the native one at the React root, so document and window
+ * listeners do not see it. That is why the keyboard is narrowed to the keys the wrapper acts on:
+ * every other key still reaches them, and the canvas dispatcher already stands down for the
+ * overlay (`data-nt-keyboard-owner`).
+ */
+const keepInBoard = (e: React.SyntheticEvent): void => e.stopPropagation()
+const keepWrapperKeysInBoard = (e: React.KeyboardEvent): void => {
+  if (NODE_WRAPPER_KEYS.has(e.key)) e.stopPropagation()
+}
+
 /** The resting picture's bytes as a PNG Blob, decoded here. NOT `fetch(dataUrl)`: the app's CSP
  *  (`default-src 'self'`, no `connect-src data:`) refuses a fetch of a data: URL, which is how
  *  "Copy as image" used to fail without a word. */
@@ -394,7 +415,14 @@ export function WhiteboardNode({ id, data, selected, positionAbsoluteX, position
       {mode &&
         geom &&
         createPortal(
-          <div className="whiteboard-clip" style={geom.clip}>
+          <div
+            className="whiteboard-clip"
+            style={geom.clip}
+            onClick={keepInBoard}
+            onDoubleClick={keepInBoard}
+            onContextMenu={keepInBoard}
+            onKeyDown={keepWrapperKeysInBoard}
+          >
             <div ref={overlayRef} className="whiteboard-overlay" data-nt-keyboard-owner="" style={geom.board}>
               <Suspense fallback={<div className="whiteboard-overlay__loading">Loading whiteboard…</div>}>
                 <WhiteboardEditor
