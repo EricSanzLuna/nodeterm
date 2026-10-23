@@ -247,7 +247,8 @@ import {
   workingNodes,
   mirrorEntry,
   pendingTicketsFor,
-  openAskFor
+  openAskFor,
+  nodesForAgentSession
 } from '../core/agent-status-mirror'
 import { mirrorCustomAgents } from '../core/mirror-custom-agents'
 import { paneOwnerProject } from '../core/agents/pane-ownership'
@@ -5092,7 +5093,10 @@ app.whenReady().then(async () => {
       nodeOfSession: (sessionId) => ptyManager.nodeOfSession(sessionId),
       projectCwd: (projectId) => workspaceStore.localCwdForProject(projectId),
       projectIsRemote: (projectId) => !!workspaceStore.projectTargetInfo(projectId)?.ssh,
-      hostDataDir: app.getPath('userData')
+      hostDataDir: app.getPath('userData'),
+      // A `context:update` is keyed by the agent session; the mirror says which node runs it, so a
+      // guest gets a meter only for a session of the shared project.
+      nodesOfAgentSession: (sessionId) => nodesForAgentSession(sessionId)
     }
   })
   // Standing (phone) relay host: keep a host connection registered so a paired phone can reach

@@ -770,6 +770,7 @@ const api: NodeTerminalApi = {
     invite: (opts?: { projectId?: string; email?: string }) =>
       ipcRenderer.invoke(IPC.relayHostInvite, opts ?? {}),
     stop: () => ipcRenderer.invoke(IPC.relayHostStop),
+    scopeProblems: (projectIds: string[]) => ipcRenderer.invoke(IPC.relayHostScopeProblems, projectIds),
     revoke: (id: string) => ipcRenderer.send(IPC.relayHostRevoke, { id }),
     onPeerPending: subscribeRelayPeerPending,
     confirm: (id: string) => ipcRenderer.send(IPC.relayHostConfirm, { id }),

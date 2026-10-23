@@ -729,6 +729,21 @@ interferes; status bar off, **mouse on**, 50k history, `set-clipboard on` + `ter
 sessions survive when no client is attached. `src/shared/ssh.ts`'s `remoteTmuxConf` is the same
 config for an SSH project's remote tmux.
 
+**Exact tmux targets: every node id that becomes a `-t` goes through `exactPaneTarget` (`=name:`) or
+`exactSessionTarget` (`=name`)** (`core/tmux-naming.ts`, security audit F1/F2, 2026-10). tmux resolves
+a BARE target by exact name, then fnmatch, then PREFIX on a miss, and node ids end in a counter or a
+random tail: with only `nt-term-abc-12` alive, `send-keys -t nt-term-abc-1` typed into it,
+`capture-pane` read it and `display-message '#{pane_pid}'` named its process (measured, tmux 3.4).
+That made every node-keyed verb (send-text, typed chat input, send-keys, capture, pane command/cwd,
+pane owner, terminate-foreground, has-session, the control-mode shadow, an attach-only reattach) a way
+to reach a DIFFERENT node, whether its own session was gone or the id was a relay peer's invention.
+For an existing session `=name:` is the same pane the bare name was (current window, active pane,
+re-measured with three windows and a split). An exact miss is `can't find session` (exit 1), except
+`display-message`, which exits 0 with every format EMPTY — every parser here answers null for that.
+On a REMOTE command line the target is single-quoted: zsh's EQUALS option expands a word starting
+with `=`. Proven against a real tmux driving a real `PtyManager` (`pty-exact-target.realtmux.test.ts`).
+A new tmux call site owes the same, and both helpers refuse a name `sessionName` did not produce.
+
 **Every REMOTE tmux invocation starts with `remoteTmuxPathPrologue()`** (`shared/ssh.ts` — PATH
 **append**: `/opt/homebrew/bin`, `/usr/local/bin`, `/opt/local/bin`, `$HOME/.local/bin`): an ssh
 exec channel gets a non-login shell, and on a macOS host Homebrew's `shellenv` lives in
@@ -9497,12 +9512,26 @@ unix-socket forward and dev-server `-L` forward over it. POSIX keeps OpenSSH unt
 - **A Team Access invite that shares ONE project is a boundary, not a label**
   (`core/relay/scoped-guest-policy.ts`, wired by `main/remote/relay-host.ts` as the core relay
   host's hooks). The invite is consent to run commands IN that project, and nothing else: inbound is
-  an allowlist (`SCOPED`) where a node id must belong only to the shared project (or be one the
-  guest just created over `canvas:mut` that no project holds yet — the host saves on a debounce, so
-  a new terminal's first `pty:create` precedes its node on disk), paths realpath inside the project
-  root and outside userData (symlinks and dangling links refused), `pty:create` loses `sshRemote`
-  and defaults its cwd to the root, `workspace:save` is refused; outbound reuses the viewer policy's
-  per-project event/terminal-frame attribution. An unknown channel is refused, and the guard test
+  an allowlist (`SCOPED`) where a node id must belong only to the shared project, paths realpath
+  inside the project root and outside userData (symlinks and dangling links refused), `pty:create`
+  loses `sshRemote` and defaults its cwd to the root, `workspace:save` is refused; outbound reuses
+  the viewer policy's per-project event/terminal-frame attribution, presence included (only peers on
+  the shared project, no node id outside it — `createPresenceFilter`). **A node id the guest itself
+  introduces over `canvas:mut` (one no project holds yet: the host saves on a debounce, so a new
+  terminal's first `pty:create` precedes its node on disk) is PENDING, and pending unlocks nothing
+  but its own spawn** (security audit F1, 2026-10): its `pty:create` carries `newOnly` (core refuses
+  a join, a reattach, and any session that already runs under that name, `unavailable: 'new-only'`),
+  and only that create's own `fresh: true` response makes it the guest's node. Until then every
+  node-keyed verb and the outbound stream refuse it, even after the host saved it into the project
+  (being on the canvas is the guest's own doing, not ownership). Introduced ids are bounded (256) and
+  must be `[A-Za-z0-9-]` (`sessionName` rewrites anything else, so two ids could name one tmux
+  session). The audit's attack was an SSH-project guest (no local shell granted) recording a PREFIX
+  of another project's node id and reaching that LOCAL terminal through tmux prefix matching (see
+  "Exact tmux targets" under the tmux section). **A share rooted at the disk root, the home directory
+  or an ancestor of either or of userData is never served** (`core/relay/share-root.ts`): every file
+  under it would be readable, `~/.ssh` included; the invite UI shows such a project disabled with the
+  reason (`relayHost.scopeProblems`), `addSeat` refuses to mint it, and the policy refuses every
+  request of such a session. An unknown channel is refused, and the guard test
   forces a decision for every relay-tab channel. `connectRelayHost` THROWS for a scoped session
   given no scope deps rather than serve it unscoped. **What it does not claim**: the guest's own
   terminal is a shell as the host's user and can `cd` anywhere or attach another tmux session; the
@@ -10083,8 +10112,15 @@ under one `$HOME`, with different bytes; the last writer wins.
   (and when a session's endpoint is dead, the script's failover can deliver its event to the other
   core's endpoint).
 
-**Known limitations** (full list in the doc): non-editors still receive cross-project presence and
-`context:update` metadata (deploy one core per team); a viewer's socket backlog over 1 MB still
+**Outbound to non-editors, since security audit (a)/(d)/F3/F4:** presence is rewritten per peer
+(`createPresenceFilter`: only peers on a shared project, node references outside nulled, joins and
+leaves synthesised as a peer moves), `context:update` needs a shared node behind its session (the
+payload's `nodeId`, else the mirror's `nodesForAgentSession`; unattributable = dropped), a
+Commenter's board comment is reduced to a comment's fields and rate-bounded per peer key
+(`append-budget.ts`), and a shared folder that is the disk root, the home directory or an ancestor of
+either or of the data dir is not a root at all (`share-root.ts`).
+
+**Known limitations** (full list in the doc): a viewer's socket backlog over 1 MB still
 pauses the shared pty through Stage 2 backpressure; the canvas authority's own limits (a project's
 non-content fields stay last writer wins between tabs, the share-time window, oversized nodes, board
 edits to another core, load-time repairs that are never cast, the GitHub issue summary modal's

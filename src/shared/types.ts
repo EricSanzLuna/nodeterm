@@ -4209,6 +4209,13 @@ export interface RelayHostApi {
   /** Leave host mode: close every bridged peer in the pool. */
   stop(): Promise<void>
   /**
+   * Which of these projects may NOT be shared, with the reason (a folder that is the disk root, the
+   * home directory or an ancestor of either — every file under it would be readable). The invite
+   * UI disables those projects; `start`/`invite` refuse them host-side too. Projects absent from the
+   * answer may be shared.
+   */
+  scopeProblems(projectIds: string[]): Promise<Record<string, string>>
+  /**
    * Team Access: per-peer revoke — cut ONE bridged peer's live session immediately (by its id) and
    * free its seat. Distinct from `stop()` (which drops all).
    */

@@ -709,6 +709,51 @@ describe('initRelayHost — Team Access start() aliases invite (additive)', () =
   })
 })
 
+// Security audit F4: a project whose folder is the disk root or the home directory (or contains it)
+// would hand the guest every file under it, `~/.ssh` included. The invite UI greys it out; the host
+// refuses to MINT such a seat, whatever the renderer sent.
+describe('initRelayHost — a share rooted at the home directory is refused host-side', () => {
+  const wire = () => {
+    const win = fakeWin()
+    const connect = vi.fn(() => makeFakeSession(0) as unknown as RelayHostSession)
+    initRelayHost(win as never, platform, {
+      loadKeys: async () => genKeyPair(),
+      mintToken: async () => ({ pairingToken: 'tok' }),
+      isPremium: () => true,
+      relayAllowed: () => true,
+      getEntitlement: () => 'ent',
+      licensedSeats: () => 3,
+      connect,
+      scope: {
+        projectsOfNode: () => [],
+        nodeOfSession: () => undefined,
+        projectCwd: (id) => ({ home: '/home/ada', root: '/', parent: '/home', app: '/home/ada/code/app' })[id],
+        homeDir: '/home/ada',
+        hostDataDir: '/home/ada/.config/node-terminal',
+        realpath: (p) => p
+      }
+    })
+    return { connect }
+  }
+  it('start and invite refuse it, before any token is minted or socket opened', async () => {
+    const { connect } = wire()
+    for (const projectId of ['home', 'root', 'parent']) {
+      await expect(h.handlers[IPC.relayHostStart]({}, projectId)).rejects.toThrow(/home directory|root of the disk/)
+      await expect(h.handlers[IPC.relayHostInvite]({}, { projectId })).rejects.toThrow(/home directory|root of the disk/)
+    }
+    expect(connect).not.toHaveBeenCalled()
+    await h.handlers[IPC.relayHostStart]({}, 'app')
+    expect(connect).toHaveBeenCalledTimes(1)
+  })
+  it('scope-problems names exactly the refused projects, with the reason', () => {
+    wire()
+    const out = h.handlers[IPC.relayHostScopeProblems]({}, ['home', 'root', 'parent', 'app', 'unknown', 42]) as Record<string, string>
+    expect(Object.keys(out).sort()).toEqual(['home', 'parent', 'root'])
+    expect(out.home).toMatch(/home directory/)
+    expect(h.handlers[IPC.relayHostScopeProblems]({}, 'not-a-list')).toEqual({})
+  })
+})
+
 // ── Board-log bridged to the host over the relay tunnel ──────────────────────────────────────────
 // A relay guest reads and writes the HOST project's board-log through the SAME registry-jailed core
 // handlers the host's own renderer uses (registerBoardLogHandlers). The board-log-specific relay

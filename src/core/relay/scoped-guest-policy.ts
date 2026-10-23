@@ -32,6 +32,7 @@ import { IPC } from '../../shared/ipc'
 import type { UiSink } from '../ui-sink-registry'
 import type { AccessDecision, RelayHostHooks } from './relay-host'
 import {
+  createPresenceFilter,
   filterOutboundBinary,
   filterOutboundEvent,
   narrowResponseForRole,
@@ -40,6 +41,7 @@ import {
   type AccessContext,
   type SubagentOwners
 } from './access-policy'
+import { shareRootProblem } from './share-root'
 
 export interface ScopedGuestDeps {
   /** EVERY project that holds this node id, from the persisted canvases ([] = none). */
@@ -60,6 +62,11 @@ export interface ScopedGuestDeps {
   realpath?(p: string): string | null
   /** Does the path exist AS AN ENTRY (lstat — a dangling symlink counts)? Injected for tests. */
   lexists?(p: string): boolean
+  /** The host user's home directory (`shareRootProblem`). Absent = `os.homedir()`. */
+  homeDir?: string
+  /** The nodes whose current AGENT session is this id (the agent-status mirror). Lets a
+   *  `context:update` without a `nodeId` be attributed; absent = such an update is never delivered. */
+  nodesOfAgentSession?(agentSessionId: string): readonly string[]
 }
 
 type Check = (args: unknown[], s: Scope) => AccessDecision
@@ -328,9 +335,10 @@ const ptyCreate: Check = (a, s) => {
 
 /**
  * `canvas:mut` (projectId, mutation): only into the shared project, and only for a node that is in
- * scope or that NO project holds yet (a node the guest is creating — recorded, so its `pty:create`
- * is accepted before the host's debounced save lands). An upsert of another project's node id is
- * refused: applied, it would put that id in the shared project and hand this session its terminal.
+ * scope or that NO project holds yet (a node the guest is creating — recorded as PENDING, so its
+ * `pty:create` is accepted, as a spawn only, before the host's debounced save lands; see
+ * `Introduced`). An upsert of another project's node id is refused: applied, it would put that id in
+ * the shared project and hand this session its terminal.
  */
 const canvasMut: Check = (a, s) => {
   if (a[0] !== s.projectId) return no(OUTSIDE)
@@ -602,8 +610,25 @@ export function noteCreate(result: unknown, s: Scope): void {
   if (node !== undefined && pendingHere(node, s)) s.introduced.set(node, 'created')
 }
 
+/**
+ * Why this scope must not be served at all, or null. A shared project whose folder is the disk root,
+ * the home directory or an ancestor of either (or of this app's data dir) would hand the guest every
+ * file under it, `~/.ssh` included (security audit F4). The invite UI refuses such a project and so
+ * does the seat mint (relay-host-service `addSeat`); this is the gate the UI is not: every request
+ * of such a session is refused. An SSH project (no local folder) has nothing to judge.
+ */
+function scopeProblem(s: Scope): string | null {
+  return shareRootProblem(s.deps.projectCwd(s.projectId), {
+    home: s.deps.homeDir,
+    dataDir: s.deps.hostDataDir,
+    realpath: s.deps.realpath
+  })
+}
+
 function decideWith(method: string, args: unknown[], s: Scope): AccessDecision {
   if (typeof method !== 'string' || !Object.hasOwn(SCOPED, method)) return no(NOT_SCOPED)
+  const problem = scopeProblem(s)
+  if (problem) return no(problem)
   return SCOPED[method](Array.isArray(args) ? args : [], s)
 }
 
@@ -629,7 +654,9 @@ function viewCtx(s: Scope): AccessContext {
     projectCwds: () => (typeof root === 'string' && root ? [root] : []),
     hostDataDir: s.deps.hostDataDir,
     realpath: s.deps.realpath,
-    isFile: () => false
+    isFile: () => false,
+    ...(s.deps.homeDir !== undefined ? { homeDir: s.deps.homeDir } : {}),
+    ...(s.deps.nodesOfAgentSession ? { nodesOfAgentSession: (sid: string) => s.deps.nodesOfAgentSession!(sid) } : {})
   }
 }
 
@@ -670,6 +697,9 @@ export function scopedGuestHooks(projectId: string, deps: ScopedGuestDeps): Rela
     access: (_session, _kind, method, args) => decideWith(method, args, s),
     wrapSink: (_session, sink: UiSink): UiSink => {
       const owners: SubagentOwners = new Map()
+      // Presence is rewritten per peer: only peers on the shared project, no node reference outside
+      // it (access-policy.ts `createPresenceFilter`, security audit (a)).
+      const presence = createPresenceFilter()
       const safe = (judge: () => boolean): boolean => {
         try {
           return judge()
@@ -679,10 +709,21 @@ export function scopedGuestHooks(projectId: string, deps: ScopedGuestDeps): Rela
       }
       return {
         sendText: (json) => {
-          // Admitted events are sent with project documents' exec fields removed (held launch
-          // commands, session programs, ssh options): the guest reads the shared project's canvas,
-          // not the command lines this machine holds for it.
-          if (safe(() => filterScopedEvent(json, s, owners))) sink.sendText(redactOutboundEvent(json))
+          let out: string | null = null
+          const deliver = safe(() => {
+            const p = presence.handle(json, () => viewCtx(s))
+            if (p !== undefined) {
+              out = p
+              return p !== null
+            }
+            if (!filterScopedEvent(json, s, owners)) return false
+            // Admitted events are sent with project documents' exec fields removed (held launch
+            // commands, session programs, ssh options): the guest reads the shared project's canvas,
+            // not the command lines this machine holds for it.
+            out = redactOutboundEvent(json)
+            return true
+          })
+          if (deliver && out !== null) sink.sendText(out)
         },
         sendBinary: (buf) => {
           if (safe(() => filterOutboundBinary(buf, viewCtx(s)))) sink.sendBinary(buf)

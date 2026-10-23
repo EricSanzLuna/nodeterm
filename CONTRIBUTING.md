@@ -283,6 +283,19 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   `remoteNodeOwner` or is refused (`not-connected`); `paneCommand` / `paneOwner` resolve unmounted
   nodes only with the explicit `{ resolveUnmounted: true }` option. See Bulk pause in `CLAUDE.md`.
 
+- **A node id never reaches tmux as a bare `-t`.** Use `exactPaneTarget` (`=nt-<id>:`) or
+  `exactSessionTarget` (`=nt-<id>`) from `core/tmux-naming.ts`, and single-quote it on a remote
+  command line (zsh expands a leading `=`). tmux prefix-matches a bare target on a miss, so `nt-x-1`
+  reaches a live `nt-x-12`: a relay peer naming a prefix typed into, read and killed another
+  project's terminal (security audit F1/F2). `pty-exact-target.realtmux.test.ts` drives a real
+  `PtyManager` to prove it; see "Exact tmux targets" in `CLAUDE.md`.
+
+- **A relay peer's node ids, presence and shared folder are judged host-side.** A scoped guest's
+  newly introduced node unlocks only its own `newOnly` spawn, presence reaches a non-editor only for
+  peers on its shared projects, and a project rooted at `/`, `$HOME` or an ancestor of either is
+  never shared (`core/relay/share-root.ts`). A UI that hides an option is convenience; the policy in
+  `core/relay/` is the gate. See "Remote access" and "Hosted team relay" in `CLAUDE.md`.
+
 - **Branch labels describe a checkout on one core.** Share existing status reads through
   `renderer/state/gitBranches.ts`; do not cache a branch forever by project id or copy a project
   branch onto worktree nodes. Source, Sessions and worktree headers consume the same observations,

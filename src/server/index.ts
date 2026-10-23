@@ -92,7 +92,8 @@ import {
   setNodeHibernated,
   seedNodeIdentities,
   sessionNameSweepEntries,
-  nodeSessionName
+  nodeSessionName,
+  nodesForAgentSession
 } from '../core/agent-status-mirror'
 import { mirrorCustomAgents } from '../core/mirror-custom-agents'
 import { createPushNotify, createLiveUpdatePush } from '../core/push-notify'
@@ -1022,6 +1023,9 @@ export async function startServer(
     // stop a stream the viewer already joined). One map lookup.
     nodeOfSession: (sessionId) => ptyManager.nodeOfSession(sessionId),
     projectCwd: (projectId) => workspaceStore.localCwdForProject(projectId),
+    // A `context:update` names an agent session, not a node: the mirror attributes it, so a
+    // non-editor receives a meter only for a session of a shared project.
+    nodesOfAgentSession: (sessionId) => nodesForAgentSession(sessionId),
     // A share or unshare: the authority adopts what joined and writes + releases what left, then every
     // client hears the new governed set (a client alone on a newly shared canvas must start publishing).
     // RESIDUAL, the share-time window (docs/hosted-team-relay.md): an edit a client made just before
