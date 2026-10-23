@@ -526,6 +526,8 @@ export function buildStubApi(): Omit<
       start: U('relayHost.start'),
       invite: U('relayHost.invite'),
       stop: U('relayHost.stop'),
+      // Nothing can be hosted here (start/invite are unsupported), so nothing is refused either.
+      scopeProblems: async () => ({}),
       revoke: noop,
       onPeerPending: noopUnsub,
       confirm: noop,

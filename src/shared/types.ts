@@ -231,6 +231,15 @@ export interface PtyCreateOptions {
    */
   joinOnly?: boolean
   /**
+   * The opposite of `joinOnly`: this create may only SPAWN a brand-new session. A co-attach join, a
+   * reattach to a live tmux / session-host / Zellij session under this node's name, and a create
+   * whose existence probe cannot answer are all refused (`unavailable: 'new-only'`), so the caller's
+   * `fresh: true` means "this create made the session". Set only by the relay scoped-guest policy
+   * (src/core/relay/scoped-guest-policy.ts) for a node id the guest introduced itself: naming a node
+   * id must never be a way to take over a session somebody else is running under it.
+   */
+  newOnly?: boolean
+  /**
    * `false`: this view never constrains the shared pty's size (a viewer's small window must not
    * shrink everyone's terminal). It is still a subscriber and is told the authoritative size.
    */
@@ -430,8 +439,12 @@ export interface PtyCreateResult {
    * `'join-only'`: `PtyCreateOptions.joinOnly` was set (a hosted-relay viewer) and no running
    * session could be confirmed to join or reattach to — either it is gone, or its existence could
    * not be checked — so nothing was started. Not a lost connection.
+   *
+   * `'new-only'`: `PtyCreateOptions.newOnly` was set (a relay guest's create for a node it
+   * introduced) and a session already exists under this node's name, or its existence could not be
+   * checked. Nothing was joined or started, and the existing session was left untouched.
    */
-  unavailable?: 'ssh' | 'codex-account' | 'join-only' | 'held-elsewhere'
+  unavailable?: 'ssh' | 'codex-account' | 'join-only' | 'held-elsewhere' | 'new-only'
 }
 
 /** Payload of `pty:recycled` — see IPC.ptyRecycled and `recycleAction` in the renderer. */
@@ -4252,6 +4265,13 @@ export interface RelayHostApi {
   invite(opts?: { projectId?: string; email?: string }): Promise<{ offer: string; id: string }>
   /** Leave host mode: close every bridged peer in the pool. */
   stop(): Promise<void>
+  /**
+   * Which of these projects may NOT be shared, with the reason (a folder that is the disk root, the
+   * home directory or an ancestor of either — every file under it would be readable). The invite
+   * UI disables those projects; `start`/`invite` refuse them host-side too. Projects absent from the
+   * answer may be shared.
+   */
+  scopeProblems(projectIds: string[]): Promise<Record<string, string>>
   /**
    * Team Access: per-peer revoke — cut ONE bridged peer's live session immediately (by its id) and
    * free its seat. Distinct from `stop()` (which drops all).

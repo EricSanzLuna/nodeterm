@@ -3735,7 +3735,9 @@ export function TerminalNode({
           // "Refresh terminal" re-asks on demand. `held-elsewhere` is the same shape: core found
           // this remote node's id held by a session that is not on its host and did not join it —
           // nothing is offline, and "Try again" would refuse again while that session runs.
-          if (unavailable === 'join-only' || unavailable === 'held-elsewhere') {
+          // `new-only` too: a relay guest's create for a node it added found a session already
+          // running under that name and was refused (core/relay/scoped-guest-policy.ts).
+          if (unavailable === 'join-only' || unavailable === 'held-elsewhere' || unavailable === 'new-only') {
             setCo(termKey, {
               offline: false,
               spawnError: null,

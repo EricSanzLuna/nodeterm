@@ -17,7 +17,7 @@ const src = fs.readFileSync(path.resolve(__dirname, 'TerminalNode.tsx'), 'utf8')
 
 /** The body of the `'join-only'` / `'held-elsewhere'` branch, up to its `return`. */
 function joinOnlyBranch(): string {
-  const start = src.indexOf("if (unavailable === 'join-only' || unavailable === 'held-elsewhere') {")
+  const start = src.indexOf("if (unavailable === 'join-only' || unavailable === 'held-elsewhere' || unavailable === 'new-only') {")
   expect(start, 'the join-only branch must still exist').toBeGreaterThan(-1)
   const end = src.indexOf('return', start)
   expect(end).toBeGreaterThan(start)

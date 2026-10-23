@@ -750,6 +750,9 @@ export const IPC = {
   relayHostInvite: 'relay:host:invite',
   relayHostRevoke: 'relay:host:revoke',
   relayHostStop: 'relay:host:stop',
+  // Which projects may not be the scope of an invite, and why (core/relay/share-root.ts): invoke,
+  // `projectIds: string[]` → `{ [projectId]: reason }`. The invite UI disables those options.
+  relayHostScopeProblems: 'relay:host:scope-problems',
   relayHostPeerPending: 'relay:host:peer-pending',
   relayHostConfirm: 'relay:host:confirm',
   relayHostOpen: 'relay:host:open',

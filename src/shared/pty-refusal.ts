@@ -32,5 +32,15 @@ export function ptyRefusal(unavailable: NonNullable<PtyCreateResult['unavailable
       connectionLost: false
     }
   }
+  // A relay guest's create for a node it added itself found a session already running under that
+  // node's name (or could not check). Joining it would hand the guest a terminal it did not start;
+  // nothing is offline, and retrying refuses again while that session runs.
+  if (unavailable === 'new-only') {
+    return {
+      message:
+        "a session with this terminal's id already exists on the host, so it was not joined — nothing was started",
+      connectionLost: false
+    }
+  }
   return { message: 'not connected — nothing was started locally', connectionLost: true }
 }
