@@ -295,7 +295,7 @@ import { useSshConn } from '../state/sshConn'
 import { useWorktrees } from '../state/worktrees'
 import { isRemoteSessionNode } from '@shared/worktree'
 import { RunBar } from './RunBar'
-import { useSession, useActiveSessionPresence } from '../session/session'
+import { isRemoteProjectId, useSession, useActiveSessionPresence } from '../session/session'
 import { isHostedReadOnly, useHostedReadOnly } from '../state/hostedTeams'
 import { isBrowserRuntime } from '../bridge/runtime'
 import { liveLinkUnavailable } from '../lib/liveLinkEntry'
@@ -1342,12 +1342,16 @@ export function TerminalNode({
   }, [api])
   // The ACTIVE project's presence — where our focus/blur casts go. It follows the active project,
   // not this node's provider: Canvas keys the node subtree's SessionProvider on the project React
-  // Flow's STORE holds (`useFlowStoreOwner`), which flips one commit after the active id. A node
-  // mounts once the store holds its project, and by then that project is the active one, so the
-  // value captured by the once-mounted lifecycle effect below is the presence of the core this node
-  // runs on: a relay tab reports focus over the relay core, a local tab hits `defaultPresence`
-  // (byte-identical to before). Render-time reads may briefly see the incoming project's presence
-  // while an outgoing node waits to unmount.
+  // Flow's STORE holds (`useFlowStoreOwner`), which flips one commit after the active id. Usually a
+  // node mounts once its project is the active one, so the value the once-mounted lifecycle effect
+  // below captures is the presence of the core this node runs on: a relay tab reports focus over the
+  // relay core, a local tab hits `defaultPresence` (byte-identical to before). NOT always: when the
+  // last team tab closes, the welcome screen sets the active project to null while the store still
+  // holds the team project's nodes, and in a rapid A→B→C switch the store can hold B while C is
+  // active. In those windows this node's `useSession()` (its own core) and this presence (the active
+  // project's) can point at different cores. The effect is negligible today: those nodes cannot be
+  // focused (the welcome screen covers them; B's nodes unmount once C lands). Reading this node's
+  // own session's presence instead is a follow-up.
   const presence = useActiveSessionPresence()
   /**
    * THIS node's agent-status store, for the memory levers that must not kill live work — resolved
@@ -3584,7 +3588,8 @@ export function TerminalNode({
       // session — this desktop's own core — would create the host's node id HERE. Canvas keys the
       // subtree on the project React Flow's store holds, and an unbound remote tab resolves to the
       // offline relay session, so this is the last line: start nothing, before any SSH resolve.
-      if (spawnBelongsElsewhere(useProjects.getState().getProject(owningProjectRef.current ?? ''), session.source)) {
+      // `isRemoteProjectId` is sessionForProject's own rule, so a tab the store deleted still counts.
+      if (spawnBelongsElsewhere(isRemoteProjectId(owningProjectRef.current ?? ''), session.source)) {
         term.write(
           `\r\n\x1b[90m${REMOTE_PROJECT_SPAWN_REFUSAL}\x1b[0m\r\n`
         )

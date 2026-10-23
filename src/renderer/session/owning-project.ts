@@ -8,10 +8,11 @@ import { SessionProvider, sessionForProject, type SessionSource } from './sessio
  * `null` = not known: outside any provider, or before React Flow has held a project.
  *
  * It exists beside the SessionProvider because a session alone cannot say whether a node is in
- * the right place. An unbound remote project resolves to the offline relay session, whose calls
- * all reject — but a node of a remote project that ends up under a LOCAL session anyway (a provider
- * keyed on the wrong project, a surface mounted outside any project's provider) would create its
- * host-side id on this core. The terminal asks `spawnBelongsElsewhere` with this id before it spawns.
+ * the right place. An unbound remote project resolves to the offline relay session, whose
+ * core-bound calls reject — but a node of a remote project that ends up under a LOCAL session
+ * anyway (a provider keyed on the wrong project, a surface mounted outside any project's provider)
+ * would create its host-side id on this core. The terminal asks
+ * `spawnBelongsElsewhere(isRemoteProjectId(<this id>), session.source)` before it spawns.
  */
 export const OwningProjectContext = createContext<string | null>(null)
 
@@ -25,13 +26,17 @@ export const REMOTE_PROJECT_SPAWN_REFUSAL =
   '[this terminal belongs to a remote project that is not connected here — nothing was started on this machine]'
 
 /**
- * True when a spawn for a node of `project` would land on the wrong core: the project lives on
- * another machine (`remote`, a hosted team / relay tab) but the session the node runs under is not
- * a relay session — it is this desktop's own core. The caller must then start nothing.
- * An unknown project (undefined) is not evidence of anything and answers false.
+ * True when a spawn for a node of a project would land on the wrong core: the project lives on
+ * another machine (`projectIsRemote`, a hosted team / relay tab) but the session the node runs
+ * under is not a relay session — it is this desktop's own core. The caller must then start nothing.
+ *
+ * Pure on purpose. Callers pass `isRemoteProjectId(<owning project id>)` (session.ts) — the same
+ * rule `sessionForProject` uses, so a tab the projects store has deleted still reads as remote
+ * here. An unknown project ('' or an id never held as remote) answers false there, which is not
+ * evidence of anything.
  */
-export function spawnBelongsElsewhere(project: { remote?: boolean } | undefined, source: SessionSource): boolean {
-  return !!project?.remote && source !== 'relay'
+export function spawnBelongsElsewhere(projectIsRemote: boolean, source: SessionSource): boolean {
+  return projectIsRemote && source !== 'relay'
 }
 
 /**

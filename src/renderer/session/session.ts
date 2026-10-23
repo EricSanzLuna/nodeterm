@@ -299,14 +299,26 @@ export function sessionForProject(projectId: string): WorkspaceSession {
   return off ? off.session : localOrActiveSession()
 }
 
-/** The offline session's entry when `projectId` is a REMOTE project — `remote` in the projects
- *  store, or (once the store no longer holds it) bound while it was (`KNOWN_REMOTE`) — the one rule
- *  `sessionForProject` and `presenceForProject` share. The caller has already found no live binding.
- *  `null` for any other id, or when no offline factory is registered. */
-function offlineForUnboundRemote(projectId: string): Entry | null {
-  if (!projectId) return null
+/** True when `projectId` names a REMOTE project (a relay / hosted team tab): `remote` in the
+ *  projects store, or, once the store no longer holds it, bound to a session while it was
+ *  (`KNOWN_REMOTE`). The store's own answer wins whenever it still holds the project. '' (no
+ *  project, the welcome screen) and an id the store never held as remote answer false.
+ *
+ *  The ONE remote-project rule: `sessionForProject`'s unbound branch (via `offlineForUnboundRemote`)
+ *  and the terminals' spawn refusal (`spawnBelongsElsewhere(isRemoteProjectId(owner), …)` in
+ *  TerminalNode / ModalTerminal) both ask it, so they cannot disagree about a tab the store has
+ *  deleted. */
+export function isRemoteProjectId(projectId: string): boolean {
+  if (!projectId) return false
   const stored = useProjects.getState().getProject(projectId)
-  if (!(stored ? stored.remote : KNOWN_REMOTE.has(projectId))) return null
+  return stored ? !!stored.remote : KNOWN_REMOTE.has(projectId)
+}
+
+/** The offline session's entry when `projectId` is a REMOTE project (`isRemoteProjectId`) — the
+ *  rule `sessionForProject` and `presenceForProject` share. The caller has already found no live
+ *  binding. `null` for any other id, or when no offline factory is registered. */
+function offlineForUnboundRemote(projectId: string): Entry | null {
+  if (!isRemoteProjectId(projectId)) return null
   return offlineEntry()
 }
 

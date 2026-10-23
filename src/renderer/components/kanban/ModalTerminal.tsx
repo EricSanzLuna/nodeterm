@@ -20,7 +20,7 @@ import { focusXtermUnlessCovered, useMdModeFocus } from '../../terminal/useMdMod
 import { FindBar } from '../FindBar'
 import { useAgentStatus } from '../../state/agentStatus'
 import { useProjects } from '../../state/projects'
-import { useSession } from '../../session/session'
+import { isRemoteProjectId, useSession } from '../../session/session'
 import { REMOTE_PROJECT_SPAWN_REFUSAL, spawnBelongsElsewhere, useOwningProjectId } from '../../session/owning-project'
 import { isHostedReadOnly } from '../../state/hostedTeams'
 import { useSettings } from '../../state/settings'
@@ -506,9 +506,10 @@ export function ModalTerminal({
       // MIRROR TerminalNode: a node of a REMOTE project (a relay / hosted team tab) under a session
       // that is not a relay session would create the host's node id on THIS desktop's core. The
       // board mounts the modal under the card's project session (`ProjectSessionScope`), so this
-      // is the defensive half: start nothing, before any SSH resolve.
+      // is the defensive half: start nothing, before any SSH resolve. `isRemoteProjectId` is
+      // sessionForProject's own rule, so a tab the store deleted still counts.
       const owner = owningProjectRef.current
-      if (spawnBelongsElsewhere(useProjects.getState().getProject(owner ?? ''), session.source)) {
+      if (spawnBelongsElsewhere(isRemoteProjectId(owner ?? ''), session.source)) {
         term.write(
           `\r\n\x1b[90m${REMOTE_PROJECT_SPAWN_REFUSAL}\x1b[0m\r\n`
         )
