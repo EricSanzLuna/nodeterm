@@ -21,7 +21,7 @@ import { FindBar } from '../FindBar'
 import { useAgentStatus } from '../../state/agentStatus'
 import { useProjects } from '../../state/projects'
 import { useSession } from '../../session/session'
-import { spawnBelongsElsewhere, useOwningProjectId } from '../../session/owning-project'
+import { REMOTE_PROJECT_SPAWN_REFUSAL, spawnBelongsElsewhere, useOwningProjectId } from '../../session/owning-project'
 import { isHostedReadOnly } from '../../state/hostedTeams'
 import { useSettings } from '../../state/settings'
 import { isMacPlatform, isWindowsPlatform } from '@shared/platform-utils'
@@ -510,7 +510,7 @@ export function ModalTerminal({
       const owner = owningProjectRef.current
       if (spawnBelongsElsewhere(useProjects.getState().getProject(owner ?? ''), session.source)) {
         term.write(
-          '\r\n\x1b[90m[this terminal belongs to a remote project that is not connected here — nothing was started on this machine]\x1b[0m\r\n'
+          `\r\n\x1b[90m${REMOTE_PROJECT_SPAWN_REFUSAL}\x1b[0m\r\n`
         )
         return
       }

@@ -20,6 +20,7 @@ import { join } from 'node:path'
 import type { CanvasNodeState, NodeTerminalApi, Project, ProjectKanban } from '@shared/types'
 import { KanbanView, type KanbanSession } from './KanbanView'
 import { GlobalKanbanView } from './GlobalKanbanView'
+import { REMOTE_PROJECT_SPAWN_REFUSAL } from '../../session/owning-project'
 import { useProjects } from '../../state/projects'
 import { useViewMode } from '../../state/viewMode'
 import {
@@ -145,8 +146,20 @@ describe('the Omni board mounts each lane\'s card modal under THAT lane\'s sessi
 
 // ── Source pins (F2c, F4): TerminalNode and ModalTerminal have no render harness ─────────────────
 const read = (rel: string): string => readFileSync(join(__dirname, rel), 'utf8').replace(/\r\n/g, '\n')
-const REFUSAL =
-  '[this terminal belongs to a remote project that is not connected here — nothing was started on this machine]'
+// Both terminals print the ONE exported refusal; the pins below find its use, not a retyped copy.
+const REFUSAL = '${REMOTE_PROJECT_SPAWN_REFUSAL}'
+
+describe('the refusal line is one constant', () => {
+  it('names that nothing was started here, and no terminal retypes it', () => {
+    expect(REMOTE_PROJECT_SPAWN_REFUSAL).toContain('remote project that is not connected here')
+    expect(REMOTE_PROJECT_SPAWN_REFUSAL).toContain('nothing was started on this machine')
+    for (const rel of ['../../nodes/TerminalNode.tsx', 'ModalTerminal.tsx']) {
+      const src = read(rel)
+      expect(src).toContain('import { REMOTE_PROJECT_SPAWN_REFUSAL,')
+      expect(src).not.toContain('nothing was started on this machine')
+    }
+  })
+})
 
 describe('both terminals refuse to spawn locally for a remote project (F2c)', () => {
   it('TerminalNode asks spawnBelongsElsewhere after the noSpawn return, before any SSH resolve or create', () => {

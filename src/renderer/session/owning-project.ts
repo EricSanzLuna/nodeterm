@@ -19,6 +19,11 @@ export function useOwningProjectId(): string | null {
   return useContext(OwningProjectContext)
 }
 
+/** What a terminal prints (in gray) when `spawnBelongsElsewhere` refuses its spawn — ONE wording
+ *  for the canvas node and the card modal, so the two surfaces cannot say different things. */
+export const REMOTE_PROJECT_SPAWN_REFUSAL =
+  '[this terminal belongs to a remote project that is not connected here — nothing was started on this machine]'
+
 /**
  * True when a spawn for a node of `project` would land on the wrong core: the project lives on
  * another machine (`remote`, a hosted team / relay tab) but the session the node runs under is not

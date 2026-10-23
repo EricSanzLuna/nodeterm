@@ -661,9 +661,15 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   - A surface that mounts a terminal outside the canvas (the kanban card modal — both boards live
     under App's LOCAL provider) runs under `sessionForProject(<its project>)` and provides
     `OwningProjectContext`: wrap it in `ProjectSessionScope` (`session/owning-project.ts`). A new
-    terminal-creating path also asks `spawnBelongsElsewhere` before its first create.
+    terminal-creating path also asks `spawnBelongsElsewhere` before its first create. A component
+    under it that keys data by project (the board log, card metadata, pull requests) reads
+    `useOwningProjectId() ?? activeProjectId`, never `activeProjectId` alone: on the Omni board the
+    card's project is not the active one, and its `useSession()` api answers for the card's project.
   - Core `join` refuses (`held-elsewhere`) a `requireRemote` create onto a held session that is
-    local or on another host. Never join by node id alone.
+    local or on another host, but a create that names no `sshRemote` still attaches to a held
+    REMOTE session, so core alone does not stop a caller that names only a node id. A new caller
+    that creates a remote node passes `requireRemote` plus the `sshRemote` it has, and treats
+    `held-elsewhere` as a refusal that is NOT a lost connection (no reconnect, no drop report).
   Do not "fix" this by re-stamping `sshRemoteTmux` onto those nodes: the host would then refuse its
   own sessions. CLAUDE.md, "Projects (tabs)".
 

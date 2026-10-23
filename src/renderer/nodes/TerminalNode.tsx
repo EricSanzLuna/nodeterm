@@ -356,7 +356,7 @@ import { applyIconChoice } from '../lib/nodeIconChoice'
 import { normalizeNodeIcon } from '@shared/node-icon'
 import { connectHostAttachment } from '../lib/sshAttachments'
 import { projectMayDialSsh } from '../session/relay-ssh'
-import { spawnBelongsElsewhere, useOwningProjectId } from '../session/owning-project'
+import { REMOTE_PROJECT_SPAWN_REFUSAL, spawnBelongsElsewhere, useOwningProjectId } from '../session/owning-project'
 import { waitForSshRemote } from '../lib/sshRemoteWait'
 
 /** Which physical modifier the registry's abstract `Cmd` resolves to for the find-bar chord. */
@@ -3586,7 +3586,7 @@ export function TerminalNode({
       // offline relay session, so this is the last line: start nothing, before any SSH resolve.
       if (spawnBelongsElsewhere(useProjects.getState().getProject(owningProjectRef.current ?? ''), session.source)) {
         term.write(
-          '\r\n\x1b[90m[this terminal belongs to a remote project that is not connected here — nothing was started on this machine]\x1b[0m\r\n'
+          `\r\n\x1b[90m${REMOTE_PROJECT_SPAWN_REFUSAL}\x1b[0m\r\n`
         )
         return
       }
