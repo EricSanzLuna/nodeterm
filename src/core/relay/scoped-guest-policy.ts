@@ -342,6 +342,10 @@ export const SCOPED: Readonly<Record<string, Check>> = Object.freeze({
   // Writes into this app's own uploads dir under an app-chosen name (a pasted screenshot's bytes).
   [IPC.filesSaveUpload]: pass,
   [IPC.filesSaveCanvasImage]: projectArg0,
+  // A whiteboard is addressed by (projectId, nodeId) and the core derives the path in that
+  // project, so the project argument is the whole scope check, as for a canvas image.
+  [IPC.filesSaveWhiteboard]: projectArg0,
+  [IPC.filesReadWhiteboard]: projectArg0,
 
   // Git: the working directory realpath-jailed to the project root, plus per-verb argument checks.
   [IPC.gitStatus]: gitCwd(),
@@ -438,6 +442,10 @@ export const SCOPED: Readonly<Record<string, Check>> = Object.freeze({
 export const SCOPED_REFUSED: ReadonlySet<string> = new Set<string>([
   // A whole-workspace write from a peer would replace the host's other projects.
   IPC.workspaceSave,
+  // Moving a project's storage writes and deletes host files (issue #1145); host-only.
+  IPC.workspaceReleaseFolderFiles,
+  IPC.workspacePrepareFolderStorage,
+  IPC.workspaceProjectStorage,
   // Host-only (shared/host-control.ts): a peer's launch claim would make the host's own viewers
   // stand down from a launch (#1173). A relay tab never sends it.
   IPC.workspaceClaimLaunch,

@@ -358,12 +358,17 @@ export function nextFreePosition(
 export type UnavailableRecovery = 'clear' | 'rehydrate' | 'keep'
 
 export function unavailableRecovery(
-  project: { unavailable?: boolean; ssh?: unknown },
+  project: { unavailable?: boolean; ssh?: unknown; storeInAppData?: boolean },
   fileState: 'present' | 'absent' | 'unreadable'
 ): UnavailableRecovery {
   // Remote projects are not ours to judge from a local stat — their file lives on the host, and
   // their placeholder is cleared by the reconnect path instead.
   if (!project.unavailable || project.ssh) return 'keep'
+  // A project stored in app data (#1145) never had its canvas in the folder: a project.json there
+  // is a stale copy or a teammate's, never this project's to rehydrate from. Its placeholder means
+  // its app-data file and cache are both gone, so opening the folder starts it again, empty, in app
+  // data — and the store still refuses to write that empty canvas over a data file that reappears.
+  if (project.storeInAppData) return 'clear'
   if (fileState === 'absent') return 'clear'
   if (fileState === 'present') return 'rehydrate'
   return 'keep'

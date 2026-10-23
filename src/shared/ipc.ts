@@ -486,6 +486,12 @@ export const IPC = {
   /** Is a folder's .nodeterm/project.json present / absent / unreadable — the distinction
    *  `probeFolder`'s null collapses. Recovery of an `unavailable` project needs it (issue #385). */
   workspaceProjectFileState: 'workspace:project-file-state',
+  /** "Store in app data", second half (issue #1145): carry settings over, remove the folder files. */
+  workspaceReleaseFolderFiles: 'workspace:release-folder-files',
+  /** "Store in folder", first half (issue #1145): refuse an occupied folder, carry settings in. */
+  workspacePrepareFolderStorage: 'workspace:prepare-folder-storage',
+  /** Where the store has a project's canvas after a move's save: folder / app data (issue #1145). */
+  workspaceProjectStorage: 'workspace:project-storage',
   projectSettingsRead: 'project-settings:read',
   projectSettingsWriteShared: 'project-settings:write-shared',
   projectSettingsUpdateLocal: 'project-settings:update-local',
@@ -578,6 +584,10 @@ export const IPC = {
   filesSaveUpload: 'files:save-upload',
   /** Write a canvas image into the project's own `.nodeterm/images/` (see core/canvas-images.ts). */
   filesSaveCanvasImage: 'files:save-canvas-image',
+  /** A whiteboard node's side file (core/whiteboards.ts). Addressed by (projectId, nodeId); the
+   *  receiving core derives the path, so a caller can never name one. */
+  filesSaveWhiteboard: 'files:save-whiteboard',
+  filesReadWhiteboard: 'files:read-whiteboard',
   /** Custom agent-alert sounds (issue #289) — stored under the core's data dir, addressed by kind. */
   filesSaveAlertSound: 'files:save-alert-sound',
   filesReadAlertSound: 'files:read-alert-sound',

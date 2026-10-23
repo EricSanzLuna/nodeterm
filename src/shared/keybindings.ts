@@ -85,6 +85,7 @@ export type CommandId =
   | 'node.newBrowser'
   | 'node.newWebView'
   | 'node.newDino'
+  | 'node.newWhiteboard'
   | 'node.newFile'
   | 'node.focusLeft'
   | 'node.focusRight'
@@ -217,6 +218,8 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
   { id: 'node.newWebView', title: 'New web view node', group: 'Nodes', scope: 'canvas',
     defaultBindings: both() },
   { id: 'node.newDino', title: 'New dino node', group: 'Nodes', scope: 'canvas',
+    defaultBindings: both() },
+  { id: 'node.newWhiteboard', title: 'New whiteboard', group: 'Nodes', scope: 'canvas',
     defaultBindings: both() },
   { id: 'node.newFile', title: 'New file…', group: 'Nodes', scope: 'canvas',
     defaultBindings: both() },

@@ -20,6 +20,7 @@ import { sessionTokenFromCookie } from './http'
 import { proxyAuthAllowed, type TrustProxyConfig } from './proxy-trust'
 import { parseRpcMessage } from '../shared/rpc'
 import { presenceHub } from '../core/presence/hub'
+import { WS_CLIENT_FRAME_MAX } from '../shared/ws-frame'
 
 /**
  * Heartbeat period. Every WS_HEARTBEAT_MS the server pings each socket; a socket that answered
@@ -51,7 +52,7 @@ export const WS_HEARTBEAT_MS = 30_000
  * That leaves ~an order of magnitude of headroom over the largest legitimate frame while cutting
  * the worst case a single frame can cost the process by ~12×.
  */
-export const WS_MAX_PAYLOAD = 8 * 1024 * 1024
+export const WS_MAX_PAYLOAD = WS_CLIENT_FRAME_MAX
 
 export interface WsServerOpts {
   platform: ServerPlatform

@@ -271,7 +271,7 @@ factories (`createTerminalNode`, `createSshTerminalNode`, `createAgentNode(agent
 group transforms (`groupSelectedNodes`, `ungroupNodes`, `duplicateNode`), and the
 `nodeStatesToFlow` / `flowToNodeStates` serializers. Node kinds (`NodeKind` in
 `src/shared/types.ts`): `terminal | sticky | group | editor | diff | video | web | browser |
-files | subagent | loop | dino | trigger` — `subagent` and `loop` are render-only (ephemeral hook-driven
+files | subagent | loop | dino | trigger | simulator | whiteboard` — `subagent` and `loop` are render-only (ephemeral hook-driven
 viz) and never persisted. `trigger` (issue #493, all four
 phases landed) is a first-class PERSISTED kind. The whole host-side
 machine is composed ONCE in `core/trigger-service.ts` (`startTriggerService`) and booted
@@ -313,6 +313,60 @@ Persistence has two layers:
   | folder-ref | `<cwd>/.nodeterm/project.json` (git-shared) | `cwd` + header + machine-local half |
   | ssh-ref | the same file on the host | `ssh` + header + `cache` (offline copy, rev-reconciled) |
   | local-data-ref | `userData/inline-projects/<id>.json` | `dataFile` + header + `project` (cache) |
+  | folder-data-ref | `userData/inline-projects/<id>.json` | `cwd` + `dataFile` + header + `project` (cache, stored WITHOUT `cwd`) |
+
+  **The folder-data-ref (issue #1145)** is a folder project whose canvas is kept in app data
+  (`Project.storeInAppData`) so that nothing is written into the folder — for client repos and
+  folders the user does not own. It is a local-data ref with a working directory: the file and the
+  cache hold the project without `cwd` (node cwds stay absolute), so the inline load and write paths
+  serve it unchanged and the entry adds the folder back. Three rules keep the promise:
+  `folderFileCwd(e)`, not `e.cwd`, decides every read or write of `<cwd>/.nodeterm/project.json`
+  (watcher, content authority, the phone writers, settings); a missing data file falls back to the
+  cache and then to a grey placeholder, **never** to the folder branch (that would adopt a stale or
+  a teammate's canvas); and the cache's missing `cwd` is the downgrade contract — an older build
+  opens it as a plain inline canvas instead of writing a fresh file into the folder. Its side files
+  follow it: settings.json and the board log under `userData/project-files/<id>/.nodeterm/`
+  (`appDataProjectRoot`; settings still load as `'shared'`; removed with the project when it is
+  deleted, kept when it moves back into its folder), whiteboards in the same root
+  (`whiteboardLocationForProject`; the folder's boards, drawn before the move, are read after it and
+  never written, and a move back copies the app-data boards over the folder's older files —
+  `carryWhiteboards` in `prepareFolderStorage`; not the shared `userData/whiteboards`, which is
+  keyed by node id, and two folders holding one committed canvas share node ids), canvas images to
+  the existing `userData/canvas-images` fallback (`sideFilesFolderForProject`). `localCwdForProject` still answers
+  the folder, because it means where terminals run and what a relay seat is jailed to. Moving
+  between the two is the tab menu's "Store canvas in app data / in folder"
+  (`lib/projectStorageMove.ts`): into app data = save, then `releaseFolderFiles` (refused until the
+  data file holds the canvas; files git tracks are kept unless the user confirms); into the folder =
+  `prepareFolderStorage` (refuses an occupied folder, like "Set folder…"), then save, then
+  `projectStorage` (where the store has the canvas now). New folder projects follow
+  `settings.newProjectStorage`; a folder that already has a project.json is adopted as it is, in its
+  folder. Rules the moves rest on:
+  - **The data file goes only when THIS save wrote the folder file** (`sweepRemovedDataFiles`'
+    `folderFilesWritten`), never because `lastWritten` remembers one: a file can leave the folder
+    behind the store's back (`git rm`, a branch checkout) while the record stays, an unchanged
+    canvas then skipped the write as "unchanged", and the sweep deleted the only copy. For the same
+    reason the record of a folder file is dropped when its project moves into app data (kept file
+    or not) and when an entry takes a folder over from a data file ("Set folder…", a move back).
+  - **A move into the folder whose folder write fails stays in app data, index included**: the
+    folder leg swallows a failed write, so the save keeps that entry a folder-data-ref for that save
+    (`appDataCanvas`, the one builder of its cache). The menu reads `projectStorage` after the save,
+    puts the flag back and says the move failed; it never reads a landed save as a landed move.
+  - The rev continues across a move (the sweep keeps it for an id that is still live).
+
+  **Known limits:** an older build that opens a folder-data-ref while a folder `project.json` is
+  still there (a tracked file the user kept) keys its watcher, its phone writer and `readLocalRef`
+  on the entry's `cwd`, so until it next saves its index it can adopt that file as the project
+  (after which the entry is a plain folder ref there and the data file is orphaned). Images and a
+  board log stay on the side they were written on when a project moves, in either direction; so do
+  a folder's whiteboard files after a move into app data (read, never removed). A board edited in
+  app data replaces the folder's file on the move back, including a teammate's newer version of a
+  tracked board pulled in the meantime (git still has it).
+  Handoff files from Transfer still write `<node cwd>/.nodeterm/`. The iOS app does not know the
+  kind: over direct SSH it reads the entry's `project` cache, which has no `cwd`, so it shows a
+  project without a folder (it never reads or writes the folder file, and its board and label
+  writers refuse with no write path; the relay verbs are handled here), and its repo scan finds no
+  `project.json` in that folder, so it can offer the folder as a new project and write one there.
+  SSH projects and Server `team bootstrap` cannot use the kind.
 
   In all three the file carries CONTENT and the entry carries the machine-local half — project
   `id`, `viewport`, `defaultAccountId`, `breadcrumbs`, `closedSessions`, `localApprovalId`,
@@ -540,6 +594,78 @@ project's nodes only.** The contract:
   `liveCanvasHolds` (tag AND active id; otherwise the store) and queues a FUNCTIONAL update
   (`rebaseOnLatest`). Consequence for readers: code pairing the tag with the RENDERED `nodes`
   (a render-time publish, an effect keyed on `nodes`) reads `renderedProjectId`, never the ref.
+- **The node subtree's session follows the project whose nodes React Flow's STORE holds**
+  (`useFlowStoreOwner`, `canvas/flowStoreOwner.ts`), never `activeProjectId`. xyflow copies the
+  `nodes` prop into its store in a PASSIVE effect and `ReactFlowProvider` sits above the keyed
+  `SessionProvider`, so a key that flipped with the active id remounted the OUTGOING project's
+  nodes under the INCOMING session for a commit: a team tab's terminals were created on this
+  desktop's own core, and a local terminal on the relay host. Each array handed to
+  `<ReactFlow nodes>` is recorded against `renderedProjectId` and the store's array is looked up
+  (unknown ⇒ the last known owner); the same id feeds `OwningProjectContext`. A local → local
+  switch keeps the key `'local'` (no remount). A session-changing remount now lands one commit
+  AFTER the load applied the project's camera and builds a fresh pan/zoom, so `<ReactFlow>` gets
+  `defaultViewport={viewportRef.current}`, or the switch resets the camera to the origin. For the
+  same reason the load's settle timer must not frame or read the incoming nodes itself: the
+  pending focus / "Open recent" resume / `nodeterm://` link it finishes run through
+  `useFlowLanding` (`canvas/flowLanding.ts`) once the owner IS that project — React may run the
+  store copy's passive effect after a due timer, which then framed the pan/zoom the remount
+  destroys and read the outgoing copy of a shared node id. The rule holds for a local → local
+  switch too (no remount, but the owner still flips). A caller that would create and frame AT ONCE
+  (`resumeWhenLanded`, `runLinkOpen`) must also ask `flowLanding.holds(projectId)`, never the epoch
+  tag alone: after "Open folder & resume" or a link that opens a new folder, the switch is the
+  folder open's last synchronous step, so the `.then` runs after the load effect installed the tag
+  and before the store copy — every time, not by chance. Otherwise it leaves the work in
+  `pendingResumeRef` / `pendingLinkRef` for the landing. A throw inside a landing is logged, never
+  rethrown: it runs in a passive effect and `<Canvas />` has no error boundary.
+  `flowStoreOwner.test.tsx` replays the switches through real React Flow, the timer firing inside
+  that window and the folder-open continuation included.
+- **A remote project's node never starts on this core, whatever it is mounted under** (bug F: a
+  team tab's terminals were created as LOCAL tmux sessions here). The node itself cannot say so: a
+  project shared from SSH with a team is ADOPTED by the host (`localizeAdoptedNode` drops
+  `sshRemoteTmux`/`ssh`/`sshFs`), so its nodes reach the tab as plain terminals. Do NOT re-stamp
+  `sshRemoteTmux` onto them — the host's core would then refuse its own sessions (`requireRemote`
+  with no master of its own: `held-elsewhere` for a live one, a refused spawn otherwise). Three
+  layers besides the keying above:
+  (1) `sessionForProject` resolves a REMOTE project (`remote` in the store, or bound while remote in
+  this run) with no live binding to the OFFLINE relay session (`OFFLINE_RELAY_SESSION_ID`,
+  `session/offline-relay-session.ts`: `source 'relay'`, `status 'offline'`), never the local one.
+  Its core-bound calls (pty, fs, git, workspace, …) reject, so no terminal can be created here; it
+  is not a wall around this machine, since its api spreads `...local` like a live relay tab's (the
+  local namespaces — contextLink, transcripts, handoff, media — still act here, and its `boardLog`
+  read answers `unsupported`). "Is this project remote?" is ONE predicate, `isRemoteProjectId`
+  (session.ts), shared by this resolution and the spawn refusal in (3). Lifecycle code asking "which
+  session is bound to this tab?" (dispose it, reconnect it) asks `boundSessionForProject`, which
+  never answers the sentinel.
+  (2) A surface that mounts a project's node OUTSIDE Canvas's node subtree runs under that project's
+  session. Both kanban boards render under App's LOCAL provider, so each mounts its card modal
+  through `ProjectSessionScope` (`session/owning-project.ts`: `sessionForProject(<card's project>)`,
+  keyed by session id, plus `OwningProjectContext`). Before it, opening a team tab's terminal card
+  created the host's node id on this desktop every time. The terminal, the comments, the metadata
+  strip and the pull-request panel now act on the card's project (`useOwningProjectId() ??
+  activeProjectId`): the terminal runs under the card project's session, the comments panel reads
+  and writes that project's board log, the metadata strip's member pool reads it, and the
+  pull-request panel reads that project's pull requests, SSH flag and auto-move target. On the Omni
+  board a lane is not the active project: pairing the lane's api with the active id blanked a relay
+  lane's comments and saved new ones nowhere, and on a local lane filed them into the ACTIVE
+  project's board log. A relay card's file links are switched off (`cardFileLinkRoute`) and its ⌘M
+  chat is refused (`stub.chat`, `E_UNSUPPORTED`). **Known exceptions (pre-existing, follow-up):** the
+  icon picker (`NodeIconPicker.chooseImage` resolves the ACTIVE project, so a team lane's card
+  opened while a local project is active copies the picked image into the local project's
+  `.nodeterm/images/`), and dictation and file-drop uploads in a relay card, which act on this
+  machine. The session is resolved at render, so a reconnect while a modal is open takes effect at
+  the board's next render.
+  (3) TerminalNode and ModalTerminal ask `spawnBelongsElsewhere(isRemoteProjectId(owner),
+  session.source)` (`owner` from `OwningProjectContext`; the predicate is the one (1) uses, so a tab
+  the store deleted still counts) before any SSH resolve or create: a remote project under a
+  non-relay session starts nothing and writes a gray "belongs to a remote project that is not
+  connected here" line. ModalTerminal mirrors TerminalNode's `dialsSsh` (a relay card's SSH-project
+  node is joined by the HOST with `requireRemote`; this machine dials, refuses and reports nothing
+  for it), and a non-dialing node's `ownerProjectId` is the owning project, else the active one.
+  `components/kanban/cardModalSession.test.tsx` renders both boards with real sessions and a probe
+  in place of CardModal, asserting which session and owning project each modal mount gets, plus
+  source pins for the two terminals; `components/kanban/boardLogPanelSession.test.tsx` and
+  `cardOwnerProject.test.tsx` render the real comments panel, metadata strip and pull-request panel
+  under a lane's `ProjectSessionScope`; `session/offline-relay-session.test.ts` replays the switches.
 - Switching away unmounts the old project's `TerminalNode`s → their tmux clients detach but
   the sessions keep running; switching back reattaches. tmux session names are per-node-id
   (globally unique), so projects never collide.
@@ -860,9 +986,15 @@ Lifecycle, by intent:
   sides: the renderer never calls `create` when `resolveSshRemote` came back empty
   (`CoState.offline` + the node's Reconnect button), and core refuses in `spawnNew`
   (`PtyCreateResult.unavailable`) so a master that dies inside the round-trip can't sneak through.
-  The refusal is **only** in `spawnNew` — a co-attach JOIN to a live session for that node id is
-  still correct. An offline node reports itself to `SshReconnector`, so the canvas heals itself;
-  `retryNow` (banner Reconnect / node Reconnect) skips the backoff and clears the refuse window.
+  The spawn refusal is in `spawnNew`, and `join` refuses (`'held-elsewhere'`) a `requireRemote`
+  create whose held session is local or on another host (host, user, or port differs) — a join to
+  the SAME remote's live session (a second view over the same endpoint) still attaches, and so does
+  a create that names no `sshRemote` onto a held remote session (its master momentarily down, or a
+  relay tab's create on the host, which carries none). The held session is never killed. A relay /
+  team tab's node, which may carry no `sshRemoteTmux` at all, is kept off this core by the session
+  it runs under plus a renderer-side `spawnBelongsElsewhere` refusal (Projects (tabs)). An
+  offline node reports itself to `SshReconnector`, so the canvas heals itself; `retryNow` (banner
+  Reconnect / node Reconnect) skips the backoff and clears the refuse window.
   **Whether a node is remote comes from its PROJECT, never from its own fields** (issue #1186,
   `@shared/ssh-project-nodes`). `requireRemote`/`sshRemoteTmux` used to be stamped only by this
   machine's node factories, but an SSH project's `project.json` lives on the host and other writers
@@ -2161,6 +2293,29 @@ number: change the table in that one module, never in one emulator.
     one file. Guard on both dialects, construct in one.
   - **Mobile**: N/A — *nodeterm mobile* attaches to tmux sessions over the transport protocol and
     has no canvas or file-browsing concept; adding one means extending that protocol.
+- **whiteboard** (`WhiteboardNode.tsx`, `whiteboard/WhiteboardEditor.tsx`) — an Excalidraw board;
+  full write-up in `docs/whiteboard-node.md`. The invariants: (1) editing is ONE live editor
+  portaled into `.canvas-root` over the node's box, never inside the scaled node (pointer drift,
+  blur, and `.flow-wrap`'s wheel capture); (2) the scene is a side file the core addresses by
+  (project, node id) — `core/whiteboards.ts` — and NEVER by a path from node data (project.json is
+  git-shared, hostile input); node data holds only `whiteboardSource` (a copy's original, by id)
+  and `boardRev` (once per session); (3) the overlay is `data-nt-keyboard-owner`, which every
+  typing-aware key site honours via `isKeyboardOwnerTarget`; (4) every save is a COMPARE-AND-SET:
+  it sends the revision its editor last read or wrote (`rev`, `dev:ino:size:mtimeNs` of the scene
+  file — writers publish by rename, so it changes on every write; `null` = no board of its own yet)
+  and the core refuses it when the file on disk has moved on, so a board open in two places (two
+  tabs, a desktop and a browser on one folder, two hosted-team Editors, a `git pull`) is never
+  silently replaced by the later writer — the editor says "Changed elsewhere" instead. Saves of one
+  board are serialized within a core; two CORES on one folder can still interleave between the
+  check and the rename. The editor's own "has anything changed" test compares with what IT last
+  saved, not with disk. The unmount flush writes a snapshot kept from `onChange` — Excalidraw's api
+  is empty by cleanup time, and reading it there once erased a board; (5) the project folder is
+  bound by its REAL path — a `.nodeterm` or `.nodeterm/whiteboards` symlink leading out of the
+  project is not followed (the board falls back to the app folder); (6) finishing (Esc, a press
+  outside) waits for a save that SUCCEEDED — a failed or refused one keeps the editor open with
+  "Keep mine" / "Discard my changes" in the header, since after the exit there is no flush left to
+  retry — and a hosted-team Viewer opens the board view-only. Excalidraw loads lazily; fonts
+  come from `scripts/excalidraw-assets-plugin.ts`; mermaid is aliased to a stub.
 - **Run node** (a `terminal` node carrying `data.runConfig`, NOT a new NodeKind;
   `@shared/run-config`, `core/run-service.ts`, `nodes/RunBar.tsx`) — VS Code's "Run Without
   Debugging" for any `.vscode/launch.json` configuration. The toolbar picks a folder (defaults to
@@ -7125,8 +7280,9 @@ glass never sits over plain black; a wallpaper the user chose is never replaced.
   backgrounds opaque); the settings preview never does. Glass stands down while a shared glyph grid is
   mounted (it paints text BELOW the nodes, so a tint would cover it), and, only when **Keep blur while
   moving** is off, the blur is dropped while the camera moves (`.canvas-moving`, toggled by
-  `onMoveStart`/`onMoveEnd` via classList so a pan does not re-render Canvas) — the tint alone
-  carries the contrast guarantee.
+  `onMoveStart`/`onMoveEnd` via classList so a pan does not re-render Canvas). Only the blur
+  pauses: nodes keep their backdrop squeeze (see **Backdrop squeeze**), which is what holds the text
+  left of the Readable tick.
 - **App-painted cell backgrounds become glass** (`terminal/glass-cell-backgrounds.ts`). addon-webgl
   0.18.0 paints every background rectangle at alpha 1 (`RectangleRenderer._updateRectangle`,
   `$a = 1`), so full-screen TUIs read as slabs: Grok's `48;2;20;20;20` screen fill, Codex's composer,
@@ -7292,22 +7448,45 @@ glass never sits over plain black; a wallpaper the user chose is never replaced.
   glass header are ink over a tinted chip (`-webkit-text-fill-color: var(--text)` with the chip
   mixed from `currentColor`), not coloured text. `styles.palette.test.ts` pins the mapping and that
   no two meanings resolve to the same colour, in both themes.
+- **Backdrop squeeze: readable at every slider position** (`glassBackdropRange`,
+  `glassChromeBackdropRange`, `glassBackdropFilter` in `glassContrast.ts`). Left of the tick the
+  tint alone measured about 1:1 at Clear (dark text over a black wallpaper, light text over a white
+  one). So each glass node appends a colour-matrix filter that squeezes the backdrop into a range
+  the tint can cover: light glass lifts it to a floor (`contrast(c) brightness(b)` maps 0..1 to
+  lo..1), dark glass caps it (`brightness(hi)`). CSS filter functions work per channel in gamma
+  sRGB, the space `composite` blends in (measured live: predicted 153, rendered 154), so every
+  squeezed channel lies in the range and the grey-endpoint argument still holds. The promise slides
+  with the slider (`glassMinRatio`): `GLASS_CLEAR_RATIO` 3:1 at Clear rising to 4.5:1 at the tick,
+  picked by eye over light and dark wallpapers in both themes (4.5:1 at Clear dimmed bright
+  wallpapers to brown). Light glass also gets a frost floor that fades in toward the tick
+  (`glassFrostFloor`, full `GLASS_LIGHT_FROST` 0.5 from the tick; without it light glass over a dark
+  wallpaper read as grey mud); the text and control chrome chains carry the same floor as a static
+  `--glass-frost` (light only). Terminal nodes get theirs per node as `--term-glass-backdrop`
+  (`useTerminalGlass`); canvas cards (subagent, files, loop, trigger, dino) follow the slider too
+  (`--glass-node-bg` at `glassSurfaceAlpha`, squeeze `--glass-node-squeeze`, both from App.tsx).
+  Glass that needs no squeeze gets no filter (null; `var(--x,)` falls back to nothing), so dark
+  glass at or right of the tick runs the exact chain it ran before. The kanban card modal's terminal
+  has no backdrop filter of its own, so it never goes clearer than the tick
+  (`useTerminalGlass(theme, true)`). Under Liquid Glass the empty-canvas hint is a text-surface pill
+  (its faint ink vanished on the wallpaper). Measured with 4 terminals panning: no frame-time change.
 - **Glass slider + refraction** (Settings → Appearance, shown only under Liquid Glass; iOS 26's
   Clear ↔ Tinted). `settings.glassTint` is a slider POSITION, not an alpha (`null` = the Readable
   tick, read through `resolveGlassSlider`): every surface has its own readable alpha, so each maps
-  the position through three points — `GLASS_CLEAR_ALPHA` 0.2 at Clear (terminal nodes; chrome controls 0.35, text surfaces never below readable — see Liquid Glass chrome), its OWN computed readable
+  the position through three points — `GLASS_CLEAR_ALPHA` 0.05 at Clear (terminal nodes and canvas cards; chrome controls 0.35, text surfaces never below readable — see Liquid Glass chrome), its OWN computed readable
   alpha at `GLASS_READABLE_TICK` (0.7), `max(readable, 0.95)` at Tinted (`glassSliderAlpha`). At the
   tick every surface is exactly at the alpha `glassTintAlpha`/`glassChromeAlpha` computed, and every
-  alpha right of it is higher — so Readable→Tinted keeps 4.5:1; left of the tick the row says the
-  guarantee is off. Measured: chrome dark 0.20 / 0.70 / 0.95, chrome light 0.20 / 0.745 / 0.95,
-  nodeterm-dark 0.20 / 0.675 / 0.95 (Clear / Readable / Tinted). App.tsx sets `--glass-t` (blur
-  16→28px on chrome and × 0.85 = 13.6→23.8px on terminal nodes via `--glass-term-blur`; saturation
+  alpha right of it is higher, so Readable→Tinted keeps 4.5:1 from the tint alone; left of the tick
+  the backdrop squeeze carries a sliding promise (see **Backdrop squeeze**). Measured: chrome dark
+  0.05 / 0.70 / 0.95, chrome light 0.05 / 0.745 / 0.95, nodeterm-dark 0.05 / 0.675 / 0.95 (Clear /
+  Readable / Tinted). App.tsx sets `--glass-t` (blur 16→28px on chrome text and controls; canvas
+  cards (`--glass-blur`) and terminal nodes (`--glass-term-blur`, × 0.85) run 4px at Clear up to the
+  same 24.4px at the tick, `16 + 12t − 12·max(0, 1 − t/0.7)`, picked by eye so Clear reads through; saturation
   `--glass-sat` 180% at Clear → 150% from the Readable tick to Tinted, text surfaces a flat 150% —
   round 2 N9: 1.6–2.0 turned glass olive or pink over bright wallpapers). **Refraction** is ONE shared SVG filter
   (`components/GlassRefraction.tsx`, `#nt-refract`: a 256² edge-lens displacement map generated once,
   `primitiveUnits="objectBoundingBox"` so one filter fits every element), referenced from
-  `--glass-blur` as `url(#nt-refract)` — no per-node filters. **It runs LAST in the chain**
-  (`blur() saturate() url()`) and composites over its SourceGraphic so its output is opaque: first in
+  `--glass-blur` as `url(#nt-refract)` — no per-node filters. **It runs after the blur**
+  (`blur() saturate() url()`; only the colour-matrix squeeze may follow it, since it moves no pixels) and composites over its SourceGraphic so its output is opaque: first in
   the chain (plus an in-filter soft blur with default edgeMode) it let Chromium show a 20–40px band of
   SHARP backdrop inside every glass rim at every slider value (visual QA C1). Measured on an empty
   `.ctx-menu` over terminal text, rim-band high-frequency energy 2.55 → 0.20 (Clear), 1.90 → 0.07
@@ -8515,8 +8694,10 @@ the Settings section and ShortcutsPanel start disagreeing about what a chord mea
   node shows its column as a **half-pill flush on the node's TOP edge** — see the pill sentence
   below. A card's ↗ / double-click opens the **card modal** (`components/kanban/CardModal.tsx`, body
   portal on the dialog-stack, scrim z 55, scrim/Esc close — Esc in CAPTURE phase, and an Esc
-  during a header rename only cancels the edit). Terminal cards get a LIVE second view of the
-  tmux session (`ModalTerminal.tsx`): the pty subscriber ledger is keyed by the composite
+  during a header rename only cancels the edit). The modal runs under the CARD project's session
+  (`ProjectSessionScope` — the boards themselves sit under App's local provider; see "A remote
+  project's node never starts on this core" under Projects). Terminal cards get a LIVE second
+  view of the tmux session (`ModalTerminal.tsx`): the pty subscriber ledger is keyed by the composite
   `(ClientId, viewerId ?? PRIMARY)` (`core/pty-manager.ts` — **viewer identity**; viewerId is an
   optional TRAILING arg through preload/ws-bridge/LocalTransport, absent = bit-for-bit legacy, and
   a client's per-connection socket pause survives a single view's departure). The modal viewer
@@ -8788,8 +8969,13 @@ the Settings section and ShortcutsPanel start disagreeing about what a chord mea
   should gain the three categories. All three are the iOS follow-up, not desktop work.
 - **Omni Kanban (global swimlanes)** (`components/kanban/GlobalKanbanView.tsx`; one swimlane per open project; `state/viewMode.ts` `globalKanban` (localStorage `nodeterm.globalKanban`, machine-local, like `viewByProject`) + `settings.omniKanbanEnabled` (feature gate, default OFF, `settings.json`) / `omniKanbanAsDefault` (when true, `view.kanbanToggle` — Cmd+Shift+B — opens Omni; otherwise per-project; `view.globalKanbanToggle` registry command — unbound, remappable — always opens Omni when enabled); **Omni is a SCOPE of the kanban side, not a third view**: the view toggle (tab icon, ⌘⇧B, the menu) flips canvas ⇄ board, and a board header's `KanbanScopeSwitch` ("This project" / "All projects", rendered only while the feature is on) moves between the two scopes — so leaving Omni through the switch lands on the project's board, and the view toggle from Omni lands on the canvas (it used to fall through to whatever the project's view happened to be, so "Canvas view" from Omni could land on a board). The decisions live once in `state/viewMode.ts` (`toggleBoardView` / `toggleAllProjectsBoard` / `showProjectBoard` / `showCanvas`), called by TabBar, the menu IPC and both registry commands; Omni has no close button. `globalKanban` deliberately stays independent of the active project, so a project switch made from a lane does not drop the user out of Omni. `isGlobalKanbanOpen()` is the single gate (fail-closed, static import of `useSettings` — the earlier `require` failed open in the packaged renderer). Non-active lanes are derived from serialized `p.nodes` via `toKanbanSessionState` (the persisted-state counterpart to `toKanbanSession`); the ACTIVE project's lane is fed LIVE by Canvas (`GlobalKanbanLive`: the same `kanbanSessionsFrom(nodes)` cards + live `teamStations` the per-project board uses), because its edits reach the store only at the next ~800 ms autosave — a store-fed lane reverted the card modal's controlled sticky textarea on every keystroke and pruned the assignment of a card created a moment earlier. The open card modal is ONE overview-level fact reported to Canvas's `setKanbanModalNode` (watched for Eco, wake-on-open, dictation target), never per-lane state; each lane's board write resolves ITS project's session (`sessionForProject`) for the hosted read-only refusal and the board-log api; `pendingLaunch` never becomes `initialCommand` in the modal (the DAG launch must fire only when dependencies report done, and the canvas `TerminalNode` already delivers `initialCommand` via `writeWhenShellReady` after the `nodeterm:create-node` project switch). Active-project edits (rename / sticky / browser nav) route through Canvas live nodes (`setNodes` + `markDirty`), non-active through the store + `writeDisk`; delete uses `ConfirmDialog` (not `confirm`) and then `deleteNodes` (active project) or `closeStoredNodes` (any other) — the existing cross-project teardown funnel, never a hand-rolled copy. The top bar's project pills and Cmd/Ctrl+1..9 (`nodeterm:swimlane-jump`) jump to the lane; header hint shows the correct mod (`Cmd` on Mac, `Ctrl` elsewhere). Server Edition works as-is, Mobile N/A.
 - **Settings** (`SettingsPage.tsx`, ⚙ / ⌘,): font/cursor (live to xterm + Monaco), default
-  shell, grid + snap, **default node size** (`defaultNodeWidth`/`defaultNodeHeight` — new
-  terminal/agent nodes only, clamped in `terminalNodeSize()` in `state/workspace.ts`),
+  shell, grid + snap, **default node size** (one row with a kind picker: terminal/agent is the
+  `defaultNodeWidth`/`defaultNodeHeight` pair, clamped in `terminalNodeSize()`; every other kind
+  the add menus create is an optional entry in `defaultNodeSizes`, resolved by `defaultNodeSize(kind)`
+  in `state/workspace.ts` through `@shared/default-node-size`, which clamps hand edits to the kind's
+  `NODE_MIN_SIZES` and 2400×1600 — new factories must place through `placeSized`, not a literal
+  `*_SIZE`, or the setting silently stops applying to that kind; the agent `settings` verb exposes
+  only the terminal pair),
   pan-hover delay, double-click focus, accent, tmux on/scrollback, commit agent,
   `seenShortcuts`. **Every section is MOUNTED whenever Settings is open** — an inactive one
   returns null from `SettingsSection`, but its hooks and the whole render body above that return
@@ -9831,8 +10017,8 @@ under one `$HOME`, with different bytes; the last writer wins.
 `context:update` metadata (deploy one core per team); a viewer's socket backlog over 1 MB still
 pauses the shared pty through Stage 2 backpressure; the canvas authority's own limits (a project's
 non-content fields stay last writer wins between tabs, the share-time window, oversized nodes, board
-edits to another core, load-time repairs that are never cast, the card modal's comments on a relay
-tab) are under "Known limits" in the doc.
+edits to another core, load-time repairs that are never cast, the GitHub issue summary modal's
+"Agent runs" log on a relay tab) are under "Known limits" in the doc.
 
 **Surfaces:** Desktop is full (joiner, plus approval and invite code in an owner's hosted tab, plus
 Share with team from any desktop OS onto a Linux host). Server Edition is the host (the `team` CLI,
@@ -9893,7 +10079,16 @@ Voice-to-text input captured via microphone, turned into terminal text via on-de
   SIMD flags in ggml), a GPU backend (this smart-whisper has no Vulkan build option), cancelling a
   running transcription, and the Server Edition (installed with `--ignore-scripts`, so it keeps the
   baseline; the startup log line `[speech] whisper binary: …` says which binary loaded).
-- **smart-whisper's model params are patched to start from whisper.cpp's defaults** (second patch in
+- **macOS: smart-whisper's Metal shader path is patched to the unpacked copy** (second patch in
+  `scripts/patch-smart-whisper.mjs`, marker `NODETERM-PATCH(smart-whisper-metal-asar)`). smart-whisper
+  sets `GGML_METAL_PATH_RESOURCES` from its own `__dirname`, which in the packaged app is inside
+  `app.asar`; native code cannot read inside an asar ("Not a directory"), so Metal init failed and
+  whisper.cpp ran on the CPU with no error shown. The shader file is already unpacked (asarUnpack), so
+  the patch rewrites `app.asar` to `app.asar.unpacked` in that path. MEASURED with the app's own binary
+  on an M5 Pro, large-v3-turbo, 2.7 s clip: 5.97 s on the CPU, 0.64 s on Metal; in the app, dictation
+  went from several seconds to under one. A dev install and an explicit `GGML_METAL_PATH_RESOURCES`
+  are unchanged.
+- **smart-whisper's model params are patched to start from whisper.cpp's defaults** (third patch in
   `scripts/patch-smart-whisper.mjs`, marker `NODETERM-PATCH(smart-whisper-ctx-params)`, every
   platform). Its `LoadModel` declared `whisper_context_params params;` and set only `use_gpu`, so DTW,
   `gpu_device`, `flash_attn` and the rest were uninitialized stack memory and the result depended on
