@@ -318,6 +318,21 @@ describe('an unbound REMOTE project resolves to the offline relay session', () =
     expect(() => bindProjectToSession(TEAM_ALPHA, OFFLINE_RELAY_SESSION_ID)).toThrow()
   })
 
+  it('a remote tab the store has since deleted still resolves offline; a never-remote one stays local', () => {
+    const relay = createSession('relay', fakeApi('host'), 'e2ehost')
+    bindProjectToSession(TEAM_ALPHA, relay.id) // remote in the store at bind time
+    // Team Access's fallback tab (`addProject(label)`, not marked remote) bound to the same session.
+    bindProjectToSession(LOCAL_ONE, relay.id)
+    disposeSession(relay.id)
+    useProjects.setState({ projects: [localProject()] }) // TEAM_ALPHA leaves the store
+    expect(sessionForProject(TEAM_ALPHA).id).toBe(OFFLINE_RELAY_SESSION_ID)
+    expect(presenceForProject(TEAM_ALPHA)).toBe(getSessionStores(OFFLINE_RELAY_SESSION_ID).presence)
+    // The store's answer wins while it holds the project: never remote ⇒ local.
+    expect(sessionForProject(LOCAL_ONE).id).toBe('local')
+    // An id that was never bound remote stays local.
+    expect(sessionForProject('project-never-seen').id).toBe('local')
+  })
+
   it('(e) sessionCount() does not count the sentinel', () => {
     expect(sessionForProject(TEAM_ALPHA).id).toBe(OFFLINE_RELAY_SESSION_ID)
     expect(sessionCount()).toBe(1)
@@ -410,6 +425,31 @@ describe('ported repro scenarios: a team tab without a live binding creates noth
     expect(localCreatesOfTeamNodes()).toEqual([])
     expect(outcomes.map((o) => o.session)).toEqual([OFFLINE_RELAY_SESSION_ID, OFFLINE_RELAY_SESSION_ID])
     expect(outcomes.every((o) => o.result === 'rejected')).toBe(true)
+    expect(localApi.pty.create).not.toHaveBeenCalled()
+  })
+
+  // Found while enumerating: `teamTabStoreOps.removeTab` (a host that stops sharing a project)
+  // deletes the tab from the STORE and unbinds it. When it was the only open tab the welcome screen
+  // keeps its nodes mounted, and an id the store no longer holds would read as "not remote".
+  it('the host stops sharing the only open team tab (store delete) while its nodes are mounted', async () => {
+    useProjects.setState({ projects: [teamTabProject()], activeProjectId: TEAM_ALPHA })
+    const relay = createSession('relay', fakeApi('host'), 'e2ehost')
+    bindProjectToSession(TEAM_ALPHA, relay.id)
+    await mount()
+    creates = []
+    outcomes = []
+    await act(async () => {
+      unbindProject(TEAM_ALPHA)
+      useProjects.getState().deleteProject(TEAM_ALPHA)
+    })
+    await settle()
+    expect(useProjects.getState().activeProjectId).toBe('')
+    expect(useProjects.getState().getProject(TEAM_ALPHA)).toBeUndefined()
+    expect(localCreatesOfTeamNodes()).toEqual([])
+    expect(outcomes.map((o) => [o.session, o.result])).toEqual([
+      [OFFLINE_RELAY_SESSION_ID, 'rejected'],
+      [OFFLINE_RELAY_SESSION_ID, 'rejected']
+    ])
     expect(localApi.pty.create).not.toHaveBeenCalled()
   })
 

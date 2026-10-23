@@ -50,6 +50,12 @@ export const OFFLINE_RELAY_SESSION_ID = 'relay-offline'
 let offlineApiFactory: (() => NodeTerminalApi) | null = null
 /** The offline session, built lazily on first use, once per registry. */
 let offline: Entry | null = null
+/** Project ids bound to a session while the projects store marked them `remote`. A remote tab can
+ *  leave the store while its nodes are still mounted — a host that stops sharing the only open team
+ *  tab deletes it from the store, and the welcome screen keeps its nodes in React Flow — and an id
+ *  the store no longer holds must still not resolve local. The store's own answer wins whenever it
+ *  still holds the project. Runtime only, like the bindings. */
+const KNOWN_REMOTE = new Set<string>()
 
 /** The per-session store instances. `createPresenceSession` is memoized BY API IDENTITY, so the
  *  one-store-per-core guarantee needs no source branch here: the local session's api is
@@ -152,6 +158,7 @@ export function resetSessionsForTest(): void {
   activeId = null
   remoteSeq = 0
   offline = null
+  KNOWN_REMOTE.clear()
 }
 
 /** Register (or, with `null`, drop) the builder of the offline relay session's api. Production
@@ -234,6 +241,7 @@ export function sessionCount(): number {
 export function bindProjectToSession(projectId: string, sessionId: string): void {
   if (!SESSIONS.has(sessionId)) throw new Error(`[session] no session ${sessionId}`)
   PROJECT_BINDINGS.set(projectId, sessionId)
+  if (useProjects.getState().getProject(projectId)?.remote) KNOWN_REMOTE.add(projectId)
 }
 
 /** Unbind ONE project (a hosted team stopped sharing it, or the user closed that one of the team's
@@ -277,9 +285,11 @@ export function boundSessionForProject(projectId: string): WorkspaceSession | nu
  *  — its session was disposed (the last team tab closed) or its binding dropped — resolves to the
  *  OFFLINE relay session, never the local one: its node ids live on another machine, and a node
  *  still mounted under the local session would create them on this desktop's core (bug F). Every
- *  core-bound call on the offline session rejects. A stale binding is pruned. An id the store does
- *  not know (a deleted project, '' on the welcome screen) is not evidence of anything remote and
- *  resolves local, as does a remote project when no offline factory is registered. */
+ *  core-bound call on the offline session rejects. A stale binding is pruned. A remote tab the store
+ *  has since deleted (a host that stopped sharing it) still resolves offline if it was bound while
+ *  remote in this run; any other id the store does not know ('' on the welcome screen) is not
+ *  evidence of anything remote and resolves local, as does a remote project when no offline factory
+ *  is registered. */
 export function sessionForProject(projectId: string): WorkspaceSession {
   const bound = boundSessionForProject(projectId)
   if (bound) return bound
@@ -287,11 +297,14 @@ export function sessionForProject(projectId: string): WorkspaceSession {
   return off ? off.session : localOrActiveSession()
 }
 
-/** The offline session's entry when `projectId` is a REMOTE project of the projects store — the
- *  one rule `sessionForProject` and `presenceForProject` share. The caller has already found no
- *  live binding. `null` for any other id, or when no offline factory is registered. */
+/** The offline session's entry when `projectId` is a REMOTE project — `remote` in the projects
+ *  store, or (once the store no longer holds it) bound while it was (`KNOWN_REMOTE`) — the one rule
+ *  `sessionForProject` and `presenceForProject` share. The caller has already found no live binding.
+ *  `null` for any other id, or when no offline factory is registered. */
 function offlineForUnboundRemote(projectId: string): Entry | null {
-  if (!projectId || !useProjects.getState().getProject(projectId)?.remote) return null
+  if (!projectId) return null
+  const stored = useProjects.getState().getProject(projectId)
+  if (!(stored ? stored.remote : KNOWN_REMOTE.has(projectId))) return null
   return offlineEntry()
 }
 
