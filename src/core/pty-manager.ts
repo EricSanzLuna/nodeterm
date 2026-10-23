@@ -303,6 +303,31 @@ const PROJECT_OVERRIDES_TIMEOUT_MS = 2_000
 const PROBE_TIMEOUT_MS = 6_000
 
 /**
+ * Ceiling for the SYNCHRONOUS tmux calls on the boot/spawn path (`ensureTmux`'s `source-file`,
+ * `ensureUpdateEnvKeys`' `show-options` / `set-option`). They block the main thread, and one runs
+ * before `createWindow`: against a tmux server that accepts the connection but never answers
+ * (stuck on a blocked client write, or SIGSTOPped) an unbounded call froze main with no window
+ * and no error — a 2026-10 repro held a client 4.05 s, exactly the wedged
+ * listener's lifetime, i.e. forever against a server that never recovers. A healthy server
+ * answers these in milliseconds, so 2 s only ever fires on a wedge. `vm_stat` already has 5 s.
+ */
+export const TMUX_BOOT_CMD_TIMEOUT_MS = 2_000
+
+/**
+ * After a `show-options` / `set-option` in `ensureUpdateEnvKeys` times out, how long it runs no
+ * synchronous tmux call at all. Every spawn passes the account-scope names, so without it each
+ * later spawn on a slow-but-alive server would block main for up to TMUX_BOOT_CMD_TIMEOUT_MS
+ * again (a 20-terminal restore: about 40 s of stalls). Once it ends the next spawn probes again,
+ * so a server that recovered is still learned.
+ */
+export const TMUX_UPDATE_ENV_COOLDOWN_MS = 60_000
+
+/** Outcome of one bounded synchronous tmux call. `timeout` is a wedged server and is LOGGED;
+ *  `failed` is the ordinary "no server running yet" exit and stays silent, as it always was.
+ *  Callers fail open on both — neither is `ok: true` with empty output. */
+type TmuxSyncResult = { ok: true; stdout: string } | { ok: false; reason: 'timeout' | 'failed' }
+
+/**
  * `execFile`, bounded. Wrapped HERE rather than at the call sites so a new one cannot forget: the
  * bug this exists for was one unbounded call out of twenty, and the next unbounded call would be
  * just as invisible. Callers may still pass their own `timeout` for the rare op that needs longer.
@@ -2045,12 +2070,39 @@ export class PtyManager {
     // The tmux server outlives the app, so it won't re-read `-f` on relaunch. Push the
     // (possibly updated) config into a running server now so new bindings apply immediately;
     // a no-op error when no server exists yet (the next session loads it fresh via `-f`).
+    // Bounded: this runs before the first window exists. A timeout keeps tmux
+    // resolved — only the config push is skipped, and runTmuxSync has already logged it.
+    this.runTmuxSync(['source-file', this.confPath], false)
+  }
+
+  /** Per-instance so a test can prove the bound in milliseconds; production never changes it. */
+  tmuxBootCmdTimeoutMs = TMUX_BOOT_CMD_TIMEOUT_MS
+
+  /**
+   * One synchronous tmux call on our socket, bounded by `tmuxBootCmdTimeoutMs`. SIGKILL, not the
+   * default SIGTERM: a wedged client that ignores or never services SIGTERM would keep
+   * `execFileSync` waiting on its exit, which is the very hang this bound exists to end. The
+   * signal goes to the short-lived tmux CLIENT we just spawned — never to the server, which holds
+   * every session and is not touched.
+   */
+  private runTmuxSync(args: string[], capture: boolean): TmuxSyncResult {
+    if (!this.tmuxPath) return { ok: false, reason: 'failed' }
     try {
-      execFileSync(this.tmuxPath, ['-L', TMUX_SOCKET, 'source-file', this.confPath], {
-        stdio: 'ignore'
+      const out = execFileSync(this.tmuxPath, ['-L', TMUX_SOCKET, ...args], {
+        stdio: capture ? ['ignore', 'pipe', 'ignore'] : 'ignore',
+        timeout: this.tmuxBootCmdTimeoutMs,
+        killSignal: 'SIGKILL'
       })
-    } catch {
-      // no server running yet — ignore
+      return { ok: true, stdout: out ? out.toString() : '' }
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code === 'ETIMEDOUT') {
+        console.warn(
+          `[pty] tmux ${args[0]} on -L ${TMUX_SOCKET} timed out after ${this.tmuxBootCmdTimeoutMs}ms` +
+            ' — the tmux server is not answering; continuing without it'
+        )
+        return { ok: false, reason: 'timeout' }
+      }
+      return { ok: false, reason: 'failed' }
     }
   }
 
@@ -2062,6 +2114,8 @@ export class PtyManager {
   /** `update-environment` names already pushed to the running server this app-run (plus the
    *  conf-baked set), so a custom agent's spawn costs at most one `set-option` per NEW key. */
   private updateEnvKeys: Set<string> | null = null
+  /** Epoch ms until which `ensureUpdateEnvKeys` makes no tmux call (a recent timeout). */
+  private updateEnvCooldownUntil = 0
 
   /** Make the shared tmux server copy these client-env names into new sessions. The conf bakes
    *  the fixed gateway list; a CUSTOM agent's env keys are user-defined and can only be appended
@@ -2076,33 +2130,34 @@ export class PtyManager {
       (n) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(n) && n !== 'PATH' && n !== 'LANG'
     )
     if (!wanted.length) return
+    if (Date.now() < this.updateEnvCooldownUntil) return
     if (!this.updateEnvKeys) {
+      const shown = this.runTmuxSync(['show-options', '-g', 'update-environment'], true)
+      // A wedged server: stop here. Every `set-option` below would wait out the same bound — one
+      // stall per new name on the spawn path — and leaving the cache unset lets a spawn after the
+      // cooldown probe a recovered server properly. The spawn itself goes ahead.
+      if (!shown.ok && shown.reason === 'timeout') {
+        this.updateEnvCooldownUntil = Date.now() + TMUX_UPDATE_ENV_COOLDOWN_MS
+        return
+      }
       this.updateEnvKeys = new Set(MODEL_GATEWAY_ENV_KEYS)
-      try {
-        const out = execFileSync(
-          this.tmuxPath,
-          ['-L', TMUX_SOCKET, 'show-options', '-g', 'update-environment'],
-          { stdio: ['ignore', 'pipe', 'ignore'] }
-        ).toString()
-        for (const m of out.matchAll(/update-environment\[\d+\]\s+(\S+)/g)) {
+      // `failed` is "no server yet" — the conf list is what a fresh server will have.
+      if (shown.ok) {
+        for (const m of shown.stdout.matchAll(/update-environment\[\d+\]\s+(\S+)/g)) {
           this.updateEnvKeys.add(m[1])
         }
-      } catch {
-        /* no server yet — the conf list is what a fresh server will have */
       }
     }
     for (const name of wanted) {
       if (this.updateEnvKeys.has(name)) continue
-      try {
-        execFileSync(
-          this.tmuxPath,
-          ['-L', TMUX_SOCKET, 'set-option', '-ga', 'update-environment', name],
-          { stdio: 'ignore' }
-        )
-        this.updateEnvKeys.add(name)
-      } catch {
-        /* no server yet — fresh-server sessions inherit the client env directly */
+      const set = this.runTmuxSync(['set-option', '-ga', 'update-environment', name], false)
+      if (set.ok) this.updateEnvKeys.add(name)
+      // One timeout per call, not per name: the rest would only wait out the same wedge.
+      else if (set.reason === 'timeout') {
+        this.updateEnvCooldownUntil = Date.now() + TMUX_UPDATE_ENV_COOLDOWN_MS
+        break
       }
+      /* `failed`: no server yet — fresh-server sessions inherit the client env directly */
     }
   }
 
