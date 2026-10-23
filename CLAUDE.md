@@ -327,8 +327,12 @@ Persistence has two layers:
   opens it as a plain inline canvas instead of writing a fresh file into the folder. Its side files
   follow it: settings.json and the board log under `userData/project-files/<id>/.nodeterm/`
   (`appDataProjectRoot`; settings still load as `'shared'`; removed with the project when it is
-  deleted, kept when it moves back into its folder), canvas images to the existing
-  `userData/canvas-images` fallback (`sideFilesFolderForProject`). `localCwdForProject` still answers
+  deleted, kept when it moves back into its folder), whiteboards in the same root
+  (`whiteboardLocationForProject`; the folder's boards, drawn before the move, are read after it and
+  never written, and a move back copies the app-data boards over the folder's older files —
+  `carryWhiteboards` in `prepareFolderStorage`; not the shared `userData/whiteboards`, which is
+  keyed by node id, and two folders holding one committed canvas share node ids), canvas images to
+  the existing `userData/canvas-images` fallback (`sideFilesFolderForProject`). `localCwdForProject` still answers
   the folder, because it means where terminals run and what a relay seat is jailed to. Moving
   between the two is the tab menu's "Store canvas in app data / in folder"
   (`lib/projectStorageMove.ts`): into app data = save, then `releaseFolderFiles` (refused until the
@@ -353,7 +357,10 @@ Persistence has two layers:
   still there (a tracked file the user kept) keys its watcher, its phone writer and `readLocalRef`
   on the entry's `cwd`, so until it next saves its index it can adopt that file as the project
   (after which the entry is a plain folder ref there and the data file is orphaned). Images and a
-  board log stay on the side they were written on when a project moves, in either direction.
+  board log stay on the side they were written on when a project moves, in either direction; so do
+  a folder's whiteboard files after a move into app data (read, never removed). A board edited in
+  app data replaces the folder's file on the move back, including a teammate's newer version of a
+  tracked board pulled in the meantime (git still has it).
   Handoff files from Transfer still write `<node cwd>/.nodeterm/`. The iOS app does not know the
   kind: over direct SSH it reads the entry's `project` cache, which has no `cwd`, so it shows a
   project without a folder (it never reads or writes the folder file, and its board and label

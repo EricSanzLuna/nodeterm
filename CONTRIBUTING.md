@@ -1156,7 +1156,9 @@ folder-data-ref (issue #1145: a folder project whose canvas lives in app data): 
 inline one, `writeDataFile`'s rule decides between instances, and the rev continues across a move
 between the folder and app data. Anything that reads or writes `<cwd>/.nodeterm/` must ask
 `folderFileCwd(e)` (or the side-file accessors), never `e.cwd` alone — a project can have a cwd and
-nothing in its folder. And `lastWritten` is a record, not evidence that a file is on disk: a file
+nothing in its folder. Such a project's side files keyed by node id (whiteboards) go under its own
+app-data root, never into a folder every project shares: two folders holding one committed canvas
+share node ids. And `lastWritten` is a record, not evidence that a file is on disk: a file
 can leave a folder behind the store's back (`git rm`, a checkout), so nothing may be deleted
 because the store remembers writing its replacement. The data-file sweep asks what THIS save wrote.
 
