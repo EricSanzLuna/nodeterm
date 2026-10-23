@@ -73,7 +73,7 @@ describe('relay advertisement — skip unchanged rewrites', () => {
     const ad = createRelayAdvertiser(file)
     await ad.write(AD)
     await ad.remove()
-    await expect(fs.access(file)).rejects.toThrow()
+    await expect(fs.readFile(file, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
     await ad.write(AD)
     expect(atomic.writes).toBe(2)
     expect(JSON.parse(await fs.readFile(file, 'utf8'))).toEqual(AD)

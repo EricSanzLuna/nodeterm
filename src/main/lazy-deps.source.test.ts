@@ -34,7 +34,7 @@ describe('lazily loaded main-process dependencies', () => {
 
   for (const dep of LAZY) {
     it(`no shipped module value-imports '${dep}'`, () => {
-      const esc = dep.replace(/[-/]/g, '\\$&')
+      const esc = dep.replace(/[.*+?^${}()|[\]\\/-]/g, '\\$&')
       // `import x from`, `import { a } from`, `import 'dep'`, `export … from` — but not `import type`.
       // `[^'"]` (not `[^;]`: this codebase has no semicolons) keeps a match inside one statement —
       // it cannot run past an earlier import's own specifier — while still spanning a multi-line `{ … }`.
