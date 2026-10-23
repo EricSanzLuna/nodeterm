@@ -11,12 +11,13 @@ import type { NodeKind } from './types'
 
 export type SizableNodeKind = Extract<
   NodeKind,
-  'sticky' | 'editor' | 'diff' | 'video' | 'web' | 'browser' | 'files' | 'dino' | 'trigger' | 'simulator'
+  'sticky' | 'editor' | 'diff' | 'video' | 'web' | 'browser' | 'files' | 'dino' | 'trigger' | 'simulator' | 'whiteboard'
 >
 
 /** In the order the Settings picker lists them. */
 export const SIZABLE_NODE_KINDS: readonly SizableNodeKind[] = [
   'sticky',
+  'whiteboard',
   'browser',
   'web',
   'editor',

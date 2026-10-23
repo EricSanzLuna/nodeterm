@@ -578,6 +578,10 @@ export const IPC = {
   filesSaveUpload: 'files:save-upload',
   /** Write a canvas image into the project's own `.nodeterm/images/` (see core/canvas-images.ts). */
   filesSaveCanvasImage: 'files:save-canvas-image',
+  /** A whiteboard node's side file (core/whiteboards.ts). Addressed by (projectId, nodeId); the
+   *  receiving core derives the path, so a caller can never name one. */
+  filesSaveWhiteboard: 'files:save-whiteboard',
+  filesReadWhiteboard: 'files:read-whiteboard',
   /** Custom agent-alert sounds (issue #289) — stored under the core's data dir, addressed by kind. */
   filesSaveAlertSound: 'files:save-alert-sound',
   filesReadAlertSound: 'files:read-alert-sound',

@@ -1,6 +1,7 @@
 import type { ChatPromptResult, EmptyPromptResult, TextDeliveryResult } from './text-delivery'
 import type { PushWebhookMinted, PushWebhookResult, PushWebhookTokenInfo } from './push-webhook'
 import type { IdentitySeedEntry } from './agent-identity-seed'
+import type { WhiteboardFile, WhiteboardSaveResult } from './whiteboard'
 import type { PrWaitHold } from './pr-wait'
 import type { SessionBackend } from './session-backend'
 import type { AgentIntegrationsSettings } from './agent-integrations'
@@ -443,7 +444,7 @@ export interface RecycledInfo {
 // 'subagent' and 'loop' are render-only (ephemeral hook-driven viz) and never persisted.
 // 'trigger' is a first-class PERSISTED kind (issue #493) — the canvas-owned schedule node; its
 // spec rides `CanvasNodeState.trigger` and is sanitized on every load path (@shared/trigger).
-export type NodeKind = 'terminal' | 'sticky' | 'group' | 'editor' | 'diff' | 'video' | 'web' | 'browser' | 'files' | 'subagent' | 'loop' | 'dino' | 'trigger' | 'simulator'
+export type NodeKind = 'terminal' | 'sticky' | 'group' | 'editor' | 'diff' | 'video' | 'web' | 'browser' | 'files' | 'subagent' | 'loop' | 'dino' | 'trigger' | 'simulator' | 'whiteboard'
 
 /** Persisted state of a single canvas node (terminal, sticky note, group frame, or editor). */
 /**
@@ -631,6 +632,15 @@ export interface CanvasNodeState {
    */
   textUpdatedAt?: number
   textUpdatedBy?: string
+  /**
+   * whiteboard-only: the board this node shows until it saves its own — set on a duplicate or a
+   * reopen (which get a NEW id) so the copy needs no file copy and no board file is ever deleted.
+   * A node id, never a path: the core resolves it inside this project (core/whiteboards.ts).
+   */
+  whiteboardSource?: string
+  /** whiteboard-only: epoch ms of the last editing session that changed the board. Written once
+   *  per session (never per stroke) — what a linked agent's "the board changed" keys on. */
+  boardRev?: number
   // dino-only: best score reached in the T-Rex Runner game.
   highScore?: number
   // editor / diff
@@ -1670,6 +1680,23 @@ export interface FilesApi {
    * Resolves null when it could not be written; callers drop that file like a failed drop.
    */
   saveCanvasImage(projectId: string, name: string, dataBase64: string): Promise<string | null>
+  /**
+   * Save a whiteboard node's scene (Excalidraw JSON) and the picture it shows at rest. The core
+   * derives the file from (projectId, nodeId) — beside project.json, or its own data dir. Resolves
+   * `{ok: true, path, rev}`, a conflict when the board on disk is no longer `expectedRev` (nothing
+   * written), or null when it could not be written. A core on an older build answers the bare path
+   * string and ignores `expectedRev`. See core/whiteboards.ts.
+   */
+  saveWhiteboard(
+    projectId: string,
+    nodeId: string,
+    scene: string,
+    thumbnailBase64?: string,
+    expectedRev?: string | null
+  ): Promise<WhiteboardSaveResult | string | null>
+  /** Read a whiteboard back; `sourceId` is the board a copied node falls back to until it saves.
+   *  `withScene: false` reads only the picture and revision (a board at rest). */
+  readWhiteboard(projectId: string, nodeId: string, sourceId?: string, withScene?: boolean): Promise<WhiteboardFile | null>
   /**
    * Store a custom sound for an agent alert (issue #289). The core validates kind, extension,
    * size and magic bytes, then writes a FIXED per-kind file under its own data dir — the picked
