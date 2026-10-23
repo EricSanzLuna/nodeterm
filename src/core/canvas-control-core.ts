@@ -23,6 +23,7 @@ import { BROWSER_FLAGS, BROWSER_KEYS, BROWSER_TIMEOUT_DEFAULT_MS, BROWSER_TIMEOU
 import { nodeColorChoices } from '@shared/node-colors'
 import { offScreenGuidanceLines } from '@shared/control-off-screen'
 import { arrangeArgsRefusal, arrangeGroupGuidanceLines } from '@shared/arrange-verb'
+import { geometryArgsRefusal, geometryGuidanceLines } from '@shared/geometry-verbs'
 import { codexThreadIdentityResolverSh } from './codex-thread-identity-sh'
 import { ISSUE_SESSION_COLUMNS, issueLaunchPrompt, parseIssueArg } from '../shared/github-issue-ref'
 import { BOARD_COMMENT_FROM_PREFIX, BOARD_COMMENT_REPLY_TO } from '../shared/board-comment'
@@ -487,6 +488,8 @@ export type ControlVerb =
   | 'move'
   | 'arrange'
   | 'align'
+  | 'resize'
+  | 'place'
   | 'link'
   | 'verify'
   | 'spawn-team'
@@ -531,6 +534,10 @@ const VERBS: ControlVerb[] = [
   'move',
   'arrange',
   'align',
+  // Issue #1288: size existing nodes and put them at canvas coordinates — the geometry `arrange`
+  // cannot express. Layout writes like `arrange`; their flag shape is @shared/geometry-verbs.
+  'resize',
+  'place',
   'link',
   'verify',
   'spawn-team',
@@ -756,6 +763,10 @@ export function parseControlRequest(
     const arrangeRefusal = arrangeArgsRefusal(args)
     if (arrangeRefusal) return { error: arrangeRefusal }
   }
+  // `resize` / `place` / `list --geometry` / a coordinate on `move` (issue #1288): the same gate desktop
+  // main runs before forwarding (it never runs this parser) and the renderer runs as its belt.
+  const geometryRefusal = geometryArgsRefusal(v, args)
+  if (geometryRefusal) return { error: geometryRefusal }
   if (v === 'ungroup' && !args.group) return { error: 'ungroup requires --group <id>' }
   if (v === 'move' && !args.nodes) return { error: 'move requires --nodes <id,id>' }
   if (v === 'align' && !args.nodes) return { error: 'align requires --nodes <id,id>' }
@@ -888,7 +899,8 @@ export function buildCanvasControlInstructions(shimPath: string): string {
     'refusal still applies) and `run` reaches only nodes you opened during this server run.',
     '',
     'Verbs:',
-    '- `list` — current nodes (id, kind, title). Start here when you need a node id.',
+    '- `list [--geometry on|off]` — current nodes (id, kind, title; the JSON rows also carry each node\'s',
+    '  place and size — see `list --geometry` below). Start here when you need a node id.',
     '- `help` — print the verb list. Answered by the shim itself, so it works even if the app is down.',
     '- `open-terminal [--count N] [--cwd P] [--cmd C] [--group <id>] [--after <id,id>] [--after-success <id,id>] [--success-deadline <90m|12h|3d>] [--after-pr <N:checks|N:merged>] [--pr-deadline <90m|12h|3d>] [--project <id>] [--run-now]` — open N plain terminals. `--cmd` requires verified node identity.',
     '- `open-claude [--count N] [--cwd P] [--prompt T | --prompt-file F] [--model M] [--group <id>] [--after <id,id>] [--after-success <id,id>] [--success-deadline <90m|12h|3d>] [--after-pr <N:checks|N:merged>] [--pr-deadline <90m|12h|3d>] [--project <id>] [--issue <owner/repo#N | #N>] [--run-now]` — open N Claude sessions.',
@@ -993,12 +1005,13 @@ export function buildCanvasControlInstructions(shimPath: string): string {
     '  children into the frame\'s parent. `move --nodes <id,id> [--group <id>]` reparents nodes or groups INTO an',
     '  existing frame (omit `--group`, or pass `top`/`none`, to pull them out to the top level) — this is',
     '  how you move a node from one frame to another.',
-    '- `arrange --nodes <id,id> [--layout grid|row|column] [--cols N]` /',
+    '- `arrange --nodes <id,id> [--layout grid|row|column] [--cols N] [--gap px]` /',
     '  `align --nodes <id,id> --edge left|right|top|bottom|hcenter|vcenter` — tidy a layout. Works on',
     '  top-level nodes OR on the children of ONE frame (all ids must share a container — you cannot',
     '  arrange across frames in one call). `arrange` places the nodes in the order you list them, and',
     '  arranging a frame\'s children also re-fits that frame and every frame around it.',
     ...arrangeGroupGuidanceLines(),
+    ...geometryGuidanceLines(),
     '- `link --to <id,id> [--from <id>]` — context-link nodes so each can READ the other\'s transcript',
     '  on demand (nodeterm linked-context CLI). `--from` defaults to you; nothing is pushed into the',
     '  linked sessions. Agent sessions you open, and the stations you name in `--after`, are already',
@@ -1422,7 +1435,7 @@ export function buildCanvasSkillBody(shimPath: string, dialect: ShimDialect = 'p
   const agentLabels = BUILTIN_AGENT_IDS.map((id) => AGENT_CONFIG[id].label).join(' / ')
   return `---
 name: manage-nodeterm-canvas
-description: Create, organize and control nodes on the nodeterm canvas — open ${agentLabels} / terminal nodes, spawn agent teams, create git worktrees as bound groups, group/arrange/align/rename/move nodes, link nodes to read back their work, move kanban cards, show an image/video/web page, write to or close a terminal. Use when the user says "Build with Nodeterm orchestration", asks to open nodes/sessions/terminals on the canvas, or wants work run in separate, visible canvas sessions or worktrees; wants the canvas or kanban board organized; wants results read back from nodes it opened; or wants output shown as a node. Not for in-process background subagents. Only works inside a nodeterm agent session.
+description: Create, organize and control nodes on the nodeterm canvas — open ${agentLabels} / terminal nodes, spawn agent teams, create git worktrees as bound groups, group/arrange/align/resize/place/rename/move nodes, link nodes to read back their work, move kanban cards, show an image/video/web page, write to or close a terminal. Use when the user says "Build with Nodeterm orchestration", asks to open nodes/sessions/terminals on the canvas, or wants work run in separate, visible canvas sessions or worktrees; wants the canvas or kanban board organized; wants results read back from nodes it opened; or wants output shown as a node. Not for in-process background subagents. Only works inside a nodeterm agent session.
 ---
 
 # Manage the nodeterm canvas
@@ -1453,7 +1466,8 @@ Edition \`--run-now\` changes nothing else (opens start at once; the \`--after\`
 applies) and \`run\` reaches only nodes you opened during this server run.
 
 Verbs:
-- \`list\` — list current nodes (id, kind, title). Start here when you need a node id.
+- \`list [--geometry on|off]\` — list current nodes (id, kind, title; the JSON rows also carry each node's
+  place and size — see \`list --geometry\` below). Start here when you need a node id.
   A row ending **LAST TURN ERRORED** is a station whose last turn died on an API/model error:
   it is idle, but it produced nothing, so do not read its output or build on it. The marker
   is on the row on purpose — a fan-out of seven stations should cost one call to learn this,
@@ -1594,7 +1608,7 @@ ${reportOutcomeDocLines().join('\n')}
   each where it sits on the canvas. Omit \`--group\` (or pass \`top\`/\`none\`) to pull them OUT to the
   top level. This is how you move a node from one frame to another: \`move --nodes n1,n2 --group g2\`.
   Invalid cycles are rejected.
-- \`arrange --nodes <id,id> [--layout grid|row|column] [--cols N]\` — tidy layout, no overlap. Works
+- \`arrange --nodes <id,id> [--layout grid|row|column] [--cols N] [--gap px]\` — tidy layout, no overlap. Works
   on top-level nodes OR on the children of ONE frame — every id must share a container (you cannot
   arrange nodes from two different frames, or mix framed + loose, in one call). The nodes are placed
   in the order you list them. When the ids are a frame's children, that frame and every frame around
@@ -1604,6 +1618,7 @@ ${arrangeGroupGuidanceLines().join('\n')}
   \`arrange --group\` it to fix that.
 - \`align --nodes <id,id> --edge left|right|top|bottom|hcenter|vcenter\` — align edges/centers. Same
   one-container rule as \`arrange\`.
+${geometryGuidanceLines().join('\n')}
 - \`link --to <id,id> [--from <id>]\` — context-link nodes, so each can READ the other's
   transcript on demand with the get-linked-context skill. \`--from\` defaults to you. Nothing is
   pushed into the linked sessions — reading is on demand, so linking never interrupts anyone.
@@ -1767,6 +1782,8 @@ Typical requests this skill covers:
   to tidy the new frame's contents (grouping keeps each node's scattered spot, so arrange after grouping).
 - "Tidy the canvas" / "clean up the layout" → \`arrange --group top\` — the user's own Tidy canvas: you stay at the
   top-left of the team you opened. Once, after the team is open — not after every \`open-*\`.
+- "Lay my sessions out exactly / the same way every time" → \`list --geometry on\` to read where everything is,
+  then \`resize\` + \`arrange --gap\` + \`place\` (the worked example under \`place\`). Rerun it after a session is replaced.
 - "Move this node into that group" → \`move --nodes <id> --group <targetGroupId>\` (not \`group\`, which only
   wraps loose nodes). "Break up this group" → \`ungroup --group <id>\`.
 - "Rename this node/group" → \`rename\`.
