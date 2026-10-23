@@ -486,6 +486,10 @@ const api: NodeTerminalApi = {
       ipcRenderer.invoke(IPC.filesSaveUpload, name, dataBase64),
     saveCanvasImage: (projectId: string, name: string, dataBase64: string) =>
       ipcRenderer.invoke(IPC.filesSaveCanvasImage, projectId, name, dataBase64),
+    saveWhiteboard: (projectId: string, nodeId: string, scene: string, thumbnailBase64?: string, expectedRev?: string | null) =>
+      ipcRenderer.invoke(IPC.filesSaveWhiteboard, projectId, nodeId, scene, thumbnailBase64, expectedRev),
+    readWhiteboard: (projectId: string, nodeId: string, sourceId?: string, withScene?: boolean) =>
+      ipcRenderer.invoke(IPC.filesReadWhiteboard, projectId, nodeId, sourceId, withScene),
     saveAlertSound: (kind: AlertSoundKind, name: string, dataBase64: string) =>
       ipcRenderer.invoke(IPC.filesSaveAlertSound, kind, name, dataBase64),
     readAlertSound: (kind: AlertSoundKind) => ipcRenderer.invoke(IPC.filesReadAlertSound, kind),

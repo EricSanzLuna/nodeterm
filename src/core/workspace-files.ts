@@ -22,6 +22,7 @@ import {
   type CanvasLayout,
   type LayoutViewports
 } from '../shared/canvas-layout'
+import { isRecord } from '../shared/is-record'
 
 /**
  * Drop a browser node's persisted `partition` unless it is exactly the jar THIS project (its
@@ -446,9 +447,6 @@ export function validKanban(k: unknown): k is ProjectKanban {
     Array.isArray((k as ProjectKanban).assignments)
   )
 }
-
-const isRecord = (x: unknown): x is Record<string, unknown> =>
-  !!x && typeof x === 'object' && !Array.isArray(x)
 
 /**
  * A project's `bridges` / `ropes` as they may be ADMITTED. Both come straight out of the git-shared,

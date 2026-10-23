@@ -1,9 +1,11 @@
 import type { ChatPromptResult, EmptyPromptResult, TextDeliveryResult } from './text-delivery'
 import type { PushWebhookMinted, PushWebhookResult, PushWebhookTokenInfo } from './push-webhook'
 import type { IdentitySeedEntry } from './agent-identity-seed'
+import type { WhiteboardFile, WhiteboardSaveResult } from './whiteboard'
 import type { PrWaitHold } from './pr-wait'
 import type { SessionBackend } from './session-backend'
 import type { AgentIntegrationsSettings } from './agent-integrations'
+import type { NodeSize, SizableNodeKind } from './default-node-size'
 // Types shared across the main, preload, and renderer processes.
 
 import { TABBAR_HEIGHT_PX } from './window-chrome-metrics'
@@ -410,9 +412,15 @@ export interface PtyCreateResult {
    * `PtyCreateOptions.requireRemote` for what used to happen instead. The renderer shows the
    * "not connected" overlay and re-spawns the node once the project's master is back.
    *
-   * Only ever set for a create that would have SPAWNED: a co-attach to a live session for this
-   * node id still joins (the session is already running wherever it runs), so a second view of a
-   * healthy remote terminal is unaffected.
+   * `'ssh'` is only ever set for a create that would have SPAWNED: a co-attach to a live session
+   * for this node id on the requested remote still joins, so a second view of a healthy remote
+   * terminal is unaffected.
+   *
+   * `'held-elsewhere'`: a `requireRemote` create found a live session for this node id held by this
+   * process, but NOT on the requested remote — it is local, or its endpoint (host, user, port)
+   * differs from the create's `sshRemote`. The join is refused and nothing was started; the held
+   * session is left untouched. A create with no `sshRemote` (master down) still joins a held
+   * remote session. Not a lost connection: retrying would refuse again.
    *
    * `'codex-account'` is the S6 fail-closed twin: a LOCAL Codex node that explicitly selected a
    * managed account whose home is missing refuses rather than spawning against the system login
@@ -423,7 +431,7 @@ export interface PtyCreateResult {
    * session could be confirmed to join or reattach to — either it is gone, or its existence could
    * not be checked — so nothing was started. Not a lost connection.
    */
-  unavailable?: 'ssh' | 'codex-account' | 'join-only'
+  unavailable?: 'ssh' | 'codex-account' | 'join-only' | 'held-elsewhere'
 }
 
 /** Payload of `pty:recycled` — see IPC.ptyRecycled and `recycleAction` in the renderer. */
@@ -436,7 +444,7 @@ export interface RecycledInfo {
 // 'subagent' and 'loop' are render-only (ephemeral hook-driven viz) and never persisted.
 // 'trigger' is a first-class PERSISTED kind (issue #493) — the canvas-owned schedule node; its
 // spec rides `CanvasNodeState.trigger` and is sanitized on every load path (@shared/trigger).
-export type NodeKind = 'terminal' | 'sticky' | 'group' | 'editor' | 'diff' | 'video' | 'web' | 'browser' | 'files' | 'subagent' | 'loop' | 'dino' | 'trigger' | 'simulator'
+export type NodeKind = 'terminal' | 'sticky' | 'group' | 'editor' | 'diff' | 'video' | 'web' | 'browser' | 'files' | 'subagent' | 'loop' | 'dino' | 'trigger' | 'simulator' | 'whiteboard'
 
 /** Persisted state of a single canvas node (terminal, sticky note, group frame, or editor). */
 /**
@@ -624,6 +632,15 @@ export interface CanvasNodeState {
    */
   textUpdatedAt?: number
   textUpdatedBy?: string
+  /**
+   * whiteboard-only: the board this node shows until it saves its own — set on a duplicate or a
+   * reopen (which get a NEW id) so the copy needs no file copy and no board file is ever deleted.
+   * A node id, never a path: the core resolves it inside this project (core/whiteboards.ts).
+   */
+  whiteboardSource?: string
+  /** whiteboard-only: epoch ms of the last editing session that changed the board. Written once
+   *  per session (never per stroke) — what a linked agent's "the board changed" keys on. */
+  boardRev?: number
   // dino-only: best score reached in the T-Rex Runner game.
   highScore?: number
   // editor / diff
@@ -1681,6 +1698,23 @@ export interface FilesApi {
    */
   saveCanvasImage(projectId: string, name: string, dataBase64: string): Promise<string | null>
   /**
+   * Save a whiteboard node's scene (Excalidraw JSON) and the picture it shows at rest. The core
+   * derives the file from (projectId, nodeId) — beside project.json, or its own data dir. Resolves
+   * `{ok: true, path, rev}`, a conflict when the board on disk is no longer `expectedRev` (nothing
+   * written), or null when it could not be written. A core on an older build answers the bare path
+   * string and ignores `expectedRev`. See core/whiteboards.ts.
+   */
+  saveWhiteboard(
+    projectId: string,
+    nodeId: string,
+    scene: string,
+    thumbnailBase64?: string,
+    expectedRev?: string | null
+  ): Promise<WhiteboardSaveResult | string | null>
+  /** Read a whiteboard back; `sourceId` is the board a copied node falls back to until it saves.
+   *  `withScene: false` reads only the picture and revision (a board at rest). */
+  readWhiteboard(projectId: string, nodeId: string, sourceId?: string, withScene?: boolean): Promise<WhiteboardFile | null>
+  /**
    * Store a custom sound for an agent alert (issue #289). The core validates kind, extension,
    * size and magic bytes, then writes a FIXED per-kind file under its own data dir — the picked
    * file's path is never sent, only its bytes and base name. Resolves `{ ok: false, error }` for a
@@ -1956,6 +1990,10 @@ export interface Settings {
    *  whatever size they were saved with; other node kinds keep their own defaults. */
   defaultNodeWidth: number
   defaultNodeHeight: number
+  /** Default size (px) for NEW nodes of every other kind the add menus create, keyed by kind; a
+   *  kind with no entry opens at its built-in size. Read through `defaultNodeSize` (renderer) /
+   *  `resolveDefaultNodeSize` (@shared/default-node-size), which clamp hand edits. Machine-local. */
+  defaultNodeSizes: Partial<Record<SizableNodeKind, NodeSize>>
   /** Sessions sidebar: the DEFAULT for a project row the user never toggled — on (historical)
    *  keeps the active project expanded and collapses the others, off leaves everything expanded.
    *  Explicit toggles live in `sidebarCollapsedItems` and always win. */
@@ -2470,6 +2508,7 @@ export const DEFAULT_SETTINGS: Settings = {
   markdownFontSize: DEFAULT_MARKDOWN_FONT_SIZE,
   defaultNodeWidth: 640,
   defaultNodeHeight: 440,
+  defaultNodeSizes: {},
   sidebarAutoCollapse: true,
   sidebarCollapsedItems: {},
   sidebarGrouping: 'project',

@@ -271,7 +271,7 @@ factories (`createTerminalNode`, `createSshTerminalNode`, `createAgentNode(agent
 group transforms (`groupSelectedNodes`, `ungroupNodes`, `duplicateNode`), and the
 `nodeStatesToFlow` / `flowToNodeStates` serializers. Node kinds (`NodeKind` in
 `src/shared/types.ts`): `terminal | sticky | group | editor | diff | video | web | browser |
-files | subagent | loop | dino | trigger` — `subagent` and `loop` are render-only (ephemeral hook-driven
+files | subagent | loop | dino | trigger | simulator | whiteboard` — `subagent` and `loop` are render-only (ephemeral hook-driven
 viz) and never persisted. `trigger` (issue #493, all four
 phases landed) is a first-class PERSISTED kind. The whole host-side
 machine is composed ONCE in `core/trigger-service.ts` (`startTriggerService`) and booted
@@ -587,6 +587,78 @@ project's nodes only.** The contract:
   `liveCanvasHolds` (tag AND active id; otherwise the store) and queues a FUNCTIONAL update
   (`rebaseOnLatest`). Consequence for readers: code pairing the tag with the RENDERED `nodes`
   (a render-time publish, an effect keyed on `nodes`) reads `renderedProjectId`, never the ref.
+- **The node subtree's session follows the project whose nodes React Flow's STORE holds**
+  (`useFlowStoreOwner`, `canvas/flowStoreOwner.ts`), never `activeProjectId`. xyflow copies the
+  `nodes` prop into its store in a PASSIVE effect and `ReactFlowProvider` sits above the keyed
+  `SessionProvider`, so a key that flipped with the active id remounted the OUTGOING project's
+  nodes under the INCOMING session for a commit: a team tab's terminals were created on this
+  desktop's own core, and a local terminal on the relay host. Each array handed to
+  `<ReactFlow nodes>` is recorded against `renderedProjectId` and the store's array is looked up
+  (unknown ⇒ the last known owner); the same id feeds `OwningProjectContext`. A local → local
+  switch keeps the key `'local'` (no remount). A session-changing remount now lands one commit
+  AFTER the load applied the project's camera and builds a fresh pan/zoom, so `<ReactFlow>` gets
+  `defaultViewport={viewportRef.current}`, or the switch resets the camera to the origin. For the
+  same reason the load's settle timer must not frame or read the incoming nodes itself: the
+  pending focus / "Open recent" resume / `nodeterm://` link it finishes run through
+  `useFlowLanding` (`canvas/flowLanding.ts`) once the owner IS that project — React may run the
+  store copy's passive effect after a due timer, which then framed the pan/zoom the remount
+  destroys and read the outgoing copy of a shared node id. The rule holds for a local → local
+  switch too (no remount, but the owner still flips). A caller that would create and frame AT ONCE
+  (`resumeWhenLanded`, `runLinkOpen`) must also ask `flowLanding.holds(projectId)`, never the epoch
+  tag alone: after "Open folder & resume" or a link that opens a new folder, the switch is the
+  folder open's last synchronous step, so the `.then` runs after the load effect installed the tag
+  and before the store copy — every time, not by chance. Otherwise it leaves the work in
+  `pendingResumeRef` / `pendingLinkRef` for the landing. A throw inside a landing is logged, never
+  rethrown: it runs in a passive effect and `<Canvas />` has no error boundary.
+  `flowStoreOwner.test.tsx` replays the switches through real React Flow, the timer firing inside
+  that window and the folder-open continuation included.
+- **A remote project's node never starts on this core, whatever it is mounted under** (bug F: a
+  team tab's terminals were created as LOCAL tmux sessions here). The node itself cannot say so: a
+  project shared from SSH with a team is ADOPTED by the host (`localizeAdoptedNode` drops
+  `sshRemoteTmux`/`ssh`/`sshFs`), so its nodes reach the tab as plain terminals. Do NOT re-stamp
+  `sshRemoteTmux` onto them — the host's core would then refuse its own sessions (`requireRemote`
+  with no master of its own: `held-elsewhere` for a live one, a refused spawn otherwise). Three
+  layers besides the keying above:
+  (1) `sessionForProject` resolves a REMOTE project (`remote` in the store, or bound while remote in
+  this run) with no live binding to the OFFLINE relay session (`OFFLINE_RELAY_SESSION_ID`,
+  `session/offline-relay-session.ts`: `source 'relay'`, `status 'offline'`), never the local one.
+  Its core-bound calls (pty, fs, git, workspace, …) reject, so no terminal can be created here; it
+  is not a wall around this machine, since its api spreads `...local` like a live relay tab's (the
+  local namespaces — contextLink, transcripts, handoff, media — still act here, and its `boardLog`
+  read answers `unsupported`). "Is this project remote?" is ONE predicate, `isRemoteProjectId`
+  (session.ts), shared by this resolution and the spawn refusal in (3). Lifecycle code asking "which
+  session is bound to this tab?" (dispose it, reconnect it) asks `boundSessionForProject`, which
+  never answers the sentinel.
+  (2) A surface that mounts a project's node OUTSIDE Canvas's node subtree runs under that project's
+  session. Both kanban boards render under App's LOCAL provider, so each mounts its card modal
+  through `ProjectSessionScope` (`session/owning-project.ts`: `sessionForProject(<card's project>)`,
+  keyed by session id, plus `OwningProjectContext`). Before it, opening a team tab's terminal card
+  created the host's node id on this desktop every time. The terminal, the comments, the metadata
+  strip and the pull-request panel now act on the card's project (`useOwningProjectId() ??
+  activeProjectId`): the terminal runs under the card project's session, the comments panel reads
+  and writes that project's board log, the metadata strip's member pool reads it, and the
+  pull-request panel reads that project's pull requests, SSH flag and auto-move target. On the Omni
+  board a lane is not the active project: pairing the lane's api with the active id blanked a relay
+  lane's comments and saved new ones nowhere, and on a local lane filed them into the ACTIVE
+  project's board log. A relay card's file links are switched off (`cardFileLinkRoute`) and its ⌘M
+  chat is refused (`stub.chat`, `E_UNSUPPORTED`). **Known exceptions (pre-existing, follow-up):** the
+  icon picker (`NodeIconPicker.chooseImage` resolves the ACTIVE project, so a team lane's card
+  opened while a local project is active copies the picked image into the local project's
+  `.nodeterm/images/`), and dictation and file-drop uploads in a relay card, which act on this
+  machine. The session is resolved at render, so a reconnect while a modal is open takes effect at
+  the board's next render.
+  (3) TerminalNode and ModalTerminal ask `spawnBelongsElsewhere(isRemoteProjectId(owner),
+  session.source)` (`owner` from `OwningProjectContext`; the predicate is the one (1) uses, so a tab
+  the store deleted still counts) before any SSH resolve or create: a remote project under a
+  non-relay session starts nothing and writes a gray "belongs to a remote project that is not
+  connected here" line. ModalTerminal mirrors TerminalNode's `dialsSsh` (a relay card's SSH-project
+  node is joined by the HOST with `requireRemote`; this machine dials, refuses and reports nothing
+  for it), and a non-dialing node's `ownerProjectId` is the owning project, else the active one.
+  `components/kanban/cardModalSession.test.tsx` renders both boards with real sessions and a probe
+  in place of CardModal, asserting which session and owning project each modal mount gets, plus
+  source pins for the two terminals; `components/kanban/boardLogPanelSession.test.tsx` and
+  `cardOwnerProject.test.tsx` render the real comments panel, metadata strip and pull-request panel
+  under a lane's `ProjectSessionScope`; `session/offline-relay-session.test.ts` replays the switches.
 - Switching away unmounts the old project's `TerminalNode`s → their tmux clients detach but
   the sessions keep running; switching back reattaches. tmux session names are per-node-id
   (globally unique), so projects never collide.
@@ -907,9 +979,15 @@ Lifecycle, by intent:
   sides: the renderer never calls `create` when `resolveSshRemote` came back empty
   (`CoState.offline` + the node's Reconnect button), and core refuses in `spawnNew`
   (`PtyCreateResult.unavailable`) so a master that dies inside the round-trip can't sneak through.
-  The refusal is **only** in `spawnNew` — a co-attach JOIN to a live session for that node id is
-  still correct. An offline node reports itself to `SshReconnector`, so the canvas heals itself;
-  `retryNow` (banner Reconnect / node Reconnect) skips the backoff and clears the refuse window.
+  The spawn refusal is in `spawnNew`, and `join` refuses (`'held-elsewhere'`) a `requireRemote`
+  create whose held session is local or on another host (host, user, or port differs) — a join to
+  the SAME remote's live session (a second view over the same endpoint) still attaches, and so does
+  a create that names no `sshRemote` onto a held remote session (its master momentarily down, or a
+  relay tab's create on the host, which carries none). The held session is never killed. A relay /
+  team tab's node, which may carry no `sshRemoteTmux` at all, is kept off this core by the session
+  it runs under plus a renderer-side `spawnBelongsElsewhere` refusal (Projects (tabs)). An
+  offline node reports itself to `SshReconnector`, so the canvas heals itself; `retryNow` (banner
+  Reconnect / node Reconnect) skips the backoff and clears the refuse window.
   **Whether a node is remote comes from its PROJECT, never from its own fields** (issue #1186,
   `@shared/ssh-project-nodes`). `requireRemote`/`sshRemoteTmux` used to be stamped only by this
   machine's node factories, but an SSH project's `project.json` lives on the host and other writers
@@ -2208,6 +2286,29 @@ number: change the table in that one module, never in one emulator.
     one file. Guard on both dialects, construct in one.
   - **Mobile**: N/A — *nodeterm mobile* attaches to tmux sessions over the transport protocol and
     has no canvas or file-browsing concept; adding one means extending that protocol.
+- **whiteboard** (`WhiteboardNode.tsx`, `whiteboard/WhiteboardEditor.tsx`) — an Excalidraw board;
+  full write-up in `docs/whiteboard-node.md`. The invariants: (1) editing is ONE live editor
+  portaled into `.canvas-root` over the node's box, never inside the scaled node (pointer drift,
+  blur, and `.flow-wrap`'s wheel capture); (2) the scene is a side file the core addresses by
+  (project, node id) — `core/whiteboards.ts` — and NEVER by a path from node data (project.json is
+  git-shared, hostile input); node data holds only `whiteboardSource` (a copy's original, by id)
+  and `boardRev` (once per session); (3) the overlay is `data-nt-keyboard-owner`, which every
+  typing-aware key site honours via `isKeyboardOwnerTarget`; (4) every save is a COMPARE-AND-SET:
+  it sends the revision its editor last read or wrote (`rev`, `dev:ino:size:mtimeNs` of the scene
+  file — writers publish by rename, so it changes on every write; `null` = no board of its own yet)
+  and the core refuses it when the file on disk has moved on, so a board open in two places (two
+  tabs, a desktop and a browser on one folder, two hosted-team Editors, a `git pull`) is never
+  silently replaced by the later writer — the editor says "Changed elsewhere" instead. Saves of one
+  board are serialized within a core; two CORES on one folder can still interleave between the
+  check and the rename. The editor's own "has anything changed" test compares with what IT last
+  saved, not with disk. The unmount flush writes a snapshot kept from `onChange` — Excalidraw's api
+  is empty by cleanup time, and reading it there once erased a board; (5) the project folder is
+  bound by its REAL path — a `.nodeterm` or `.nodeterm/whiteboards` symlink leading out of the
+  project is not followed (the board falls back to the app folder); (6) finishing (Esc, a press
+  outside) waits for a save that SUCCEEDED — a failed or refused one keeps the editor open with
+  "Keep mine" / "Discard my changes" in the header, since after the exit there is no flush left to
+  retry — and a hosted-team Viewer opens the board view-only. Excalidraw loads lazily; fonts
+  come from `scripts/excalidraw-assets-plugin.ts`; mermaid is aliased to a stub.
 - **Run node** (a `terminal` node carrying `data.runConfig`, NOT a new NodeKind;
   `@shared/run-config`, `core/run-service.ts`, `nodes/RunBar.tsx`) — VS Code's "Run Without
   Debugging" for any `.vscode/launch.json` configuration. The toolbar picks a folder (defaults to
@@ -5967,7 +6068,14 @@ bridges enter live state only via `appendBridgeEdges`) and the server
     **login node** that runs `claude /login` under the account dir. Core polls the dir's
     `.claude.json` (`LOGIN_POLL_MS` 2 s, up to `LOGIN_TIMEOUT_MS` 5 min) for `oauthAccount.email`;
     on capture the account flips out of `pending` with its email as the default label. Account
-    removal cancels any pending wait + `markDirty`. **Codex accounts have the same two halves** —
+    removal cancels any pending wait + `markDirty`. **A removal that deletes the dir first MOVES the
+    account's Claude sessions to the system account** (`renderer/lib/accountRemoval.ts`): a running
+    `claude` keeps the account's `CLAUDE_CONFIG_DIR` in its tmux env, so deleting the dir under it
+    left the CLI logged out and repainting half-blank. Active canvas → the ordinary switch
+    (`runClaudeAccountSwitch` to system), or copy + recycle for an idle node the switch cannot drive;
+    other projects → `copySession` + tmux kill (they cold-resume on next open). Any busy session, or
+    one that could not be moved, refuses the removal and keeps the account. Linked accounts and a
+    disconnected host's account delete nothing, so they skip the move. **Codex accounts have the same two halves** —
     `createCodexAccountLoginNode` (`codex login`, title "Codex login") behind the
     `nodeterm:add-codex-account-login` listener, with `codexAccounts.waitLogin` polling the managed
     home's `auth.json`. **On Windows the Codex identity comes from that `auth.json`'s id_token JWT
@@ -8555,8 +8663,10 @@ the Settings section and ShortcutsPanel start disagreeing about what a chord mea
   node shows its column as a **half-pill flush on the node's TOP edge** — see the pill sentence
   below. A card's ↗ / double-click opens the **card modal** (`components/kanban/CardModal.tsx`, body
   portal on the dialog-stack, scrim z 55, scrim/Esc close — Esc in CAPTURE phase, and an Esc
-  during a header rename only cancels the edit). Terminal cards get a LIVE second view of the
-  tmux session (`ModalTerminal.tsx`): the pty subscriber ledger is keyed by the composite
+  during a header rename only cancels the edit). The modal runs under the CARD project's session
+  (`ProjectSessionScope` — the boards themselves sit under App's local provider; see "A remote
+  project's node never starts on this core" under Projects). Terminal cards get a LIVE second
+  view of the tmux session (`ModalTerminal.tsx`): the pty subscriber ledger is keyed by the composite
   `(ClientId, viewerId ?? PRIMARY)` (`core/pty-manager.ts` — **viewer identity**; viewerId is an
   optional TRAILING arg through preload/ws-bridge/LocalTransport, absent = bit-for-bit legacy, and
   a client's per-connection socket pause survives a single view's departure). The modal viewer
@@ -8828,8 +8938,13 @@ the Settings section and ShortcutsPanel start disagreeing about what a chord mea
   should gain the three categories. All three are the iOS follow-up, not desktop work.
 - **Omni Kanban (global swimlanes)** (`components/kanban/GlobalKanbanView.tsx`; one swimlane per open project; `state/viewMode.ts` `globalKanban` (localStorage `nodeterm.globalKanban`, machine-local, like `viewByProject`) + `settings.omniKanbanEnabled` (feature gate, default OFF, `settings.json`) / `omniKanbanAsDefault` (when true, `view.kanbanToggle` — Cmd+Shift+B — opens Omni; otherwise per-project; `view.globalKanbanToggle` registry command — unbound, remappable — always opens Omni when enabled); **Omni is a SCOPE of the kanban side, not a third view**: the view toggle (tab icon, ⌘⇧B, the menu) flips canvas ⇄ board, and a board header's `KanbanScopeSwitch` ("This project" / "All projects", rendered only while the feature is on) moves between the two scopes — so leaving Omni through the switch lands on the project's board, and the view toggle from Omni lands on the canvas (it used to fall through to whatever the project's view happened to be, so "Canvas view" from Omni could land on a board). The decisions live once in `state/viewMode.ts` (`toggleBoardView` / `toggleAllProjectsBoard` / `showProjectBoard` / `showCanvas`), called by TabBar, the menu IPC and both registry commands; Omni has no close button. `globalKanban` deliberately stays independent of the active project, so a project switch made from a lane does not drop the user out of Omni. `isGlobalKanbanOpen()` is the single gate (fail-closed, static import of `useSettings` — the earlier `require` failed open in the packaged renderer). Non-active lanes are derived from serialized `p.nodes` via `toKanbanSessionState` (the persisted-state counterpart to `toKanbanSession`); the ACTIVE project's lane is fed LIVE by Canvas (`GlobalKanbanLive`: the same `kanbanSessionsFrom(nodes)` cards + live `teamStations` the per-project board uses), because its edits reach the store only at the next ~800 ms autosave — a store-fed lane reverted the card modal's controlled sticky textarea on every keystroke and pruned the assignment of a card created a moment earlier. The open card modal is ONE overview-level fact reported to Canvas's `setKanbanModalNode` (watched for Eco, wake-on-open, dictation target), never per-lane state; each lane's board write resolves ITS project's session (`sessionForProject`) for the hosted read-only refusal and the board-log api; `pendingLaunch` never becomes `initialCommand` in the modal (the DAG launch must fire only when dependencies report done, and the canvas `TerminalNode` already delivers `initialCommand` via `writeWhenShellReady` after the `nodeterm:create-node` project switch). Active-project edits (rename / sticky / browser nav) route through Canvas live nodes (`setNodes` + `markDirty`), non-active through the store + `writeDisk`; delete uses `ConfirmDialog` (not `confirm`) and then `deleteNodes` (active project) or `closeStoredNodes` (any other) — the existing cross-project teardown funnel, never a hand-rolled copy. The top bar's project pills and Cmd/Ctrl+1..9 (`nodeterm:swimlane-jump`) jump to the lane; header hint shows the correct mod (`Cmd` on Mac, `Ctrl` elsewhere). Server Edition works as-is, Mobile N/A.
 - **Settings** (`SettingsPage.tsx`, ⚙ / ⌘,): font/cursor (live to xterm + Monaco), default
-  shell, grid + snap, **default node size** (`defaultNodeWidth`/`defaultNodeHeight` — new
-  terminal/agent nodes only, clamped in `terminalNodeSize()` in `state/workspace.ts`),
+  shell, grid + snap, **default node size** (one row with a kind picker: terminal/agent is the
+  `defaultNodeWidth`/`defaultNodeHeight` pair, clamped in `terminalNodeSize()`; every other kind
+  the add menus create is an optional entry in `defaultNodeSizes`, resolved by `defaultNodeSize(kind)`
+  in `state/workspace.ts` through `@shared/default-node-size`, which clamps hand edits to the kind's
+  `NODE_MIN_SIZES` and 2400×1600 — new factories must place through `placeSized`, not a literal
+  `*_SIZE`, or the setting silently stops applying to that kind; the agent `settings` verb exposes
+  only the terminal pair),
   pan-hover delay, double-click focus, accent, tmux on/scrollback, commit agent,
   `seenShortcuts`. **Every section is MOUNTED whenever Settings is open** — an inactive one
   returns null from `SettingsSection`, but its hooks and the whole render body above that return
@@ -9871,8 +9986,8 @@ under one `$HOME`, with different bytes; the last writer wins.
 `context:update` metadata (deploy one core per team); a viewer's socket backlog over 1 MB still
 pauses the shared pty through Stage 2 backpressure; the canvas authority's own limits (a project's
 non-content fields stay last writer wins between tabs, the share-time window, oversized nodes, board
-edits to another core, load-time repairs that are never cast, the card modal's comments on a relay
-tab) are under "Known limits" in the doc.
+edits to another core, load-time repairs that are never cast, the GitHub issue summary modal's
+"Agent runs" log on a relay tab) are under "Known limits" in the doc.
 
 **Surfaces:** Desktop is full (joiner, plus approval and invite code in an owner's hosted tab, plus
 Share with team from any desktop OS onto a Linux host). Server Edition is the host (the `team` CLI,
@@ -9912,6 +10027,27 @@ Voice-to-text input captured via microphone, turned into terminal text via on-de
   the default is still `auto`. **Mobile** keeps its own list, tracked separately as issue #591.
 - **Browser constraints** — `getUserMedia` requires HTTPS or `localhost`; mic permission prompt is the browser's own (not handled by nodeterm). Model downloads land on the **server's data dir** (accessible across sessions).
 - **Electron + native dep** — smart-whisper is externalized + `asarUnpack`'d (not bundled); `postinstall` rebuilds it against Electron's ABI. Device verification of the ABI rebuild is not yet exercised on a dev machine — test paths exist but have not been run in CI.
+- **Linux x64 ships TWO whisper binaries, picked per CPU (issue #1267).** smart-whisper's
+  binding.gyp passes no `-m` flags, so on x86-64 ggml compiles at the SSE2 baseline and every
+  AVX/AVX2/FMA/F16C kernel drops out (`objdump -d smart-whisper.node | grep -c ymm` = **0** on the
+  shipped build). Measured, base model, 3 s of audio, 12-thread AVX2 box: **18.8 s** as shipped vs
+  **1.9 s** with `-mavx -mavx2 -mfma -mf16c`, and the same 11.2 s → 1.5 s under Electron's ABI; the
+  report was large-v3-turbo taking ~7 min for one sentence. `scripts/patch-smart-whisper.mjs` (run
+  before `electron-rebuild` in `postinstall`/`rebuild`, beside the node-pty patch) adds a
+  `smart-whisper-avx2` target behind a gyp `OS=="linux" and target_arch=="x64"` condition — mac and
+  Windows builds are unchanged — and makes smart-whisper's loader read
+  `globalThis.__NODETERM_WHISPER_BINARY__`. `pickWhisperBinary` sets it from `/proc/cpuinfo`.
+  **Never ship a single `-mavx2` build**: on a CPU without AVX2 that is a SIGILL that takes the
+  whole app down on the first dictation, which is why the baseline stays and why every failure
+  (flags unreadable, variant file absent, variant fails to load) falls back to it rather than to
+  "unavailable". `WHISPER_SIMD_FLAGS` and the script's `SIMD_FLAGS` must name the same set (pinned
+  by `smart-whisper-patch.test.ts`, which also fails on an unpatched install). Threads:
+  `whisperThreads` replaces whisper.cpp's `min(4, cpus)` with about half the logical CPUs plus two,
+  capped at 8 — **not** every CPU: ggml's workers spin-wait, and 12 threads on 12 busy logical CPUs
+  measured 12.8 s against 8 threads' 1.4 s. Not covered yet: macOS x64 (Accelerate, same missing
+  SIMD flags in ggml), a GPU backend (this smart-whisper has no Vulkan build option), cancelling a
+  running transcription, and the Server Edition (installed with `--ignore-scripts`, so it keeps the
+  baseline; the startup log line `[speech] whisper binary: …` says which binary loaded).
 
 ## Packaging & auto-update
 
