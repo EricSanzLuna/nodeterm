@@ -349,11 +349,15 @@ host is a handover that started and did not finish, and the same guard applies.
 Reopening the project from "Recently closed", with ⇧⌘T, or by opening the same host and folder as an
 SSH project again, warns first:
 
-> <name> is now managed by team <team> on <host>. Open it from the team tab, or run "team unshare
-> <projectId>" on the server first.
+> <name> was handed to team <team> on <host>. The server keeps its canvas and keeps running its
+> agents, even after it is unshared. Opening it here gives one canvas two editors that can overwrite
+> each other, and its agents would start the same conversations the server is running.
 >
-> Open it here anyway? Two copies editing one canvas can overwrite each other, and its agents would
-> start the same conversations the server is running. Its agents are not resumed here automatically.
+> Open it here anyway? Its agents are not resumed here automatically.
+
+The warning offers no other way out on purpose: `team unshare` only stops sharing the project, and
+the server keeps it and its running agents, so neither the team tab (gone once it is unshared) nor
+the command gives the project back to this desktop.
 
 or, for a handover that did not finish:
 
@@ -798,11 +802,6 @@ it is a new way to use it.
   client's baseline and is never cast, so on a governed project it never reaches disk: every load
   derives it again. The repairs are deterministic, so this costs nothing visible, but a repair that
   must persist on a shared project has to be cast.
-- **The issue summary modal's "Agent runs" on a relay tab** (`GitHubIssueSummaryModal` →
-  `BoardLogPanel`) still pairs the LOCAL api with the relay project's id: `KanbanView` renders under
-  App's local provider, and unlike the card modal this modal is not wrapped in
-  `ProjectSessionScope`, so the history is read from this machine's core, not the host's. It is
-  pre-existing; a follow-up.
 
 ## Status and troubleshooting
 
@@ -1174,6 +1173,11 @@ are unchanged.
   leaves. Past 8 MB its output is dropped (redrawn later) and the pause is handed back
   (`ui-sink-registry.ts`).
 - **Shared canvas edits:** see [Known limits](#known-limits) under Shared canvas authority.
+- **The issue summary modal's "Agent runs" on a relay tab** (`GitHubIssueSummaryModal` →
+  `BoardLogPanel`) still pairs the LOCAL api with the relay project's id: `KanbanView` renders under
+  App's local provider, and unlike the card modal this modal is not wrapped in
+  `ProjectSessionScope`, so the history is read from this machine's core, not the host's. It is
+  pre-existing; a follow-up.
 - **No git for Viewers in a subfolder of a larger repository.** Viewers and Commenters get the git
   panel only for a project that is the top folder of its own repository (or a worktree's). A
   monorepo subfolder shows its files but refuses every git read (see [Roles](#roles)).
