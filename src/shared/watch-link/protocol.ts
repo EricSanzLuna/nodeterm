@@ -20,7 +20,17 @@ export const WATCH_EVENT = {
 } as const
 /** A viewer's chat line (Commenter and Control links). */
 export const WATCH_CHAT_CAST = 'watch:chat'
-/** Control links only: `{ name, password }`. Answered to that viewer alone with `watch:control`. */
+/**
+ * Control links only. Answered to that viewer alone with `watch:control`. Two forms:
+ *  - SEALED, `{ sealed: { key, nonce, box } }` (./unlock-seal.ts): `{ name, password }` in a
+ *    `nacl.box` from a fresh key pair of the page's to the key THIS connection's meta offered
+ *    (`WatchMeta.unlockKey`). Every holder of a link can derive the tunnel's keys (both are derived
+ *    from the link's secret), so a recording of the relay traffic plus the link would otherwise read a
+ *    password a controller typed; the per-connection key pair is not derived from anything.
+ *  - PLAIN, `{ name, password }`: what a page from before sealing sends, and what a page sends to a host
+ *    that offered no key (a host from before sealing). A host refuses it (as a malformed attempt) on a
+ *    connection that has already sent a sealed one.
+ */
 export const WATCH_UNLOCK_CAST = 'watch:unlock'
 /**
  * Control links only, from a controlling viewer: `{ data }`, at most `INPUT_MAX` UTF-16 units.
@@ -90,6 +100,9 @@ export interface WatchMeta {
   /** Present (true) when the watched node is an agent whose conversation `watch:history` can read
    *  back. Absent: a plain terminal, or a host older than read-back. */
   history?: true
+  /** A Control link only: the base64 X25519 public key THIS connection seals its unlock to
+   *  (`WATCH_UNLOCK_CAST`). The same for the connection's life; absent from a host older than sealing. */
+  unlockKey?: string
 }
 
 /** `controlling`: this viewer may type. `available`: a Control link this viewer may unlock.
@@ -105,7 +118,13 @@ const CONTROL_REASONS: readonly WatchControlReason[] = ['wrong', 'locked', 'off'
 export interface WatchControlEvent {
   state: WatchControlState
   reason?: WatchControlReason
+  /** With `locked` only: how long until the lock lifts by itself, in ms from when the host sent it.
+   *  Absent: it does not (a lock from a host older than timed locks); only the sharer can lift it. The
+   *  sharer can always lift it sooner. */
+  lockedForMs?: number
 }
+/** The longest a wrong-password lock lasts by itself (the host doubles it from 15 minutes per lock). */
+export const CONTROL_LOCK_MAX_MS = 24 * 60 * 60_000
 export interface WatchTypingEvent {
   /** Self-chosen names: claims, shown as such. */
   names: string[]
@@ -122,10 +141,18 @@ export const TYPING_NAMES_MAX = 10
  *  is dropped, never the state with it. */
 export function readControlEvent(x: unknown): WatchControlEvent | null {
   if (!x || typeof x !== 'object') return null
-  const { state, reason } = x as Record<string, unknown>
+  const { state, reason, lockedForMs } = x as Record<string, unknown>
   if (!(CONTROL_STATES as readonly unknown[]).includes(state)) return null
   const out: WatchControlEvent = { state: state as WatchControlState }
   if ((CONTROL_REASONS as readonly unknown[]).includes(reason)) out.reason = reason as WatchControlReason
+  // Only beside `locked`, and only a duration a host can mean: anything else reads as "until the
+  // sharer lifts it", never as a time the page would promise.
+  if (
+    state === 'locked' && typeof lockedForMs === 'number' && Number.isInteger(lockedForMs) &&
+    lockedForMs >= 0 && lockedForMs <= CONTROL_LOCK_MAX_MS
+  ) {
+    out.lockedForMs = lockedForMs
+  }
   return out
 }
 /** A `watch:typing` payload's names: each one a clean chat name, deduplicated in order, at most
@@ -176,6 +203,17 @@ const CONTROLS = /[\u0000-\u001f\u007f-\u009f]/g
 // directory imports nothing from outside itself (it is vendored byte for byte into nodeterm-web), so
 // the class is restated here and src/core/watch-link/wire.test.ts pins the two equal.
 const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g
+// Every other format character (Unicode category Cf) is invisible too: the zero-width space and
+// joiners, the word joiner, the soft hyphen, the tag characters. In a NAME any of them makes a second
+// name that looks exactly like the first — "Sharer" and "Sharer" + U+200B — in the chat, in "X is
+// typing…" and in the owner's "someone using the name …" notice. So a name keeps none of them, nor the
+// letters that draw as blank space (the Hangul fillers, the Braille blank, the combining grapheme
+// joiner, which is invisible but a mark rather than Cf).
+const NAME_INVISIBLES = /[\p{Cf}\u034f\u115f\u1160\u2800\u3164\uffa0]/gu
+// In chat TEXT the same characters go, but for the two joiners real writing needs: the zero-width
+// joiner (U+200D) holds emoji sequences together, and the zero-width non-joiner (U+200C) is how
+// Persian and the Indic scripts are spelled. Text is not an identity claim; a name is.
+const TEXT_INVISIBLES = /(?![\u200c\u200d])\p{Cf}/gu
 /** How much of a raw value the cleaning chain may look at, as a multiple of the cap: a cast is
  *  attacker-sized, and the regex chain must not run over megabytes to keep 500 units of it. Generous
  *  enough that whitespace and controls collapsing away never empty an honest message. */
@@ -193,7 +231,7 @@ function capUnits(s: string, max: number): string {
   return out
 }
 
-function clean(raw: unknown, max: number): string | null {
+function clean(raw: unknown, max: number, invisibles: RegExp = TEXT_INVISIBLES): string | null {
   if (typeof raw !== 'string') return null
   // Bound the input BEFORE the regex chain (by code point), then cap the cleaned text the same way.
   const bounded = capUnits(raw, max * RAW_FACTOR)
@@ -201,13 +239,16 @@ function clean(raw: unknown, max: number): string | null {
     .replace(/[\r\n\t]+/g, ' ')
     .replace(CONTROLS, '')
     .replace(BIDI_CONTROLS, '')
+    .replace(invisibles, '')
     .replace(/\s+/g, ' ')
     .trim()
   const s = capUnits(cleaned, max).trim()
   return s ? s : null
 }
 export const sanitizeChatText = (raw: unknown): string | null => clean(raw, CHAT_TEXT_MAX)
-export const sanitizeChatName = (raw: unknown): string | null => clean(raw, CHAT_NAME_MAX)
+/** A self-chosen name (chat, the typing line, an unlock): no invisible character at all, so two names
+ *  that look alike ARE alike. */
+export const sanitizeChatName = (raw: unknown): string | null => clean(raw, CHAT_NAME_MAX, NAME_INVISIBLES)
 
 // --- read-back (`watch:history`) --------------------------------------------------------------------
 
