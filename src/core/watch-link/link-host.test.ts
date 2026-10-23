@@ -14,9 +14,12 @@ import { IPC } from '../../shared/ipc'
 import { isHostOnlyChannel } from '../../shared/host-control'
 import { connectWatchClient } from '../../shared/watch-link/client'
 import { deriveWatchLinkKeys } from '../../shared/watch-link/keys'
+import { readUnlockKey, sealUnlock } from '../../shared/watch-link/unlock-seal'
+import { bytesToB64 } from '../../shared/watch-link/bytes'
 import {
   INPUT_MAX,
   TYPING_NAMES_MAX,
+  WATCH_CHAT_CAST,
   WATCH_EVENT,
   WATCH_HISTORY_CAST,
   WATCH_INPUT_CAST,
@@ -122,7 +125,7 @@ interface SetupOpts {
    *  service does). */
   verifyPassword?: (pw: string) => Promise<boolean>
   /** Replaces the service's lock (which sets `record.control.locked`); still counted in `locks()`. */
-  onControlLocked?: () => void
+  onControlLocked?: (by?: string | null) => void
   /** Replaces the service's record of the link-wide wrong count; still recorded in `wrongs`. */
   onWrongAttempt?: (count: number) => void
   join?: (clientId: number, nodeId: string, viewerId: string) => Promise<JoinAnswer | null> | JoinAnswer | null
@@ -163,6 +166,8 @@ function setup(o: SetupOpts = {}) {
   const currents: ((() => boolean) | undefined)[] = []
   /** Every link-wide wrong count the host reported (`onWrongAttempt`), in order. */
   const wrongs: number[] = []
+  /** Who tipped each lock, as the host named it (`onControlLocked`). */
+  const lockedBy: (string | null)[] = []
   let mints = 0
   let changes = 0
   let verifies = 0
@@ -255,9 +260,10 @@ function setup(o: SetupOpts = {}) {
       taken.push(name)
     },
     // What the service does, synchronously, before returning (the host reads the record live).
-    onControlLocked: () => {
+    onControlLocked: (by) => {
       locks++
-      if (o.onControlLocked) o.onControlLocked()
+      lockedBy.push(by ?? null)
+      if (o.onControlLocked) o.onControlLocked(by)
       else if (record.control) record.control.locked = true
     },
     // What the service does: the count goes on the record (and to disk).
@@ -269,7 +275,7 @@ function setup(o: SetupOpts = {}) {
   })
   hosts.push(host)
   return {
-    record, host, peers, sinks, left, calls, joinArgs, joinTimes, inputs, currents, wrongs, chats, joined, gone, reads,
+    record, host, peers, sinks, left, calls, joinArgs, joinTimes, inputs, currents, wrongs, lockedBy, chats, joined, gone, reads,
     keys: deriveWatchLinkKeys(secret),
     mints: () => mints,
     /** How many times the host reported a change to the registry (`onChange`). */
@@ -1041,7 +1047,11 @@ describe('createLinkHost — ending', () => {
     for (let i = 0; i < MAX_VIEWERS_PER_LINK; i++) vs.push(await openViewer(t, i))
     await clock.flush()
     expect(t.peers).toHaveLength(MAX_VIEWERS_PER_LINK) // no idle listener while full
-    await clock.advance(FULL_STATUS_POLL_MS)
+    // Finding L6: a revoke made elsewhere reaches a full link's viewers within a minute (it was five).
+    expect(FULL_STATUS_POLL_MS).toBe(60_000)
+    await clock.advance(FULL_STATUS_POLL_MS - 1)
+    expect(status).not.toHaveBeenCalled()
+    await clock.advance(1)
     expect(status).toHaveBeenCalledTimes(1)
     expect(t.gone).toEqual([])
     state = 'revoked'
@@ -1317,6 +1327,80 @@ describe('createLinkHost — control', () => {
     expect(metaOf(w).control).toEqual({ state: 'available' })
   })
 
+  // --- finding L3: the unlock is sealed to a key pair of THIS connection's ---------------------------
+
+  it('a Control link offers each connection its own unlock key, the same on every rejoin; other roles none', async () => {
+    const clock = manualClock()
+    let n = 0
+    const t = controller({ clock, join: () => ({ sessionId: `s${++n}`, cols: 80, rows: 24, altScreen: true }) })
+    t.host.start()
+    const a = await openViewer(t, 0)
+    const b = await openViewer(t, 1)
+    const ka = metaOf(a).unlockKey
+    expect(readUnlockKey(ka)).not.toBeNull()
+    expect(readUnlockKey(metaOf(b).unlockKey)).not.toBeNull()
+    expect(metaOf(b).unlockKey).not.toBe(ka)
+    // Not derived from the link: nothing a link holder can compute.
+    expect([bytesToB64(t.keys.host.publicKey), bytesToB64(t.keys.viewer.publicKey)]).not.toContain(ka)
+    ptyEvent(t.sink(0), IPC.ptyExit('s1'), 0)
+    await clock.flush()
+    await clock.advance(REJOIN_BACKOFF_MS[0])
+    await vi.waitFor(() => expect(a.named(WATCH_EVENT.meta)).toHaveLength(2))
+    expect(metaOf(a, 1).unlockKey).toBe(ka)
+    for (const role of ['viewer', 'commenter'] as const) {
+      const o = setup({ role })
+      o.host.start()
+      const w = await openViewer(o)
+      expect('unlockKey' in metaOf(w)).toBe(false)
+    }
+  })
+
+  it('a sealed unlock opens with the connection key: the right password controls, and the real client seals', async () => {
+    const t = controller()
+    t.host.start()
+    // The real client (it seals on its own once the meta offered a key).
+    const v = await openViewer(t, 0)
+    expect(await unlock(v, 'Ada', PW)).toEqual({ state: 'controlling' })
+    // A raw peer sealing it by hand to the key its own meta offered.
+    const p = await openRaw(t, 1)
+    const key = readUnlockKey((p.named(WATCH_EVENT.meta)[0] as WatchMeta).unlockKey)!
+    expect(await rawUnlock(p, [sealUnlock('Bob', PW, key)])).toEqual({ state: 'controlling' })
+    expect(t.taken).toEqual(['Ada', 'Bob'])
+  })
+
+  it('an unlock sealed to another key (another connection\'s, a replay) is wrong and counted, never verified', async () => {
+    const clock = manualClock()
+    const t = controller({ clock })
+    t.host.start()
+    const other = await openRaw(t, 0)
+    const p = await openRaw(t, 1)
+    const otherKey = readUnlockKey((other.named(WATCH_EVENT.meta)[0] as WatchMeta).unlockKey)!
+    await clock.advance(UNLOCK_MIN_INTERVAL_MS)
+    expect(await rawUnlock(p, [sealUnlock('Eve', PW, otherKey)])).toEqual({ state: 'available', reason: 'wrong' })
+    await clock.advance(UNLOCK_MIN_INTERVAL_MS)
+    expect(await rawUnlock(p, [{ sealed: { key: 'x', nonce: 'y', box: 'z' } }])).toEqual({ state: 'available', reason: 'wrong' })
+    expect(t.verifies()).toBe(0)
+    expect(t.wrongs).toEqual([1, 2])
+  })
+
+  it('a plain unlock (a page from before sealing) still works — but not after the same connection sent a sealed one', async () => {
+    const clock = manualClock()
+    const t = controller({ clock })
+    t.host.start()
+    const old = await openRaw(t, 0)
+    expect(await rawUnlock(old, [{ name: 'Ada', password: PW }])).toEqual({ state: 'controlling' })
+    const p = await openRaw(t, 1)
+    const key = readUnlockKey((p.named(WATCH_EVENT.meta)[0] as WatchMeta).unlockKey)!
+    await clock.advance(UNLOCK_MIN_INTERVAL_MS)
+    expect(await rawUnlock(p, [sealUnlock('Bob', WRONG, key)])).toEqual({ state: 'available', reason: 'wrong' })
+    const verified = t.verifies()
+    await clock.advance(UNLOCK_MIN_INTERVAL_MS)
+    // The right password, in the clear, on a connection that seals: refused unverified, counted.
+    expect(await rawUnlock(p, [{ name: 'Bob', password: PW }])).toEqual({ state: 'available', reason: 'wrong' })
+    expect(t.verifies()).toBe(verified)
+    expect(t.taken).toEqual(['Ada'])
+  })
+
   // --- watch:unlock -----------------------------------------------------------------------------------
 
   it('an unlock sent before the viewer joined is ignored, even with the right password: no answer, no verification', async () => {
@@ -1569,6 +1653,69 @@ describe('createLinkHost — control', () => {
     expect(t.locks()).toBe(1)
     expect(t.taken).toEqual(['Ada'])
   }, 20_000) // eleven real scrypt checks
+
+  // Finding L2: the service gives a lock a lift time; every viewer is told how long it lasts, and the
+  // owner is told who tipped it.
+  it('a timed lock tells each viewer how long it lasts: in the lock, in a refused unlock, in a later meta', async () => {
+    const clock = manualClock()
+    let n = 0
+    const t: Setup = controller({
+      clock,
+      join: () => ({ sessionId: `s${++n}`, cols: 80, rows: 24, altScreen: true }),
+      control: ctl({ wrong: WRONG_PER_LINK - 1 }),
+      verifyPassword: async (pw) => pw === PW,
+      onControlLocked: () => {
+        t.record.control!.locked = true
+        t.record.control!.lockedUntil = clock.now() + 15 * 60_000
+      }
+    })
+    t.host.start()
+    const v = await openViewer(t, 0)
+    const w = await openViewer(t, 1)
+    await clock.advance(UNLOCK_MIN_INTERVAL_MS)
+    const before = controlOf(v).length
+    expect(v.c.unlock('Eve', WRONG)).toBe(true)
+    await vi.waitFor(() => expect(controlOf(v).slice(before)).toEqual([
+      { state: 'available', reason: 'wrong' },
+      { state: 'locked', reason: 'locked', lockedForMs: 15 * 60_000 }
+    ]))
+    await vi.waitFor(() => expect(controlOf(w).at(-1)).toEqual({ state: 'locked', reason: 'locked', lockedForMs: 15 * 60_000 }))
+    expect(t.lockedBy).toEqual(['Eve'])
+    await clock.advance(5 * 60_000)
+    expect(await unlock(v, 'Eve', PW)).toEqual({ state: 'locked', reason: 'locked', lockedForMs: 10 * 60_000 })
+    // A rejoin's meta says what is left.
+    const metas = w.named(WATCH_EVENT.meta).length
+    ptyEvent(t.sink(1), IPC.ptyExit('s2'), 0)
+    await clock.flush()
+    await clock.advance(REJOIN_BACKOFF_MS[0])
+    await vi.waitFor(() => expect(w.named(WATCH_EVENT.meta)).toHaveLength(metas + 1))
+    expect(metaOf(w, metas).control).toEqual({ state: 'locked', lockedForMs: 10 * 60_000 - REJOIN_BACKOFF_MS[0] })
+    // The lock lifts (the service clears it and tells the host): every viewer may unlock again.
+    t.record.control!.locked = false
+    t.record.control!.lockedUntil = null
+    t.host.allowControl()
+    await vi.waitFor(() => expect(controlOf(w).at(-1)).toEqual({ state: 'available' }))
+    await clock.advance(UNLOCK_MIN_INTERVAL_MS)
+    expect(await unlock(w, 'Ada', PW)).toEqual({ state: 'controlling' })
+  })
+
+  it('the lock names who tipped it: the attempt\'s own name, else the chat name of the connection that sent it, else nobody', async () => {
+    for (const c of [{ chat: 'Mallory', want: 'Mallory' }, { chat: null, want: null }]) {
+      const clock = manualClock()
+      const t = controller({ clock, control: ctl({ wrong: WRONG_PER_LINK - 1 }) })
+      t.host.start()
+      const p = await openRaw(t, 0)
+      if (c.chat) {
+        p.cast(WATCH_CHAT_CAST, [{ name: c.chat, text: 'hi' }])
+        await vi.waitFor(() => expect(t.chats).toHaveLength(1))
+      }
+      await clock.advance(UNLOCK_MIN_INTERVAL_MS)
+      // A malformed attempt (no name left once cleaned) tips it.
+      await rawUnlock(p, [{ name: '\u200b', password: 'x' }])
+      await vi.waitFor(() => expect(t.locks()).toBe(1))
+      expect(t.lockedBy).toEqual([c.want])
+    }
+  })
 
   it('allowControl resets the link count and tells every viewer it is available again', async () => {
     const clock = manualClock()
