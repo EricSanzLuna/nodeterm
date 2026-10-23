@@ -42,7 +42,7 @@ import type { LocalForward, ParsedSsh, ReverseForward, SshOptions, SshTarget } f
 import { parseProxyJump, resolveForwardAgent, type HostQuery, type JumpSpec, type ResolvedHost } from './ssh-config'
 import { WINDOWS_OPENSSH_AGENT_PIPE, resolveWindowsIdentityAgent } from './windows-agent-discovery'
 import { expandProxyTokens, proxyCommandSocket, type ProxySpawn } from './proxy-command'
-import { acceptNewHostKey } from './known-hosts'
+import { acceptNewHostKey, hostKeyAlgorithmsFor, hostKeyMismatchMessage } from './known-hosts'
 import { addKeyToAgent, type AgentAddResult } from './agent-add'
 
 /**
@@ -842,27 +842,28 @@ export class NativeMux {
     let hostKeyRefusal = ''
     const cancelled = { value: false }
     const auth = this.authPlan(target, host, options, mode, cancelled)
+    const keyPolicy = { userFiles: host.userKnownHostsFiles, globalFiles: host.globalKnownHostsFiles }
+    // OpenSSH's order_hostkeyalgs: offer the key types on record for this host first, so a host
+    // that still holds its recorded key presents it — and any other type it presents is refused as
+    // a changed key (known-hosts.ts), never recorded as a new one. Undefined = ssh2's default order.
+    const serverHostKey = hostKeyAlgorithmsFor(keyPolicy, knownAs, host.port)
     const cfg: ConnectConfig = {
       sock,
       username: host.user,
       readyTimeout: AUTH_WAIT_MS,
       keepaliveInterval: (options.serverAliveInterval ?? 0) * 1000,
       keepaliveCountMax: options.serverAliveCountMax ?? 3,
+      ...(serverHostKey ? { algorithms: { serverHostKey } } : {}),
       hostVerifier: (key: Buffer): boolean => {
         // accept-new is the only policy the builders ask for; `ask`/`yes` from the user's config
         // are overridden by the command line exactly as they are for OpenSSH.
-        const v = acceptNewHostKey(
-          { userFiles: host.userKnownHostsFiles, globalFiles: host.globalKnownHostsFiles },
-          knownAs,
-          host.port,
-          key
-        )
+        const v = acceptNewHostKey(keyPolicy, knownAs, host.port, key)
         if (!v.accept) {
           hostKeyRefusal =
             prefix +
             (v.verdict === 'revoked'
               ? `@@@ WARNING: REVOKED HOST KEY DETECTED FOR ${knownAs} @@@`
-              : `@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@ Host key verification failed for ${knownAs}.`)
+              : hostKeyMismatchMessage(knownAs, host.port, v))
         }
         return v.accept
       },
