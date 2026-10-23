@@ -35,17 +35,22 @@ const TMUX =
   ['/opt/homebrew/bin/tmux', '/usr/local/bin/tmux', '/usr/bin/tmux'].find((p) => existsSync(p)) ?? null
 
 vi.mock('./session-host-backend', async () => (await import('./__fixtures__/no-session-host')).noSessionHost())
+/** Every pty the manager spawns (its tmux client): a refused NEW-ONLY create must spawn none. */
+const spawns = vi.hoisted(() => [] as Array<{ file: string; args: string[] }>)
 vi.mock('node-pty', () => ({
-  spawn: () => ({
-    onData: () => {},
-    onExit: () => {},
-    write: () => {},
-    resize: () => {},
-    pause: () => {},
-    resume: () => {},
-    kill: () => {},
-    pid: 4321
-  })
+  spawn: (file: string, args: string[]) => {
+    spawns.push({ file, args })
+    return {
+      onData: () => {},
+      onExit: () => {},
+      write: () => {},
+      resize: () => {},
+      pause: () => {},
+      resume: () => {},
+      kill: () => {},
+      pid: 4321
+    }
+  }
 }))
 vi.mock('./pty-devices', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./pty-devices')>()),
@@ -166,8 +171,12 @@ describe.skipIf(!TMUX || process.platform === 'win32')('node-keyed tmux verbs re
   })
 
   it('a NEW-ONLY create never joins or reattaches a session that already runs under the name', async () => {
+    spawns.length = 0
     const r = await manager.createHeadless({ persistKey: victimKey, cols: 80, rows: 24, newOnly: true })
     expect(r).toEqual({ sessionId: '', fresh: false, unavailable: 'new-only' })
+    // Refused BEFORE any tmux client is spawned: `new-session -A -D` would attach to the victim and
+    // detach its other clients even if the result were thrown away afterwards.
+    expect(spawns).toEqual([])
     // The victim is untouched (still alive, nothing typed).
     await expect(tmux(['has-session', '-t', `=${sessionName(victimKey)}`])).resolves.toBeTruthy()
     // Where nothing runs under the EXACT name (a prefix of a live one included), it spawns fresh.
@@ -175,6 +184,7 @@ describe.skipIf(!TMUX || process.platform === 'win32')('node-keyed tmux verbs re
     expect(fresh.unavailable).toBeUndefined()
     expect(fresh.fresh).toBe(true)
     expect(fresh.sessionId).not.toBe('')
+    expect(spawns.map((c) => c.args.includes('new-session'))).toEqual([true])
     manager.releaseHeadless(prefixKey)
   })
 })
