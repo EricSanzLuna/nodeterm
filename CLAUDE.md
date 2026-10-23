@@ -10025,6 +10025,15 @@ Voice-to-text input captured via microphone, turned into terminal text via on-de
   SIMD flags in ggml), a GPU backend (this smart-whisper has no Vulkan build option), cancelling a
   running transcription, and the Server Edition (installed with `--ignore-scripts`, so it keeps the
   baseline; the startup log line `[speech] whisper binary: …` says which binary loaded).
+- **macOS: smart-whisper's Metal shader path is patched to the unpacked copy** (second patch in
+  `scripts/patch-smart-whisper.mjs`, marker `NODETERM-PATCH(smart-whisper-metal-asar)`). smart-whisper
+  sets `GGML_METAL_PATH_RESOURCES` from its own `__dirname`, which in the packaged app is inside
+  `app.asar`; native code cannot read inside an asar ("Not a directory"), so Metal init failed and
+  whisper.cpp ran on the CPU with no error shown. The shader file is already unpacked (asarUnpack), so
+  the patch rewrites `app.asar` to `app.asar.unpacked` in that path. MEASURED with the app's own binary
+  on an M5 Pro, large-v3-turbo, 2.7 s clip: 5.97 s on the CPU, 0.64 s on Metal; in the app, dictation
+  went from several seconds to under one. A dev install and an explicit `GGML_METAL_PATH_RESOURCES`
+  are unchanged.
 
 ## Packaging & auto-update
 

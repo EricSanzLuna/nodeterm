@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
-import { PATCH_MARKER, SIMD_FLAGS, VARIANT_TARGET, patchSmartWhisper } from '../../../scripts/patch-smart-whisper.mjs'
+import { METAL_MARKER, PATCH_MARKER, SIMD_FLAGS, VARIANT_TARGET, patchSmartWhisper } from '../../../scripts/patch-smart-whisper.mjs'
 import { WHISPER_SIMD_FLAGS } from './speech-service'
 import { testTmpDir } from '../test-tmp'
 
@@ -17,8 +17,7 @@ const installed = fs.existsSync(path.join(PKG, 'binding.gyp'))
 /** Pristine smart-whisper 0.8.1 binding.gyp + the loader lines of its dist/index.js (dist-index.js). */
 const FIXTURE = path.resolve(__dirname, '__fixtures__/smart-whisper-0.8.1')
 
-function copyPackage(): string {
-  const dir = testTmpDir('sw-patch-')
+function copyPackage(dir = testTmpDir('sw-patch-')): string {
   fs.mkdirSync(path.join(dir, 'dist'), { recursive: true })
   fs.copyFileSync(path.join(FIXTURE, 'binding.gyp'), path.join(dir, 'binding.gyp'))
   // Stored flat: the repo's .gitignore drops every dist/ directory.
@@ -31,6 +30,7 @@ describe('patch-smart-whisper', () => {
     const howto = 'node_modules is unpatched — run `npm run rebuild`.'
     expect(fs.readFileSync(path.join(PKG, 'binding.gyp'), 'utf8'), howto).toContain(PATCH_MARKER)
     expect(fs.readFileSync(path.join(PKG, 'dist', 'index.js'), 'utf8'), howto).toContain(PATCH_MARKER)
+    expect(fs.readFileSync(path.join(PKG, 'dist', 'index.js'), 'utf8'), howto).toContain(METAL_MARKER)
   })
 
   it('builds for exactly the CPU flags the runtime checks', () => {
@@ -57,6 +57,52 @@ describe('patch-smart-whisper', () => {
     fs.writeFileSync(path.join(dir, 'binding.gyp'), '{}')
     fs.writeFileSync(path.join(dir, 'dist', 'index.js'), 'module.exports = {}')
     expect(() => patchSmartWhisper(dir)).toThrow(/anchor/)
+  })
+
+  it('refuses a dist/index.js whose Metal path line moved', () => {
+    const dir = copyPackage()
+    const js = path.join(dir, 'dist', 'index.js')
+    fs.writeFileSync(js, fs.readFileSync(js, 'utf8').replace(/^process\.env\.GGML_METAL.*\n/m, ''))
+    expect(() => patchSmartWhisper(dir)).toThrow(/Metal/)
+  })
+
+  describe('Metal shader path', () => {
+    const KEY = 'GGML_METAL_PATH_RESOURCES'
+
+    /** Loads a patched package from `pkgDir` and returns the shader dir it hands whisper.cpp. */
+    function metalPath(pkgDir: string, preset?: string): string | undefined {
+      copyPackage(pkgDir)
+      patchSmartWhisper(pkgDir)
+      const rel = path.join(pkgDir, 'build', 'Release')
+      fs.mkdirSync(rel, { recursive: true })
+      fs.writeFileSync(path.join(rel, 'smart-whisper.js'), 'module.exports = {}')
+      const saved = process.env[KEY]
+      if (preset === undefined) delete process.env[KEY]
+      else process.env[KEY] = preset
+      try {
+        createRequire(path.join(pkgDir, 'dist', 'index.js'))('./index.js')
+        return process.env[KEY]
+      } finally {
+        if (saved === undefined) delete process.env[KEY]
+        else process.env[KEY] = saved
+      }
+    }
+
+    it('points a packaged app at the unpacked copy, which native code can read', () => {
+      // Inside app.asar the path is "Not a directory" to Metal, so whisper.cpp ran on the CPU.
+      const res = path.join(testTmpDir('sw-metal-'), 'Resources')
+      const pkg = path.join(res, 'app.asar', 'node_modules', 'smart-whisper')
+      expect(metalPath(pkg)).toBe(path.join(res, 'app.asar.unpacked', 'node_modules', 'smart-whisper', 'whisper.cpp', 'ggml', 'src'))
+    })
+
+    it('leaves a dev install, an unpacked path and an explicit setting alone', () => {
+      const dev = path.join(testTmpDir('sw-metal-dev-'), 'node_modules', 'smart-whisper')
+      expect(metalPath(dev)).toBe(path.join(dev, 'whisper.cpp', 'ggml', 'src'))
+      const unpacked = path.join(testTmpDir('sw-metal-unp-'), 'app.asar.unpacked', 'node_modules', 'smart-whisper')
+      expect(metalPath(unpacked)).toBe(path.join(unpacked, 'whisper.cpp', 'ggml', 'src'))
+      const asar = path.join(testTmpDir('sw-metal-set-'), 'app.asar', 'node_modules', 'smart-whisper')
+      expect(metalPath(asar, '/custom/metal')).toBe('/custom/metal')
+    })
   })
 
   describe('patched loader', () => {
