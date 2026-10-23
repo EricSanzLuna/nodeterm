@@ -22,6 +22,14 @@ import { IPC } from '../shared/ipc'
 // in-memory and redacted at its push boundary; the panel/IPC side is gated on the setting.
 const logBuffer = new LogBuffer()
 installLogSink(logBuffer)
+// Process-death telemetry: a GPU-process crash used to leave
+// no trace at all. Registered here, before 'ready', because the GPU process launches during boot
+// and can die there. LOG ONLY — Chromium respawns the GPU process itself; see process-health-log.ts.
+const childProcessGoneLine = createChildProcessGoneLog()
+app.on('child-process-gone', (_event, details) => {
+  const { level, msg } = childProcessGoneLine(details)
+  console[level](`[process] ${msg}`)
+})
 import { nativeMux, setNativeWindowsAgentOptIn, useNativeSsh } from '../core/remote-ssh/native/native-runtime'
 import { writeFilesToClipboard } from './clipboard-files'
 import { writeWindowsFileDrop } from './clipboard-files-win'
@@ -190,6 +198,7 @@ import {
 import { answerHeldPermission, isStructuredTicket, type HeldPermissionIo } from '../core/agents/permission-decision'
 import type { AnswerPermissionPayload } from '../shared/agents/permission-answer'
 import { setMainWindow, getMainWindow, sendToMain, closeAction, createCrashReloadPolicy } from './main-window'
+import { createChildProcessGoneLog, createHangTracker, formatRenderProcessGone } from './process-health-log'
 import { WINDOW_VISIBILITY_EVENTS, windowVisibilitySignal } from './window-visibility'
 import {
   MENU_ITEM_ID_CLOSE,
@@ -1392,7 +1401,23 @@ function createWindow(): BrowserWindow {
     })
   }
   const crashReload = createCrashReloadPolicy()
+  // Renderer hangs: Electron declares one after its own input-ack timeout and clears it on the
+  // next ack. One line when declared, one with the duration when it ends; logged, never acted on.
+  const hangs = createHangTracker()
+  win.on('unresponsive', () => {
+    const line = hangs.unresponsive(Date.now())
+    if (line) console[line.level](`[process] ${line.msg}`)
+  })
+  win.on('responsive', () => {
+    const line = hangs.responsive(Date.now())
+    if (line) console[line.level](`[process] ${line.msg}`)
+  })
   win.webContents.on('render-process-gone', (_event, details) => {
+    // The ring's only record that the page died — the reload below wipes the renderer's own console.
+    const gone = formatRenderProcessGone(details)
+    console[gone.level](`[process] ${gone.msg}`)
+    // A hang open on the dead page ends with it; the reloaded page's first hang is a new one.
+    hangs.reset()
     ptyManager.dropClient(presenceId)
     // A dead renderer sends no disarm and no focus-lost report. The reloaded page mounts no
     // recorder and no terminal, so without this the user would come back to an app where ⌘W does
@@ -3545,11 +3570,18 @@ app.whenReady().then(async () => {
   // once a minute. The send goes through `sendToMain`, which resolves the window AT SEND TIME and
   // no-ops while it is closed (macOS keeps the app alive without one) — the monitor's own
   // try/catch is the backstop, not the primary.
+  //
+  // The kernel leg (macOS only — absent elsewhere) is the one that actually fires there: the byte
+  // leg is silent on darwin and main's RSS never nears 4 GB. It runs the renderer levers ONLY, on an
+  // escalation of `kern.memorystatus_vm_pressure_level` (at most once per KERNEL_LEVER_GAP_MS at
+  // the same severity, so a flapping level does not re-run them); a kernel CRITICAL deliberately does
+  // NOT sweep the reaper yet — that is a separate, separately measured step (#211).
   createMemoryPressureMonitor({
     onPressure: (severity) => {
       sendToMain(IPC.appMemoryPressure, severity)
       if (severity === 'critical') void sessionReaper.sweep()
-    }
+    },
+    onKernelPressure: (severity) => sendToMain(IPC.appMemoryPressure, severity)
   }).start()
   // Pty-device pressure (core/pty-pressure.ts): the OTHER way this machine runs out, and the one
   // that actually happened. The memory monitor above could not see it — during the 2026-08-11
@@ -3586,6 +3618,17 @@ app.whenReady().then(async () => {
     unmeasuredSessions: () => ptyManager.zellijSessionCount(),
     // Windows (no tmux): the session host's sessions; undefined where it is not the backend.
     sessionHost: () => ptyManager.sessionHostListing(),
+    // The panel's "nodeterm itself" group: pids, types and CPU time only. Memory
+    // is NOT taken from here — on macOS `memory.workingSetSize` is resident size and misses the GPU
+    // helper's IOSurfaces (footprint 1557-1845 MB vs 96-153 MB), and `privateBytes` is Windows-only;
+    // core looks each pid up in the sweep's own footprint table instead. Called once per panel
+    // sweep, never on a timer.
+    appProcesses: () =>
+      app.getAppMetrics().map((m) => ({
+        pid: m.pid,
+        type: m.type,
+        ...(typeof m.cpu.cumulativeCPUUsage === 'number' ? { cpuSeconds: m.cpu.cumulativeCPUUsage } : {})
+      })),
     remote: {
       // Identity, not liveness: a DISCONNECTED SSH project is still someone else's machine, and
       // `connectedHosts()` alone would answer "local" for it — exactly the window the service's
