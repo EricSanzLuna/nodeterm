@@ -6850,8 +6850,9 @@ one is Pro and the backend is the gate. Reference: **`docs/live-links.md`**. Inv
   host-only channels before any policy, so it could never arrive (`src/shared/host-control.test.ts`,
   `src/core/relay/scoped-guest-policy.test.ts`).
 - A watcher never goes through `decideAccess` (it would get the VIEW table): `watcher-policy.ts` refuses
-  every request and every cast but `watch:chat` (Commenter and Control links) and, on a Control link
-  only, the three controller casts `watch:unlock` / `watch:input` / `watch:release`; it passes out only
+  every request and every cast but `watch:history` (every link), `watch:chat` (Commenter and Control
+  links) and, on a Control link only, the three controller casts `watch:unlock` / `watch:input` /
+  `watch:release`; it passes out only
   `watch:*`, its own pty frames and `pty:size`, and takes no `interceptReq` (`watcher-policy.test.ts`,
   `chat-cast.guard.test.ts`). The policy knows only the ROLE: "controlling" is the link host's state
   per CONNECTION (a right password; a reconnect unlocks again, a session restart keeps it). Input from
@@ -6886,6 +6887,12 @@ one is Pro and the backend is the gate. Reference: **`docs/live-links.md`**. Inv
 - Watchers are QUIET (no broadcast, not in `clientIds()`) and SELF-PACED (never paused, dropped or
   resynced by the registry); the reaper reads `quietClientIds()` too, or it releases a session only a
   viewer holds (`ui-sink-registry.watcher.test.ts`, `pty-reap.test.ts`).
+- Read-back (`watch:history`, `core/watch-link/history.ts`) is the agent's CONVERSATION, never the
+  terminal's history: a viewer's stream is a tmux client on the alternate screen and has nothing to
+  scroll, and copy-mode would scroll the owner's pane. The host cuts every page at `record.createdAt`
+  (a message with no time is never sent) and `readHistoryPage` cuts again on both ends; tool results and
+  thinking never travel. The read is host-chat's `page`, bound to the link's node (a viewer sends only a
+  cursor), one at a time per viewer, ≥ 500 ms apart.
 - The stream filter sees every byte, has NO length cap (a cap leaked a measured clipboard), and every
   join resets it `midStream`, never to text mode and never on a keyframe. `captureVisible` never returns
   history (exact `=nt-<id>:`, no `-S`; the session host answers its negotiated `captureVisible`, the

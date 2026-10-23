@@ -124,6 +124,7 @@ import {
 } from '../core/watch-link/service'
 import { createWatchLinkApi } from '../core/watch-link/api'
 import { WatchLinkStore } from '../core/watch-link/store'
+import { HISTORY_READ_BYTES } from '../core/watch-link/history'
 import { createWatchPty, watchRemoteFor, watchRemoteRecords, type WatchRemote } from '../core/watch-link/pty-seam'
 import { SshStore } from './ssh-store'
 import { GitService } from '../core/git-service'
@@ -297,7 +298,7 @@ import { codexHome } from '../core/usage/codex-usage'
 import { isAsyncSubagentLaunch, isCursorPayload, grokRawFields, type NormalizedAgentEvent } from '../shared/agents/normalize'
 import { applyGrokHookSession } from '../core/grok-hook-session'
 import { agentAccountColor } from '../shared/agents/account-color'
-import { capabilityAgentId } from '../shared/agents/config'
+import { canChat, capabilityAgentId } from '../shared/agents/config'
 import {
   setRemoteTranscriptReader,
   TITLE_TAIL_BYTES,
@@ -416,7 +417,8 @@ import {
   loadOrCreateKeyPair,
   relayAllowed,
   API_BASE as RELAY_API_BASE,
-  RELAY_URL
+  RELAY_URL,
+  type HostChatOps
 } from './remote/host-service'
 import { initStandingHost } from './remote/standing-host'
 import { initRelayHost } from './remote/relay-host-service'
@@ -3620,6 +3622,12 @@ app.whenReady().then(async () => {
   // Server Edition. `init()` decides nothing before the boot workspace load (R40): an empty answer
   // while the index is still being read is not evidence that a node is gone.
   // Where a watcher join goes (core's ONE rule, over this machine's records and its live masters).
+  // Read-back for a link's viewers (docs/live-links.md → Read-back) reads through the phone Chat
+  // screen's page reader (host-chat.ts, `hostBridge.chat` below): the node from this machine's
+  // records, the renderer's session id first, an SSH node read on its host and never here. That reader
+  // is built later in boot, so it is bound late; a read-back before it exists is a failed read the
+  // viewer may repeat. The link host cuts every page at the link's creation; this only reads.
+  let watchHistoryChat: Pick<HostChatOps, 'page'> | null = null
   const watchRemote = (nodeId: string): WatchRemote =>
     watchRemoteFor(nodeId, watchRemoteRecords(workspaceStore, (connectionId) => sshProjectManager?.refForProject(connectionId)))
   watchLinks = createWatchLinkService({
@@ -3654,6 +3662,17 @@ app.whenReady().then(async () => {
     // Zellij is a local-only backend) is not decided by this machine's backend choice: 'ok' (a host
     // with no tmux at all answers every keystroke false, which the link host reports as dropped).
     controlSupport: (nodeId) => (watchRemote(nodeId).requireRemote ? 'ok' : ptyManager.nodeControlSupport(nodeId)),
+    history: async (nodeId, before) => {
+      const chat = watchHistoryChat
+      if (!chat) throw new Error('read-back is not ready yet')
+      const page = await chat.page(nodeId, before === null ? { maxBytes: HISTORY_READ_BYTES } : { before, maxBytes: HISTORY_READ_BYTES })
+      return page === null || page === 'unsupported' ? { kind: 'unsupported' } : { kind: 'page', result: page }
+    },
+    // The same question host-chat's page asks before it reads: an agent the ⌘M view can render.
+    historySupported: (nodeId) => {
+      const agentId = workspaceStore.getNodeResolved(nodeId)?.agentId ?? mirrorEntry(nodeId)?.agentId
+      return !!agentId && canChat(capabilityAgentId(agentId))
+    },
     emit: (channel, ...args) => sendToOwners(corePlatform, channel, ...args)
   })
   registerWatchLinkIpc(corePlatform, watchLinks)
@@ -5036,6 +5055,7 @@ app.whenReady().then(async () => {
     // to have focused (that gap read as "cwd is outside the shared project roots" on the phone).
     workspaceRoots: () => workspaceStore.localProjectCwds()
   }
+  watchHistoryChat = hostBridge.chat
   // The renderer owns the Eco hibernation flag (persisted in ITS localStorage) and main only
   // mirrors it — same direction as `terminalFocused`. Feeds the agent-status mirror so the phone
   // renders SLEEPING (and re-fed at renderer boot from the persisted store, so a desktop restart
