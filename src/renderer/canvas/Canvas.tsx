@@ -985,6 +985,7 @@ import type { TeamStation } from '../lib/teamProgress'
 import { canvasTeamStations, useTeamStations } from '../state/teamStations'
 import { applyPullAutoMove } from '../lib/pullAutoMove'
 import { useWallpaperBackground, wallpaperLayers } from '../state/wallpaper'
+import { AerialWallpaper, useIsAerialWallpaper } from '../components/AerialWallpaper'
 import { showCanvasDots } from '../lib/canvasDots'
 import { PROJECT_NAME_MAX, clampProjectName } from '@shared/project-name'
 
@@ -1410,12 +1411,16 @@ export function Canvas() {
   // transformed, so it stays fixed while the canvas pans and zooms. React Flow's own root goes
   // transparent over it (`.react-flow.has-wallpaper`).
   const wallpaperBg = useWallpaperBackground()
+  // An aerial paints its still and video on its own layer before the root (AerialWallpaper), so the
+  // root paints nothing — and it is a wallpaper even when its thumbnail is missing.
+  const aerialWallpaper = useIsAerialWallpaper()
+  const hasWallpaper = !!wallpaperBg || aerialWallpaper
   // Memoised: Canvas re-renders on every drag frame, and a fresh style object would make React
   // re-diff (and a multi-MB data: URL re-compare) the root's style each time.
   const wallpaperStyle = useMemo<React.CSSProperties | undefined>(
     () =>
-      wallpaperBg ? wallpaperLayers(wallpaperBg) : undefined,
-    [wallpaperBg]
+      wallpaperBg && !aerialWallpaper ? wallpaperLayers(wallpaperBg) : undefined,
+    [wallpaperBg, aerialWallpaper]
   )
   const [nodes, setNodes, onNodesChange] = useNodesState<CanvasNode>([])
   // Persistent context links between Claude nodes (separate from ephemeral subagent/loop edges).
@@ -19372,6 +19377,10 @@ export function Canvas() {
   const paletteChip = chipFor('app.commandPalette')
 
   return (
+    <>
+    {/* An aerial wallpaper paints as a fixed layer BEFORE the root (the root then paints no
+        background), so it needs no stacking context of its own — see AerialWallpaper. */}
+    <AerialWallpaper />
     <div className="canvas-root" style={wallpaperStyle}>
       <TabBar
         onSwitch={switchProject}
@@ -19760,7 +19769,7 @@ export function Canvas() {
         <SessionProvider session={nodeSession} key={nodeSession.id}>
         <OwningProjectContext.Provider value={flowOwnerProjectId}>
         <ReactFlow
-          className={wallpaperBg ? 'has-wallpaper' : undefined}
+          className={hasWallpaper ? 'has-wallpaper' : undefined}
           nodes={allNodes}
           // Read only at mount. A session-changing switch remounts this <ReactFlow> (key above) one
           // commit AFTER the load effect applied the project's camera, and the fresh pan/zoom starts
@@ -20703,5 +20712,6 @@ export function Canvas() {
         )}
       </div>
     </div>
+    </>
   )
 }

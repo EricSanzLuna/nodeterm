@@ -375,7 +375,7 @@ import { registerGrokCliIpc } from '../core/grok-cli'
 import { registerCursorCliIpc } from '../core/cursor-cli'
 import { refreshCodexIdentityCaps, registerCodexIdentityIpc } from '../core/codex-identity-caps'
 import { codexCliCaps, registerCodexCliIpc } from '../core/codex-cli'
-import { registerWallpaperIpc, setWallpaperImageOps } from '../core/wallpaper'
+import { registerWallpaperIpc, setWallpaperImageOps, setWallpaperMediaUrl } from '../core/wallpaper'
 import { nativeImageWallpaperOps } from './wallpaper-native-image'
 import { registerRunConfigIpc, stopAllRunWatches } from '../core/run-service'
 import { registerSimulatorIpc, setSimulatorNodeRefusal, shutdownOwnedSimulators, stopAllSimulators } from '../core/simulator/simulator-service'
@@ -1732,6 +1732,9 @@ app.whenReady().then(async () => {
   // Windows has no sips: convert (thumbnails, Windows stills, oversized imports) with Chromium's
   // own decoder. macOS keeps sips and Linux keeps no converter, byte for byte.
   if (process.platform === 'win32') setWallpaperImageOps(nativeImageWallpaperOps)
+  // Aerial wallpapers (macOS) stream through nt-media://; core allowlists only the clips and
+  // thumbnails its own manifest scan found.
+  setWallpaperMediaUrl(allowMediaPath)
   registerWallpaperIpc(settingsStore)
   registerRunConfigIpc()
   registerSimulatorIpc()

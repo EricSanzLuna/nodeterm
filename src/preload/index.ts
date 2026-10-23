@@ -592,7 +592,9 @@ const api: NodeTerminalApi = {
   wallpaper: {
     listStills: () => ipcRenderer.invoke(IPC.wallpaperListStills),
     load: (w) => ipcRenderer.invoke(IPC.wallpaperLoad, w),
-    importImage: (p) => ipcRenderer.invoke(IPC.wallpaperImport, p)
+    importImage: (p) => ipcRenderer.invoke(IPC.wallpaperImport, p),
+    listAerials: () => ipcRenderer.invoke(IPC.wallpaperListAerials),
+    aerialClips: (w) => ipcRenderer.invoke(IPC.wallpaperAerialClips, w)
   },
   simulator: {
     devices: (refresh) => ipcRenderer.invoke(IPC.simulatorDevices, refresh === true),
