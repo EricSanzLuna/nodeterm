@@ -41,9 +41,9 @@ const APPROVAL_TIMEOUT_MS = 60_000
 export interface RelayTabDeps {
   /** The preload relay surface — only `onClosed` is needed here (to catch a pre-approval drop). */
   relayClient: Pick<RelayClientApi, 'onClosed'>
-  /** Add an EMPTY project tab (`useProjects.getState().addProject`) → the new project's id. The
-   *  fallback when the host shared nothing (no scoped project) and the reconnect lever (Canvas
-   *  overrides it to reuse the existing project id in place). */
+  /** Add an EMPTY relay tab (`addRelayTab` — marked `remote`, never a plain local project) → the
+   *  new project's id. The fallback when the host shared nothing (no scoped project) and the
+   *  reconnect lever (Canvas overrides it to reuse the existing project id in place). */
   addProject: (label: string) => { id: string }
   /** Adopt the host's shared project as a tab (`useProjects.getState().adoptProject`) → fresh
    *  project id, node ids kept. Used on FIRST connect to populate the tab with the host's actual

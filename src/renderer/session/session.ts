@@ -54,7 +54,9 @@ let offline: Entry | null = null
  *  leave the store while its nodes are still mounted — a host that stops sharing the only open team
  *  tab deletes it from the store, and the welcome screen keeps its nodes in React Flow — and an id
  *  the store no longer holds must still not resolve local. The store's own answer wins whenever it
- *  still holds the project. Runtime only, like the bindings. */
+ *  still holds the project. Runtime only, like the bindings. Needs no cap: it holds one entry per
+ *  DISTINCT remote project id bound in this app run (a handful of relay / team tabs), and a
+ *  reconnect re-binds the same id. */
 const KNOWN_REMOTE = new Set<string>()
 
 /** The per-session store instances. `createPresenceSession` is memoized BY API IDENTITY, so the
@@ -309,7 +311,8 @@ function offlineForUnboundRemote(projectId: string): Entry | null {
 }
 
 /** The projects bound to a live session whose api IS `api`, i.e. the tabs one relay connection
- *  serves. An unbound project merely falls back to the local session, so the local api binds none. */
+ *  serves. Bindings only: an unbound project — local, or a remote one resolving to the offline
+ *  relay session — is bound to no api, so neither the local api nor the offline one binds any. */
 export function projectIdsBoundToApi(api: NodeTerminalApi): string[] {
   const out: string[] = []
   for (const [projectId, sessionId] of PROJECT_BINDINGS) {

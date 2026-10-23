@@ -19,7 +19,7 @@ import {
   setOfflineRelayApiFactory,
   OFFLINE_RELAY_SESSION_ID,
 } from './session'
-import { useProjects } from '../state/projects'
+import { addRelayTab, useProjects } from '../state/projects'
 import { LocalTransport } from '../terminal/local-transport'
 import { planActiveProjectDials } from '../lib/sshAttachments'
 import type { NodeTerminalApi, Project, Workspace } from '@shared/types'
@@ -123,6 +123,35 @@ describe('openRelayTab (connect → tab → mount)', () => {
     expect(useProjects.getState().getProject(tab.projectId)).toBeUndefined()
     expect(sessionForProject(tab.projectId).source).toBe('local')
     expect(sessionCount()).toBe(1) // only local remains
+  })
+
+  it('a Team Access tab whose host shared nothing is a RELAY tab: never saved, offline (never local) once disposed', async () => {
+    // The host's workspace is empty, so openRelayTab takes the fallback: `deps.addProject(label)`,
+    // which Canvas wires to `addRelayTab` on a first connect.
+    const { api } = fakeBridgedApi()
+    const close = vi.fn()
+    const handle: RelayApiHandle = { api, ready: () => Promise.resolve(), close }
+    const { deps } = makeDeps({ handle, addProject: addRelayTab })
+    const offlineApi = { marker: 'offline-relay' } as unknown as NodeTerminalApi
+    setOfflineRelayApiFactory(() => offlineApi)
+    try {
+      const tab = await openRelayTab('conn-1', "Ayşe's Mac", deps)
+      const project = useProjects.getState().getProject(tab.projectId)
+      expect(project?.remote).toBe(true)
+      expect(sessionForProject(tab.projectId).id).toBe(tab.sessionId)
+      // Never written to THIS machine's workspace: a reload must not bring it back as a LOCAL
+      // project carrying the host's node ids (the disk writer skips `remote` too).
+      expect(useProjects.getState().toWorkspace().projects.map((p) => p.id)).not.toContain(tab.projectId)
+      tab.dispose()
+      expect(close).toHaveBeenCalledTimes(1)
+      const s = sessionForProject(tab.projectId)
+      expect(s.id).toBe(OFFLINE_RELAY_SESSION_ID)
+      expect(s.source).toBe('relay')
+      expect(boundSessionForProject(tab.projectId)).toBeNull()
+    } finally {
+      setOfflineRelayApiFactory(null)
+      useProjects.setState({ projects: [], activeProjectId: '' })
+    }
   })
 
   it('a disposed tab whose project is REMOTE in the store resolves to the offline relay session, never local', async () => {

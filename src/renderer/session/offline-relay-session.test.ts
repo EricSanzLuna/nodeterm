@@ -22,7 +22,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { CanvasNodeState, NodeTerminalApi, Project, PtyCreateOptions } from '@shared/types'
 import { E_DISCONNECTED } from '../../shared/rpc'
-import { useProjects } from '../state/projects'
+import { addRelayTab, useProjects } from '../state/projects'
 import {
   OFFLINE_RELAY_SESSION_ID,
   activeSessionApi,
@@ -321,13 +321,18 @@ describe('an unbound REMOTE project resolves to the offline relay session', () =
   it('a remote tab the store has since deleted still resolves offline; a never-remote one stays local', () => {
     const relay = createSession('relay', fakeApi('host'), 'e2ehost')
     bindProjectToSession(TEAM_ALPHA, relay.id) // remote in the store at bind time
-    // Team Access's fallback tab (`addProject(label)`, not marked remote) bound to the same session.
-    bindProjectToSession(LOCAL_ONE, relay.id)
+    // Team Access's fallback tab (the host shared nothing to adopt), bound to the same session. It
+    // is an EMPTY relay tab, `remote` like every relay tab (`addRelayTab`, what Canvas passes as the
+    // first-connect `addProject`): the host's nodes reach it over canvas sync.
+    const fallback = addRelayTab("Ayşe's Mac")
+    bindProjectToSession(fallback.id, relay.id)
     disposeSession(relay.id)
-    useProjects.setState({ projects: [localProject()] }) // TEAM_ALPHA leaves the store
+    expect(sessionForProject(fallback.id).id).toBe(OFFLINE_RELAY_SESSION_ID)
+    useProjects.setState({ projects: [localProject()] }) // TEAM_ALPHA and the fallback leave the store
     expect(sessionForProject(TEAM_ALPHA).id).toBe(OFFLINE_RELAY_SESSION_ID)
+    expect(sessionForProject(fallback.id).id).toBe(OFFLINE_RELAY_SESSION_ID)
     expect(presenceForProject(TEAM_ALPHA)).toBe(getSessionStores(OFFLINE_RELAY_SESSION_ID).presence)
-    // The store's answer wins while it holds the project: never remote ⇒ local.
+    // A local project the store holds stays local (local projects are never bound).
     expect(sessionForProject(LOCAL_ONE).id).toBe('local')
     // An id that was never bound remote stays local.
     expect(sessionForProject('project-never-seen').id).toBe('local')
@@ -498,6 +503,20 @@ describe('source pins', () => {
       expect(body).toContain('boundSessionForProject(')
       expect(body).not.toContain('sessionForProject(')
     }
+  })
+
+  // Canvas's first-connect `addProject` (the host shared nothing to adopt) must make a RELAY tab:
+  // a plain `useProjects.getState().addProject(name)` is a local project — saved to this machine's
+  // workspace with the host's node ids, and LOCAL again once its relay session is gone.
+  it('Canvas creates the Team Access fallback tab with addRelayTab', () => {
+    const canvas = read('../canvas/Canvas.tsx')
+    const a = canvas.indexOf('const mountRemoteMirror = useCallback(')
+    const b = canvas.indexOf('adoptProject: reconnectProjectId', a)
+    expect(a).toBeGreaterThan(-1)
+    expect(b).toBeGreaterThan(a)
+    const deps = canvas.slice(a, b)
+    expect(deps).toContain('(name) => addRelayTab(name)')
+    expect(deps).not.toContain('.addProject(')
   })
 
   it('offline-relay-session.ts registers the factory at module load', () => {

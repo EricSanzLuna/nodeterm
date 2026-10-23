@@ -503,7 +503,7 @@ import {
   shouldShowExplorerPinHint,
   writeSeenExplorerPinHint
 } from '../lib/explorerPinHint'
-import { sameSshEndpoint, setKanbanPublishHook, setStoredCanvasPublishHook, useProjects } from '../state/projects'
+import { addRelayTab, sameSshEndpoint, setKanbanPublishHook, setStoredCanvasPublishHook, useProjects } from '../state/projects'
 import { useAgentStatus, recordsTurnInterrupt } from '../state/agentStatus'
 import { usePendingPause, startPendingPauseWatcher } from '../state/pendingPause'
 import {
@@ -5600,7 +5600,10 @@ export function Canvas() {
               }
               return { id: reconnectProjectId } // reconnect: reuse the existing tab, don't spawn one
             }
-          : (name) => useProjects.getState().addProject(name),
+          : // The host shared nothing to adopt: an EMPTY relay tab — `remote`, like every relay tab,
+            // or it would be saved as a local project carrying the host's node ids and resolve to
+            // the LOCAL session once its relay session is gone.
+            (name) => addRelayTab(name),
         // First connect adopts the host's shared project (its nodes, fresh id). On reconnect the
         // existing tab (with its nodes) is reused via addProject above, so no adopt lever is passed.
         adoptProject: reconnectProjectId
@@ -10103,8 +10106,9 @@ export function Canvas() {
   // reason: the ⇧⌘T plan executor just below reopens through the guarded form.
   //
   // A relay (team) tab is refused here, the one funnel every reopen goes through: once closed its
-  // relay session is gone, and `sessionForProject` would fall back to the LOCAL session, mounting
-  // the host's node ids on this machine's core (local shells, an agent cold-resume). False = refused.
+  // relay session is gone, and its nodes could never start — `sessionForProject` answers the offline
+  // relay session for it (before that existed it fell back to the LOCAL session, mounting the host's
+  // node ids on this machine's core: local shells, an agent cold-resume). False = refused.
   const reopenProjectUnchecked = useCallback(
     (id: string): boolean => {
       if (useProjects.getState().getProject(id)?.remote) {
