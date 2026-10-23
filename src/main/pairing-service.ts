@@ -41,6 +41,7 @@ import {
 } from './pairing-core'
 import type { DeviceRevokeResult, DeviceRevokeServerOutcome, Settings } from '../shared/types'
 import { renameAtomic, sweepForeignTempFiles, tempNameFor } from '../core/fs-atomic'
+import { readSshHostKeyFingerprints } from './ssh-host-key-fingerprint'
 import { publicKeyToB64, deriveSharedKey, encrypt, decrypt, type KeyPair } from './remote/e2ee'
 import { hostIdFromPublicKeyB64 } from './remote/relay-id'
 import { getDeviceId } from '../core/device-id'
@@ -401,6 +402,12 @@ export interface PairingServiceOptions {
    * leg (tests, and any shell without a standing host).
    */
   revokePhoneRelayTrust?: () => Promise<{ persisted: boolean; killed: boolean }>
+  /**
+   * This host's SSH host-key fingerprints for the QR's `sshHostKeys` (ssh-host-key-fingerprint.ts):
+   * every key sshd would serve, per its own configuration, or [] when that cannot be established.
+   * Never asked on Windows, where the QR says `ssh:false`.
+   */
+  readSshHostKeys?: () => Promise<string[]>
 }
 
 export function createPairingService(
@@ -592,12 +599,19 @@ export function createPairingService(
 
     const addr = srv.address()
     const pairPort = typeof addr === 'object' && addr ? addr.port : 0
-    const [name, sshOpen, windowsKeyFile] = await Promise.all([
+    const [name, sshOpen, windowsKeyFile, sshHostKeys] = await Promise.all([
       computerName(),
       probeSsh(),
       directSsh
         ? Promise.resolve(undefined)
-        : (options.detectKeyFile ?? detectWindowsKeyFile)().catch((): WindowsKeyFile => 'unknown')
+        : (options.detectKeyFile ?? detectWindowsKeyFile)().catch((): WindowsKeyFile => 'unknown'),
+      // The phone pins its first SSH connect to one of these instead of trusting whatever answers
+      // port 22 (the QR is on this screen: the same trust basis as `hostKey`). Complete or empty,
+      // never a subset (the phone refuses a key not listed); empty means the QR carries none and the
+      // phone's first contact is TOFU, as before.
+      directSsh
+        ? (options.readSshHostKeys ?? readSshHostKeyFingerprints)().catch((): string[] => [])
+        : Promise.resolve(undefined)
     ])
     // Relay reachability (network-free) — embedded in the QR so the phone can reach us over the
     // relay too. Also reused in handleRequest to mint the phone's device token. LAN-only when null.
@@ -626,7 +640,7 @@ export function createPairingService(
       name,
       hostKey,
       relay: relayCtx?.block,
-      ...(directSsh ? {} : { ssh: false as const })
+      ...(directSsh ? { sshHostKeys } : { ssh: false as const })
     })
 
     // Give up after PAIR_TIMEOUT_MS with a timeout result.

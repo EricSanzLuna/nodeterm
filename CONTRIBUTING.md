@@ -751,6 +751,15 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   not fold one into the other. Change the relay protocol and `relay-pop-vector.json` must change in
   both repos. Deep version: CLAUDE.md § Hosted team relay.
 
+- **A peer's X25519 key goes through `src/core/relay/e2ee.ts`, never straight into
+  `nacl.box.before`.** `deriveSharedKey` refuses a low-order key (raw X25519 output all zero: the
+  shared secret would be a public constant, the SAS a fixed value) and `publicKeyFromB64` refuses
+  non-canonical base64; a new intake of a key someone will PIN (an offer, a code, a QR field, a pin
+  store) validates with `peerPublicKeyFromB64` / `isUsablePeerKeyB64` and gets a
+  `low-order-keys.test-support.ts` test. A new surface that SHOWS the SAS shows `SAS_COMPARE_HINT`
+  (`src/shared/remote/sas.ts`) under it, and nothing compares SAS strings across builds (a v1 peer
+  shows the first six of the ten digits). Deep version: CLAUDE.md § Remote access.
+
 - **Normalize BOTH sides of a path comparison, through one function.** A marker normalized where
   it is built and matched raw where it is used is a no-op on the machine you wrote it on and a
   silent defect on Windows. That is issue #558: the managed-hook marker was folded to `/` while

@@ -283,6 +283,8 @@ import { SetupConsentDialog } from '../components/SetupConsentDialog'
 import { ConsentNotice } from '../remote/ConsentNotice'
 import { approvePhoneWithFeedback } from '../lib/phone-approval'
 import { peerApprovalView } from '@shared/remote/approval'
+import { admitPendingPeer } from '../lib/pendingPeerAdmission'
+import { SAS_COMPARE_HINT } from '@shared/remote/sas'
 import { promptDialog } from '../components/promptDialog'
 import { UpgradeDialog } from '../components/UpgradeDialog'
 import { LiveLinkDialog } from '../components/LiveLinkDialog'
@@ -1169,6 +1171,8 @@ interface PendingPeerState {
   /** The peer's stable box key (phone source): survives the phone's reconnect churn where the
    *  per-attach id does not, so a mid-retry Approve still lands. */
   pub?: string | null
+  /** The peer's stable box key (relay source). With `pub`, what `admitPendingPeer` compares. */
+  peerKeyB64?: string
 }
 
 /**
@@ -2289,10 +2293,33 @@ export function Canvas() {
     confirmFlags.current.merge = !!v
     setMergeTargetState(v)
   }, [])
+  // The dialog's current request, read synchronously by `offerPendingPeer` (a state value would be
+  // a render behind when two handshakes land in one tick). Written ONLY by setPendingPeer.
+  const pendingPeerRef = useRef<PendingPeerState | null>(null)
   const setPendingPeer = useCallback((v: PendingPeerState | null) => {
+    pendingPeerRef.current = v
     confirmFlags.current.peer = !!v
     setPendingPeerState(v)
   }, [])
+  /**
+   * A device finished its handshake and asks for the SAS dialog. The dialog has ONE slot, and a
+   * different device must never swap its digits under the human comparing them (a click meant for
+   * one device would approve another): `admitPendingPeer` refuses it, fail closed. A refused phone
+   * is rejected explicitly (it retries, and is asked once this dialog is answered); a relay peer has
+   * no reject, so it is simply never confirmed. The same device re-raising replaces in place.
+   */
+  const offerPendingPeer = useCallback(
+    (next: PendingPeerState) => {
+      const verdict = admitPendingPeer(pendingPeerRef.current, next)
+      if (verdict === 'refuse') {
+        console.warn(`[remote] a second device asked for approval while one is open; refused (${next.source})`)
+        if (next.source === 'phone') window.nodeTerminal.remoteHost.reject(next.id, next.pub ?? undefined)
+        return
+      }
+      setPendingPeer(next)
+    },
+    [setPendingPeer]
+  )
   const setCloseTarget = useCallback((v: { id: string; name: string; count: number; end: boolean } | null) => {
     confirmFlags.current.closeProject = !!v
     setCloseTargetState(v)
@@ -4304,9 +4331,9 @@ export function Canvas() {
   // migration is complete. Standing phone consent has a request/reply persistence outcome.
   useEffect(() => {
     return window.nodeTerminal.relayHost.onPeerPending((info) =>
-      setPendingPeer({ ...info, source: 'relay' })
+      offerPendingPeer({ ...info, source: 'relay' })
     )
-  }, [setPendingPeer])
+  }, [offerPendingPeer])
 
   // The LEGACY phone host feeds the SAME dialog (issue #372): when the SAS prompt migrated to
   // the relayHost tunnel, the phone — still on the legacy dialect — lost its prompt entirely:
@@ -4317,20 +4344,17 @@ export function Canvas() {
   // host-side expiry drops the dialog rather than leaving Approve aimed at a dead id.
   useEffect(() => {
     const unPending = window.nodeTerminal.remoteHost.onPeerPending((info) =>
-      setPendingPeer({ ...info, source: 'phone', label: 'Your phone' })
+      offerPendingPeer({ ...info, source: 'phone', label: 'Your phone' })
     )
     const unCleared = window.nodeTerminal.remoteHost.onPeerPendingCleared((info) => {
-      setPendingPeerState((cur) => {
-        const next = cur && cur.source === 'phone' && cur.id === info.id ? null : cur
-        confirmFlags.current.peer = !!next
-        return next
-      })
+      const cur = pendingPeerRef.current
+      if (cur && cur.source === 'phone' && cur.id === info.id) setPendingPeer(null)
     })
     return () => {
       unPending()
       unCleared()
     }
-  }, [setPendingPeer])
+  }, [offerPendingPeer, setPendingPeer])
 
   // Team Access seat table (docs/…/team-access, Task 3): a SEPARATE relay-host subscription set from
   // the SAS-approval effect above — one feeds the dialog, this one feeds the live/pending seats store.
@@ -5772,8 +5796,8 @@ export function Canvas() {
         // A hosted team's owner is not at a host screen: they read the same code in their approval
         // dialog, so the joiner reads it to them (a call, a chat).
         const question = hosted
-          ? `Read this code to an owner of ${label || 'the team'} (call or chat) — they see the same code before approving this device:\n\n${sas}`
-          : `Verify this code matches the one shown on the host:\n\n${sas}`
+          ? `Read this code to an owner of ${label || 'the team'} (call or chat) — they see the same code before approving this device:\n\n${sas}\n\n${SAS_COMPARE_HINT}`
+          : `Verify this code matches the one shown on the host:\n\n${sas}\n\n${SAS_COMPARE_HINT}`
         if (sas && window.confirm(question)) {
           window.nodeTerminal.relayClient.confirm(connectionId)
           // Nothing left for this user to do: the owner's wait starts now (the joiner says so).

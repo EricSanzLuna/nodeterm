@@ -310,7 +310,7 @@ describe('initRelayHost — nothing is served before mutual approval', () => {
 
     const pending = pendingSent()
     expect(pending).toBeTruthy()
-    expect(pending!.sas).toMatch(/^\d{3} \d{3}$/)
+    expect(pending!.sas).toMatch(/^\d{3} \d{3} \d{4}$/)
     expect(pending!.peerKeyB64).toBe(host.peerKeyB64)
     // No client, no presence, no open before the human confirms.
     expect(peerRegistry().ids()).toEqual([])

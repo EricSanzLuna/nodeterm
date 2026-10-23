@@ -398,7 +398,7 @@ and host key already exists, sets `approvedAt` on it and keeps its device token 
 That is safe only because of what `seedBookmark` is given: the join code `team bootstrap` just
 returned over the project's own SSH channel, whose host key `known_hosts` already authenticated. The
 code names the relay key it was minted for (`decodeJoinCode` checks that the host id is the hash of
-that key), which is the assurance comparing six digits by eye gives. Main enforces that input: it
+that key), which is the assurance comparing the SAS digits by eye gives. Main enforces that input: it
 seeds only a code a successful `team bootstrap` returned during this app run (kept per project, in
 memory), and refuses any other code, however valid, so that join compares the SAS. The host approves
 its own half because your key is an owner in `team.json`. If the seed fails, the join asks for the
