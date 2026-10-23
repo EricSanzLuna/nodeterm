@@ -231,10 +231,13 @@ describe('S5: Secure and HSTS', () => {
     await request(port, 'GET', '/login', { host: '127.0.0.1:8443' })
     await request(port, 'GET', '/login', { host: '[::1]:8443' })
     expect(warn).not.toHaveBeenCalled()
-    await request(port, 'GET', '/login', { host: 'term.example.com' })
-    await request(port, 'GET', '/login', { host: 'term.example.com' })
+    await request(port, 'GET', '/login', { host: 'attacker-chosen.invalid' })
+    await request(port, 'GET', '/login', { host: 'attacker-chosen.invalid' })
     expect(warn).toHaveBeenCalledTimes(1)
-    expect(String(warn.mock.calls[0][0])).toMatch(/NODETERM_PUBLIC_ORIGIN=https:\/\/term\.example\.com/)
+    const line = String(warn.mock.calls[0][0])
+    expect(line).toMatch(/NODETERM_PUBLIC_ORIGIN/)
+    // The Host header is the client's to write: none of it reaches the log (log injection).
+    expect(line).not.toContain('attacker-chosen')
     // Configured: never warns.
     warn.mockClear()
     const port2 = await serve({ publicOrigin: 'https://term.example.com' })

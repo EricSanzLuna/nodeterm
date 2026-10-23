@@ -111,7 +111,17 @@ interface SessionEntry {
   createdAt: number
 }
 
-type SessionMap = { [token: string]: SessionEntry }
+/** Sessions by token. A `Map`, never a plain object: the token arrives in a request cookie, and a
+ *  request-chosen key must not index (or `delete` from) an object's own properties. On disk it stays
+ *  the `{ token: { createdAt } }` object it always was. */
+type SessionMap = Map<string, SessionEntry>
+
+/** What `createSession` mints: 32 random bytes as hex. Anything else is not a token of ours. */
+const SESSION_TOKEN_RE = /^[0-9a-f]{64}$/
+
+function isSessionToken(token: string | undefined): token is string {
+  return typeof token === 'string' && SESSION_TOKEN_RE.test(token)
+}
 
 export class Auth {
   private authPath: string
@@ -215,17 +225,27 @@ export class Auth {
 
   private loadSessions(): SessionMap {
     if (this.sessions === null) {
+      const map: SessionMap = new Map()
       try {
-        this.sessions = JSON.parse(fs.readFileSync(this.sessionsPath, 'utf8')) as SessionMap
+        const raw: unknown = JSON.parse(fs.readFileSync(this.sessionsPath, 'utf8'))
+        if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+          for (const [token, entry] of Object.entries(raw as Record<string, unknown>)) {
+            const createdAt = (entry as { createdAt?: unknown } | null)?.createdAt
+            if (isSessionToken(token) && typeof createdAt === 'number' && Number.isFinite(createdAt)) {
+              map.set(token, { createdAt })
+            }
+          }
+        }
       } catch {
-        this.sessions = {}
+        /* missing or unreadable: no sessions */
       }
+      this.sessions = map
     }
     return this.sessions
   }
 
   private persistSessions(): void {
-    fs.writeFileSync(this.sessionsPath, JSON.stringify(this.sessions ?? {}, null, 2), {
+    fs.writeFileSync(this.sessionsPath, JSON.stringify(Object.fromEntries(this.sessions ?? new Map()), null, 2), {
       mode: 0o600
     })
   }
@@ -233,31 +253,31 @@ export class Auth {
   createSession(): string {
     const sessions = this.loadSessions()
     const token = crypto.randomBytes(32).toString('hex')
-    sessions[token] = { createdAt: Date.now() }
+    sessions.set(token, { createdAt: Date.now() })
     this.persistSessions()
     return token
   }
 
   validateSession(token: string | undefined): boolean {
-    if (!token) return false
+    if (!isSessionToken(token)) return false
     const sessions = this.loadSessions()
     const now = Date.now()
     let changed = false
-    for (const [t, entry] of Object.entries(sessions)) {
+    for (const [t, entry] of sessions) {
       if (now - entry.createdAt >= SESSION_TTL_MS) {
-        delete sessions[t]
+        sessions.delete(t)
         changed = true
       }
     }
     if (changed) this.persistSessions()
-    return Object.prototype.hasOwnProperty.call(sessions, token)
+    return sessions.has(token)
   }
 
   /** Sign out ONE session: the token the caller presented (S3). True when it existed. */
   revokeSession(token: string): boolean {
+    if (!isSessionToken(token)) return false
     const sessions = this.loadSessions()
-    if (!Object.prototype.hasOwnProperty.call(sessions, token)) return false
-    delete sessions[token]
+    if (!sessions.delete(token)) return false
     this.persistSessions()
     this.announceRevoke()
     return true
@@ -265,7 +285,7 @@ export class Auth {
 
   /** Sign out everywhere: every session of every browser (S3). */
   revokeAll(): void {
-    this.sessions = {}
+    this.sessions = new Map()
     this.persistSessions()
     this.announceRevoke()
   }

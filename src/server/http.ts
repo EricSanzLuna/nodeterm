@@ -129,10 +129,6 @@ function isLoopbackHost(host: string | undefined): boolean {
   return name === 'localhost' || name.endsWith('.localhost') || name === '::1' || /^127(\.\d{1,3}){3}$/.test(name)
 }
 
-/** A `Host` value safe to print: hostname characters only, capped. */
-function printableHost(host: string): string {
-  return host.replace(/[^A-Za-z0-9.:\-[\]]/g, '').slice(0, 100)
-}
 
 function redirect(res: http.ServerResponse, status: number, location: string): void {
   res.writeHead(status, { Location: location })
@@ -477,9 +473,9 @@ export function createHttpHandler(
     if (publicOrigin !== undefined) res.setHeader('Strict-Transport-Security', HSTS)
     else if (!warnedNoPublicOrigin && !isLoopbackHost(req.headers['host'])) {
       warnedNoPublicOrigin = true
-      const host = printableHost(req.headers['host'] ?? '')
+      // A fixed sentence: the Host header is the client's to write, so none of it reaches the log.
       console.warn(
-        `[nodeterm-server] requests are arriving for "${host}" but NODETERM_PUBLIC_ORIGIN is not set: the session cookie is marked Secure only when your proxy sends X-Forwarded-Proto: https, and no HSTS header is sent. Set NODETERM_PUBLIC_ORIGIN=https://${host} (the address you open in the browser). See docs/SERVER.md.`
+        `[nodeterm-server] requests are arriving for a non-loopback host name but NODETERM_PUBLIC_ORIGIN is not set: the session cookie is marked Secure only when your proxy sends X-Forwarded-Proto: https, and no HSTS header is sent. Set NODETERM_PUBLIC_ORIGIN to the https address you open in the browser (for example https://term.example.com). See docs/SERVER.md.`
       )
     }
 

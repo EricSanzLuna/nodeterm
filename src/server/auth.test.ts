@@ -93,6 +93,39 @@ describe('Auth', () => {
     expect(heard).toHaveLength(2)
   })
 
+  it('a request-chosen token never indexes an object: odd keys are just "no such session"', () => {
+    const a = new Auth(dir)
+    const real = a.createSession()
+    for (const key of ['__proto__', 'constructor', 'toString', 'hasOwnProperty', '', 'x'.repeat(64)]) {
+      expect(a.validateSession(key)).toBe(false)
+      expect(a.revokeSession(key)).toBe(false)
+    }
+    expect(a.validateSession(real)).toBe(true)
+    // On disk it is still the { token: { createdAt } } object every older build wrote and reads.
+    const onDisk = JSON.parse(fs.readFileSync(path.join(dir, 'sessions.json'), 'utf8'))
+    expect(Object.keys(onDisk)).toEqual([real])
+    expect(typeof onDisk[real].createdAt).toBe('number')
+  })
+
+  it('loading sessions.json keeps only well-formed tokens (an older file keeps working)', () => {
+    const good = 'a'.repeat(64)
+    fs.writeFileSync(
+      path.join(dir, 'sessions.json'),
+      `{"${good}":{"createdAt":${Date.now()}},"__proto__":{"createdAt":${Date.now()}},"short":{"createdAt":${Date.now()}},"${'b'.repeat(64)}":{"createdAt":"soon"}}`
+    )
+    const a = new Auth(dir)
+    expect(a.validateSession(good)).toBe(true)
+    expect(a.validateSession('__proto__')).toBe(false)
+    expect(a.validateSession('short')).toBe(false)
+    expect(a.validateSession('b'.repeat(64))).toBe(false)
+    // The malformed entries are gone from the next write, not carried along.
+    const fresh = a.createSession()
+    const onDisk = JSON.parse(fs.readFileSync(path.join(dir, 'sessions.json'), 'utf8'))
+    expect(Object.keys(onDisk).sort()).toEqual([good, fresh].sort())
+    fs.writeFileSync(path.join(dir, 'sessions.json'), '[1,2]')
+    expect(new Auth(dir).validateSession(good)).toBe(false)
+  })
+
   it('password rule: at least 8 characters, one definition for setup and the boot seed (S8)', () => {
     expect(passwordTooShort('1234567')).toBe(true)
     expect(passwordTooShort('12345678')).toBe(false)
