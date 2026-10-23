@@ -975,6 +975,12 @@ installation-qualified endpoint only after bearer verification. A wrong bearer a
 any handler runs; only that explicit wrong-owner response (or transport failure) permits endpoint
 failover. A node-identity 403 stays final. Test with disposable sockets, never a running user's tunnel.
 
+**A hook-server client sends no `Origin` and a loopback `Host`.** The server refuses both before
+the bearer (a browser page, DNS rebinding included, is the caller this keeps out). curl, Node's
+`http` and fetch, and Bun's fetch all comply as they are used today; a new client that sets an
+`Origin`, or names the server by anything but `127.0.0.1` / `localhost` / `[::1]`, gets a 403.
+`hook-server.browser-guard.test.ts` drives the real transports — add yours there.
+
 **Both raw listeners change together** — `src/main/index.ts` and `src/server/agent-status.ts`. A new
 field on a hook event that reaches only the desktop leaves the Server Edition quietly without the
 feature, and the boundary tests can only tell you an import is wrong, never that a field is missing.

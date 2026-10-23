@@ -4022,6 +4022,25 @@ command-bearing opens; this does not add a human-confirm dialog or change mobile
     reconnecting terminals. These changes share the core listener in Desktop and Server Edition;
     the mobile wire protocol and node-identity rules are unchanged.
 
+  - **A browser is refused before the bearer is looked at** (`core/agents/hook-browser-guard.ts`).
+    The bearer stays the real gate; this is the belt beside it, against the one caller that can
+    reach a loopback port without being a process of ours. A request carrying ANY `Origin` header,
+    or a `Host` that is not `127.0.0.1` / `localhost` / `[::1]` (any port), gets 403 on both
+    listeners, before the 403-vs-421 bearer distinction, so a DNS-rebound page learns nothing.
+    MEASURED, every shipped client passes: curl over the socket sends `Host: localhost` (the codex
+    launcher's socket URL sends `localhost:0`), curl over TCP `127.0.0.1:<port>` (the SSH TCP
+    fallback arrives with the HOST's port — hence any port), Node's `http` over the socket
+    `localhost`, Node's fetch no Origin (but `sec-fetch-mode: cors` — never refuse on that), Bun's
+    fetch (opencode's runtime) no Origin. The SSH reverse tunnel forwards bytes, so a host-side
+    curl's Host arrives unchanged. A request with no Host is let through (Node already 400s an
+    HTTP/1.1 one; no browser sends one). **A new client must send no Origin and a loopback Host** —
+    `hook-server.browser-guard.test.ts` drives the real transports and goes red otherwise.
+  - **`~/.nodeterm` on an SSH host is 0700** (`privateRemoteDirCommand`, run by `setup()` on every
+    connect and tunnel repair): created under `umask 077` and an existing one tightened, never
+    through a symlink, never a directory the login user does not own (`-O`, which only a root login
+    needs). The secrets inside were already 0600 one by one; the umbrella is so a future file written
+    there without a mode is not born world-readable in a traversable directory.
+
   - **No keyring is not "no identity" (#1088).** Electron 42 on a Linux session without Secret
     Service/kwallet picks `basic_text` and `safeStorage.encryptString` THROWS (measured under xvfb).
     The desktop secret load used to reject on every boot ⇒ no node token was ever written ⇒ `send` /
@@ -9548,7 +9567,14 @@ unix-socket forward and dev-server `-L` forward over it. POSIX keeps OpenSSH unt
   master check. A new ssh call site owes the same routing.
 - **Semantics are OpenSSH's:** ControlMaster auto/no, `-O check|exit|forward|cancel`,
   `StrictHostKeyChecking=accept-new` over the user's own known_hosts (hashed entries included —
-  that is why HMAC-SHA1 appears; CodeQL's alert on it is dismissed with the reason), publickey
+  that is why HMAC-SHA1 appears; CodeQL's alert on it is dismissed with the reason) — with the
+  recorded host key TYPE pinned: the types on record lead ssh2's `algorithms.serverHostKey`
+  (OpenSSH's order_hostkeyalgs, `hostKeyAlgorithmsFor`), and a host that HAS a recorded key but
+  presents another type is refused like a changed key, naming both types and `ssh-keygen -R`
+  (stricter than OpenSSH's accept-new, which records the new type; type-blind, a MITM holding only
+  an ed25519 key against a host recorded under ECDSA was silently recorded and trusted). The
+  list handed to ssh2 is always a reordering of `SSH2_DEFAULT_SERVER_HOST_KEY`, pinned to the
+  package by test, because an exact list naming anything ssh2 lacks makes `connect()` throw; publickey
   only (agent, then key files, passphrase through the existing dialog, never in BatchMode), the
   user's `~/.ssh/config` via `ssh -G` (never a second parser of it), a dropped connection ends
   every channel with 255 (what `SshReconnector` reads).
