@@ -1131,6 +1131,13 @@ export interface Project {
   icon?: ProjectIcon
   /** Default working directory for new terminals created in this project. */
   cwd?: string
+  /**
+   * MACHINE-LOCAL: this folder project's canvas lives in app data (`userData/inline-projects/<id>.json`),
+   * not in `<cwd>/.nodeterm/project.json`, and nothing is written into the folder (issue #1145).
+   * Only meaningful beside a local `cwd`; never written to any shared file. See the
+   * folder-data-ref kind in core/workspace-files.ts (`IndexEntryV3.dataFile`).
+   */
+  storeInAppData?: boolean
   /** When set, this is an SSH project: its terminals run on `server` in `remoteCwd` (remote tmux). */
   ssh?: { server: import('./ssh').SshConnection; remoteCwd: string }
   viewport: Viewport
@@ -1502,6 +1509,16 @@ export interface WorkspaceApi {
   /** Whether <folder>/.nodeterm/project.json is `present`, definitely `absent`, or `unreadable`
    *  (any non-ENOENT error). Never guesses absence from a failed read — see issue #385. */
   projectFileState(folder: string): Promise<'present' | 'absent' | 'unreadable'>
+  /** "Store in app data", second half (issue #1145): once the move's save has landed, carry the
+   *  folder's settings into app data and remove its `.nodeterm` files (git-tracked ones only with
+   *  `removeTracked`). See `WorkspaceStore.releaseFolderFiles`. */
+  releaseFolderFiles(projectId: string, removeTracked: boolean): Promise<import('./project-storage').ReleaseFolderFilesResult>
+  /** "Store in folder", first half (issue #1145): refuse a folder that already holds a canvas or
+   *  settings, else carry this project's settings in. See `WorkspaceStore.prepareFolderStorage`. */
+  prepareFolderStorage(projectId: string): Promise<import('./project-storage').PrepareFolderStorageResult>
+  /** Where the store has this project's canvas right now (issue #1145): asked after a move's save,
+   *  which can land while the folder write in it did not. See `WorkspaceStore.projectStorage`. */
+  projectStorage(projectId: string): Promise<import('./project-storage').ProjectStorageKind>
   /** Fired once after an on-disk migration: `v2` = a v2→v3 migration wrote .nodeterm/ dirs into the
    *  project folders; `exec` = the custom shell / advanced ssh args of already-open projects moved
    *  out of the shared project file into this machine's own workspace index (@shared/node-exec). */
@@ -2006,6 +2023,11 @@ export interface Settings {
    *  (`$reponame` and `$defaultFolderName` aliases) plus `$branch`; both `$x` and `${x}` forms.
    *  A missing branch token is appended automatically. */
   worktreePathTemplate: string
+  /** Issue #1145. Where a folder project created from now on keeps its canvas: `'folder'` (the
+   *  default — `<cwd>/.nodeterm/project.json`, git-shareable) or `'appData'` (nothing written into
+   *  the folder; see `Project.storeInAppData`). A folder that already has a project.json is adopted
+   *  as it is, in its folder, whatever this says. Existing projects move from the tab menu. */
+  newProjectStorage: import('./project-storage').NewProjectStorage
   /** ms to dwell over a terminal before it takes pointer focus (pan-across guard). */
   panHoverDelay: number
   /** Issue #757. Whether a terminal node's keyboard focus follows the POINTER (the long-standing
@@ -2494,6 +2516,7 @@ export const DEFAULT_SETTINGS: Settings = {
   omniKanbanEnabled: false,
   omniKanbanAsDefault: false,
   worktreePathTemplate: DEFAULT_WORKTREE_PATH_TEMPLATE,
+  newProjectStorage: 'folder',
   panHoverDelay: 600,
   terminalFocusFollowsPointer: true,
   doubleClickFocus: true,

@@ -6,6 +6,7 @@ import { join } from 'path'
 import {
   WHITEBOARD_SCENE_MAX_BYTES,
   appWhiteboardsDir,
+  carryWhiteboards,
   projectWhiteboardsDir,
   readWhiteboard,
   saveWhiteboard
@@ -250,5 +251,114 @@ describe('compare-and-set: a save made against a stale revision is refused', () 
     await saveWhiteboard(loc, 'whiteboard-1', sceneOf('one'))
     expect(await saveWhiteboard(loc, 'whiteboard-1', sceneOf('two'))).toMatchObject({ ok: true })
     expect(await onDisk()).toBe(sceneOf('two'))
+  })
+})
+
+// A folder project can keep its canvas in app data (issue #1145) so that nothing is written into
+// the folder. Its boards then live in the project's own app-data root (`appDataProjectRoot` in
+// workspace-store.ts), and the folder's boards — drawn before the move — are only ever READ.
+describe('a folder project kept in app data', () => {
+  let appRoot: string
+  beforeEach(() => {
+    appRoot = join(userDataDir, 'project-files', 'project-p1')
+  })
+
+  it("writes into the project's app-data root, creating it, and nothing into the folder", async () => {
+    const loc = { projectCwd: appRoot, createRoot: true, readOnlyRoot: projectCwd, userDataDir }
+    const saved = await saveWhiteboard(loc, 'whiteboard-1', scene, png)
+    expect(pathOf(saved)).toBe(join(projectWhiteboardsDir(appRoot), 'whiteboard-1.excalidraw'))
+    expect(await fs.readdir(projectCwd)).toEqual([])
+    expect((await readWhiteboard(loc, 'whiteboard-1'))?.scene).toBe(scene)
+  })
+
+  it('a board drawn in the folder before the move still opens, and its next save lands in app data', async () => {
+    await saveWhiteboard({ projectCwd, userDataDir }, 'whiteboard-1', scene, png)
+    const loc = { projectCwd: appRoot, createRoot: true, readOnlyRoot: projectCwd, userDataDir }
+
+    const before = await readWhiteboard(loc, 'whiteboard-1')
+    expect(before).toMatchObject({ scene, fromSource: false })
+    const edited = JSON.stringify({ type: 'excalidraw', elements: [{ id: 'b' }] })
+    // Saved against the folder file's revision: the compare-and-set sees the same board the read did.
+    expect(await saveWhiteboard(loc, 'whiteboard-1', edited, png, before!.rev)).toMatchObject({ ok: true })
+
+    expect((await readWhiteboard(loc, 'whiteboard-1'))?.scene).toBe(edited)
+    expect(await fs.readFile(join(projectWhiteboardsDir(projectCwd), 'whiteboard-1.excalidraw'), 'utf8')).toBe(scene)
+  })
+
+  it('never writes into the read-only root, even when the app-data root will not take the board', async () => {
+    await fs.mkdir(userDataDir, { recursive: true })
+    await fs.writeFile(join(userDataDir, 'project-files'), 'not a directory')
+    const loc = { projectCwd: appRoot, createRoot: true, readOnlyRoot: projectCwd, userDataDir }
+    const saved = await saveWhiteboard(loc, 'whiteboard-1', scene)
+    expect(pathOf(saved)).toBe(join(appWhiteboardsDir(userDataDir), 'whiteboard-1.excalidraw'))
+    expect(await fs.readdir(projectCwd)).toEqual([])
+  })
+
+  it('reads every place a save can land before the read-only root, so a save is never shadowed', async () => {
+    // The folder still holds the board as it was before the move…
+    await saveWhiteboard({ projectCwd, userDataDir }, 'whiteboard-1', scene)
+    // …and the app-data root cannot take the edit, so it falls back to the app folder.
+    await fs.mkdir(userDataDir, { recursive: true })
+    await fs.writeFile(join(userDataDir, 'project-files'), 'not a directory')
+    const loc = { projectCwd: appRoot, createRoot: true, readOnlyRoot: projectCwd, userDataDir }
+    const edited = JSON.stringify({ type: 'excalidraw', elements: [{ id: 'b' }] })
+    await saveWhiteboard(loc, 'whiteboard-1', edited)
+    expect((await readWhiteboard(loc, 'whiteboard-1'))?.scene).toBe(edited)
+  })
+})
+
+// The move of a folder project's canvas from app data back into its folder (issue #1145) takes the
+// boards drawn or edited in app data along: the folder is read first afterwards, and its older file
+// of the same board would otherwise hide the newer one.
+describe('carryWhiteboards', () => {
+  let appRoot: string
+  beforeEach(() => {
+    appRoot = join(userDataDir, 'project-files', 'project-p1')
+  })
+  const inFolder = (name: string) => join(projectWhiteboardsDir(projectCwd), name)
+
+  it("copies every board into the folder, replacing the folder's older file, picture byte-exact", async () => {
+    const edited = JSON.stringify({ type: 'excalidraw', elements: [{ id: 'edited' }] })
+    await saveWhiteboard({ projectCwd, userDataDir }, 'whiteboard-1', scene)
+    await saveWhiteboard({ projectCwd: appRoot, createRoot: true, userDataDir }, 'whiteboard-1', edited, png)
+    await saveWhiteboard({ projectCwd: appRoot, createRoot: true, userDataDir }, 'whiteboard-2', scene)
+
+    await carryWhiteboards(appRoot, projectCwd)
+
+    expect(await fs.readFile(inFolder('whiteboard-1.excalidraw'), 'utf8')).toBe(edited)
+    expect((await fs.readFile(inFolder('whiteboard-1.png'))).equals(pngBytes)).toBe(true)
+    expect(await fs.readFile(inFolder('whiteboard-2.excalidraw'), 'utf8')).toBe(scene)
+    // The app-data copies stay: nothing is deleted on either side.
+    expect(await fs.readFile(join(projectWhiteboardsDir(appRoot), 'whiteboard-1.excalidraw'), 'utf8')).toBe(edited)
+  })
+
+  it("a carried board with no picture drops the folder's old picture rather than show it", async () => {
+    await saveWhiteboard({ projectCwd, userDataDir }, 'whiteboard-1', scene, png)
+    await saveWhiteboard({ projectCwd: appRoot, createRoot: true, userDataDir }, 'whiteboard-1', scene, '')
+    await carryWhiteboards(appRoot, projectCwd)
+    await expect(fs.stat(inFolder('whiteboard-1.png'))).rejects.toThrow()
+  })
+
+  it('does nothing, and creates nothing in the folder, when there is no board to carry', async () => {
+    await carryWhiteboards(appRoot, projectCwd)
+    expect(await fs.readdir(projectCwd)).toEqual([])
+  })
+
+  it.skipIf(process.platform === 'win32')('never carries a symlink, and never writes through one', async () => {
+    const secret = join(root, 'secret.txt')
+    await fs.writeFile(secret, 'private key material')
+    const from = projectWhiteboardsDir(appRoot)
+    await fs.mkdir(from, { recursive: true })
+    await fs.symlink(secret, join(from, 'whiteboard-evil.excalidraw'))
+    await carryWhiteboards(appRoot, projectCwd)
+    await expect(fs.stat(inFolder('whiteboard-evil.excalidraw'))).rejects.toThrow()
+
+    const outside = join(root, 'outside')
+    await fs.mkdir(outside)
+    await saveWhiteboard({ projectCwd: appRoot, createRoot: true, userDataDir }, 'whiteboard-1', scene)
+    await fs.mkdir(join(projectCwd, '.nodeterm'), { recursive: true })
+    await fs.symlink(outside, projectWhiteboardsDir(projectCwd))
+    await carryWhiteboards(appRoot, projectCwd)
+    expect(await fs.readdir(outside)).toEqual([])
   })
 })

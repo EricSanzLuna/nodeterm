@@ -33,6 +33,7 @@ import { registerCodexRelayProjectCheck } from './codexCli'
 import { markWorkspaceDirty } from './workspaceDirty'
 import { rootPositionWith } from '@shared/root-position'
 import { folderName } from '../lib/projectOpen'
+import { useSettings } from './settings'
 // One order-independent key for an edge's endpoints — the SAME rule `hiddenLinkIds` uses, so a
 // rope and the bridge it covers are recognized as one relationship here too.
 import { pairKey as bridgePairKey } from '../lib/noteLink'
@@ -96,6 +97,9 @@ interface ProjectsState {
    *  on `Project.icon` and git-shared via project.json like name/color. No-op for an unknown id. */
   setProjectIcon(id: string, icon: ProjectIcon | undefined): void
   setProjectCwd(id: string, cwd: string): void
+  /** Issue #1145: where this folder project's canvas is stored. Only the flag — the move itself
+   *  (save, then the core step) is `lib/projectStorageMove`. */
+  setProjectStoreInAppData(id: string, on: boolean): void
   /** Grey (or un-grey) a project tab as "unavailable" WITHOUT dropping it — runtime-only, never
    *  persisted (see the toWorkspace tripwire). Set true when a relay tab's socket drops (Stage 4
    *  Task 7) so it stays reconnectable; cleared when it reconnects. */
@@ -323,6 +327,16 @@ interface ProjectsState {
   toWorkspace(): Workspace
 }
 
+/**
+ * A local folder project CREATED from now on (never one adopted from an existing project.json)
+ * keeps its canvas where Settings → Behavior says (issue #1145).
+ */
+function withNewProjectStorage(project: Project): Project {
+  return project.cwd && !project.ssh && useSettings.getState().settings.newProjectStorage === 'appData'
+    ? { ...project, storeInAppData: true }
+    : project
+}
+
 /** A persisted node's position in ROOT space: its own plus every ancestor frame's origin. */
 function rootStatePosition(
   node: CanvasNodeState,
@@ -503,7 +517,7 @@ export const useProjects = create<ProjectsState>((set, get) => ({
     // Every new project's name — a folder's own name, an SSH label, a relay host's project
     // name — gets the same cap as a rename (issue #940). A blank one keeps createProject's default.
     const clean = name === undefined ? undefined : clampProjectName(name) || undefined
-    const project = createProject(get().projects.length, clean, cwd, ssh)
+    const project = withNewProjectStorage(createProject(get().projects.length, clean, cwd, ssh))
     set((s) => ({ projects: [...s.projects, project] }))
     return project
   },
@@ -583,6 +597,17 @@ export const useProjects = create<ProjectsState>((set, get) => ({
   setProjectCwd(id, cwd) {
     set((s) => ({
       projects: s.projects.map((p) => (p.id === id ? { ...p, cwd } : p))
+    }))
+  },
+
+  setProjectStoreInAppData(id, on) {
+    set((s) => ({
+      projects: s.projects.map((p) => {
+        if (p.id !== id) return p
+        if (on) return { ...p, storeInAppData: true }
+        const { storeInAppData: _drop, ...rest } = p
+        return rest
+      })
     }))
   },
 
@@ -1115,7 +1140,7 @@ export const useProjects = create<ProjectsState>((set, get) => ({
     const fallbackName = clampProjectName(folderName(cwd)) || 'Project'
     // `name` is the agent's `--name`, free text like a rename: same cap (issue #940).
     const project = {
-      ...createProject(get().projects.length, clampProjectName(name ?? '') || fallbackName, cwd),
+      ...withNewProjectStorage(createProject(get().projects.length, clampProjectName(name ?? '') || fallbackName, cwd)),
       ...(color ? { color } : {})
     }
     set((s) => ({ projects: [...s.projects, project] }))

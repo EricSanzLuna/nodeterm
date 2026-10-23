@@ -383,6 +383,19 @@ export function buildRealApi(
       client.request(IPC.workspaceProjectFileState, folder) as ReturnType<
         WorkspaceApi['projectFileState']
       >,
+    // REAL: core registers both (issue #1145), and the Server Edition stores projects the same way.
+    releaseFolderFiles: (projectId: string, removeTracked: boolean) =>
+      client.request(IPC.workspaceReleaseFolderFiles, projectId, removeTracked) as ReturnType<
+        WorkspaceApi['releaseFolderFiles']
+      >,
+    prepareFolderStorage: (projectId: string) =>
+      client.request(IPC.workspacePrepareFolderStorage, projectId) as ReturnType<
+        WorkspaceApi['prepareFolderStorage']
+      >,
+    projectStorage: (projectId: string) =>
+      client.request(IPC.workspaceProjectStorage, projectId) as ReturnType<
+        WorkspaceApi['projectStorage']
+      >,
     // REAL: core broadcasts IPC.workspaceMigrated after a v2→v3 migration (workspace-store.ts).
     onMigrated: (cb) => client.subscribe(IPC.workspaceMigrated, cb as Listener),
     // REAL: core broadcasts IPC.workspaceCorruptRecovered from the load path (workspace-store.ts).

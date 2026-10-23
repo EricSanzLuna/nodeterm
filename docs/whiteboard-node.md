@@ -57,6 +57,18 @@ falling back to `<userData>/whiteboards/` for a cwd-less canvas, an SSH project 
 read-only project folder (the `canvas-images.ts` rules). Writes are atomic (`writeFileAtomic`; the
 PNG through `tempNameFor` + `renameAtomic`, since `writeFileAtomic` writes text).
 
+A folder project whose canvas is kept in app data (issue #1145) writes nothing into its folder: its
+boards go to the same layout under its own app-data root,
+`<userData>/project-files/<projectId>/.nodeterm/whiteboards/`, which is deleted with the project
+(`WorkspaceStore.whiteboardLocationForProject`, wired into both shells as `whiteboardLocation`). Not
+the shared `<userData>/whiteboards/`: that folder is keyed by node id, and two folders holding the
+same committed canvas share node ids, so two such projects would read and overwrite each other's
+boards. The folder's boards, drawn before the move, are read after every place a save can land and
+never written, so a board still opens after the move and its next save lands in app data. A move
+back into the folder first copies the app-data boards over the folder's older files
+(`carryWhiteboards`), since the folder is read first again; a folder project reads its app-data
+root after its folder for a board that did not copy.
+
 **The core derives the path from (project, node id); it never accepts one.** Node data comes from
 the git-shared `project.json`, which anyone with commit access can edit — a path taken from it
 could aim a read or an overwrite anywhere. A node id must be a `string` passing `isSafeNodeId`
