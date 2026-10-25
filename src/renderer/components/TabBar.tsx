@@ -312,9 +312,11 @@ export function TabBar({
             title={
               pendingUpdate.kind === 'downloaded'
                 ? `nodeterm v${pendingUpdate.version} is ready, restart to update`
-                : pendingUpdate.kind === 'manual'
-                  ? `nodeterm v${pendingUpdate.version} is available, download it to update`
-                  : 'This version is no longer supported, update to continue'
+                : pendingUpdate.kind === 'available'
+                  ? `nodeterm v${pendingUpdate.version} is available, click to download it`
+                  : pendingUpdate.kind === 'manual'
+                    ? `nodeterm v${pendingUpdate.version} is available, download it to update`
+                    : 'This version is no longer supported, update to continue'
             }
             onClick={() => runPendingUpdate(pendingUpdate)}
           >

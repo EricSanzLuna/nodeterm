@@ -417,7 +417,8 @@ body,
 }
 
 /* Title-bar "Update" button (Figma-style): right after the traffic lights, deliberately loud and
-   not dismissible, shown only while an update is staged / owed (state/pendingUpdate.ts). */
+   not dismissible, shown from the moment a newer version is known until it is installed
+   (state/pendingUpdate.ts). */
 .tabbar__update {
   display: inline-flex;
   align-items: center;
