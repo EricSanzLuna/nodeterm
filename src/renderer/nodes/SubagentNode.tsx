@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { IconChevronDown, IconChevronRight } from '../components/icons'
 import { Handle, NodeResizer, Position, type NodeProps } from '@xyflow/react'
 import { NODE_MIN_SIZES } from '../lib/nodeSizing'
 import type { CanvasNode } from '../state/workspace'
@@ -59,8 +60,10 @@ export function SubagentNode({ id, data, selected }: NodeProps<CanvasNode>) {
   const select = () => useAgentNodes.getState().select(id)
 
   return (
+    <>
     <div onPointerDownCapture={select} className={`subagent-node${working ? ' working' : ' done'}`}>
-      <NodeResizer isVisible={selected} minWidth={NODE_MIN_SIZES.subagent.width} minHeight={NODE_MIN_SIZES.subagent.height} color="#d97757" />
+      {/* Paint only: the old resize box in its old place (see .nt-resize-ghost in styles.css). */}
+      <NodeResizer isVisible={selected} color="#d97757" lineClassName="nt-resize-ghost" handleClassName="nt-resize-ghost" />
       <Handle type="target" position={Position.Top} isConnectable={false} />
       <div className="subagent-node__head nodrag" onClick={toggle} style={{ cursor: 'pointer' }}>
         <button
@@ -71,7 +74,7 @@ export function SubagentNode({ id, data, selected }: NodeProps<CanvasNode>) {
             toggle()
           }}
         >
-          {expanded ? '▾' : '▸'}
+          {expanded ? <IconChevronDown /> : <IconChevronRight />}
         </button>
         <span className="subagent-node__dot" />
         <span className="subagent-node__type">{(data.subagentType as string) || 'subagent'}</span>
@@ -86,5 +89,12 @@ export function SubagentNode({ id, data, selected }: NodeProps<CanvasNode>) {
         </div>
       )}
     </div>
+    {/* Sibling of the root, not a child: under Liquid Glass the root has a backdrop-filter,
+        which makes it the containing block for these absolute edges, so they were clipped and
+        covered (only the top edge stayed grabbable). Out here they sit on the node wrapper.
+        AFTER the root, never before it: focus mode reparents the root out of this wrapper, and
+        React inserting a control "before the root" would then throw NotFoundError. */}
+    <NodeResizer isVisible={selected} minWidth={NODE_MIN_SIZES.subagent.width} minHeight={NODE_MIN_SIZES.subagent.height} color="#d97757" />
+    </>
   )
 }

@@ -1,5 +1,7 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { AGENT_CONFIG, BUILTIN_AGENT_IDS, type AgentId, type BuiltinAgentId } from '@shared/agents/config'
+import type { CanvasLayout } from '@shared/canvas-layout'
 import type { CustomAgent } from '@shared/types'
 import { formatShortcut, isHoldChord } from '@shared/shortcut'
 import { hasSpeechModel } from '@shared/speech'
@@ -9,9 +11,15 @@ import { useSettings } from '../state/settings'
 import { useProjects } from '../state/projects'
 import { accountsForProject, sshAccountsHint } from '../state/workspace'
 import { CONTENT_ADD_ITEMS, contentAddItemsToDockRows, type AddHandlers } from '../lib/addMenuSpec'
+import { layoutSubtitle, sortedLayouts } from '../lib/canvasLayoutView'
 import { ZOOM_PRESETS, activeZoomPreset } from '../lib/zoomPresets'
+import { useCoreIsWindows } from '../terminal/use-core-platform'
+import { Tooltip } from './Tooltip'
 
 const isMac = /Mac/i.test(navigator.platform || navigator.userAgent)
+
+/** How long a flyout stays open after the pointer leaves its row (see `closeFlyoutSoon`). */
+const FLYOUT_CLOSE_DELAY_MS = 200
 
 interface DockProps {
   dirty: boolean
@@ -25,8 +33,13 @@ interface DockProps {
   /** Opens the Spawn-a-team dialog (issue #78) — the conductor lands at the Dock's default spot. */
   onSpawnTeam: () => void
   onAddDino: () => void
+  onAddWhiteboard: () => void
   onAddTrigger: () => void
   onAddFiles: () => void
+  /** A run node (a launch.json configuration) rooted in the project folder. */
+  onAddRun: () => void
+  /** A Simulator node (macOS desktop). */
+  onAddSimulator: () => void
   onAddAgent: (agentId: AgentId, accountId?: string) => void
   onOpenFile: () => void
   onAddRemote: () => void
@@ -43,6 +56,15 @@ interface DockProps {
   onGoForward: () => void
   onSave: () => void
   onFitView: () => void
+  /** Saves the current arrangement under a name the user is asked for. */
+  onSaveLayout: () => void
+  /** Puts the canvas back the way `layout` recorded it. No confirm: it moves nodes and nothing
+   *  else, and the undo stack picks it up like any other placement. */
+  onRestoreLayout: (layout: CanvasLayout) => void
+  /** Overwrites `layout` with the arrangement now on screen, keeping its name. */
+  onUpdateLayout: (layout: CanvasLayout) => void
+  onRenameLayout: (layout: CanvasLayout) => void
+  onDeleteLayout: (layout: CanvasLayout) => void
   onZoomIn: () => void
   onZoomOut: () => void
   /** Jump to an exact zoom (a preset percentage), holding the screen centre still. */
@@ -66,8 +88,11 @@ export function Dock({
   onAddSticky,
   onSpawnTeam,
   onAddDino,
+  onAddWhiteboard,
   onAddTrigger,
   onAddFiles,
+  onAddRun,
+  onAddSimulator,
   onAddAgent,
   onOpenFile,
   onAddRemote,
@@ -82,6 +107,11 @@ export function Dock({
   onGoForward,
   onSave,
   onFitView,
+  onSaveLayout,
+  onRestoreLayout,
+  onUpdateLayout,
+  onRenameLayout,
+  onDeleteLayout,
   onZoomIn,
   onZoomOut,
   onZoomTo,
@@ -90,10 +120,37 @@ export function Dock({
 }: DockProps) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [zoomMenuOpen, setZoomMenuOpen] = useState(false)
+  const [layoutMenuOpen, setLayoutMenuOpen] = useState(false)
   // Which builtin's flyout submenu is open (at most one). A builtin earns a flyout only when it has
   // ≥1 inheriting custom agent (one with a `baseAgent` matching it); otherwise it stays a flat
   // button, byte-identical to before this nesting existed.
   const [openSub, setOpenSub] = useState<BuiltinAgentId | null>(null)
+  // The add menu scrolls its rows when the window is too short to show them all, and a scroller
+  // clips anything that pokes out of it. So the flyout is portaled into the menu box (outside the
+  // scrolling list) and placed beside its row. It stays a React child of the row, so moving the
+  // pointer from the row into the flyout is not a mouseleave.
+  const [addMenuEl, setAddMenuEl] = useState<HTMLDivElement | null>(null)
+  const [subPos, setSubPos] = useState<{ top: number; left: number } | null>(null)
+  // Leaving the row closes its flyout after a short delay, not at once: the list's scrollbar sits
+  // between the row and the flyout (always on Windows/Linux, while visible on macOS), and crossing
+  // it is a mouseleave. Entering the row or its flyout again cancels the close.
+  const closeTimer = useRef<number | undefined>(undefined)
+  const cancelFlyoutClose = (): void => window.clearTimeout(closeTimer.current)
+  const closeFlyoutSoon = (aid: BuiltinAgentId): void => {
+    cancelFlyoutClose()
+    closeTimer.current = window.setTimeout(
+      () => setOpenSub((cur) => (cur === aid ? null : cur)),
+      FLYOUT_CLOSE_DELAY_MS
+    )
+  }
+  const openFlyout = (aid: BuiltinAgentId, row: HTMLElement): void => {
+    cancelFlyoutClose()
+    // The row's offsetParent is the menu box (the list is not positioned), and offsetTop ignores
+    // the list's scroll, so subtract it. The 6px matches the flyout's own top padding.
+    const scrolled = row.parentElement?.scrollTop ?? 0
+    setSubPos({ top: row.offsetTop - scrolled - 6, left: row.offsetLeft + row.offsetWidth })
+    setOpenSub(aid)
+  }
   // The registry's first effective `speech.dictation` binding, `''` when the user unbound it.
   // The selector returns a STRING, so zustand's default equality keeps an unrelated settings
   // write from re-rendering the dock.
@@ -142,6 +199,20 @@ export function Dock({
     setZoomMenuOpen(false)
   }
 
+  const pickLayout = (fn: () => void) => () => {
+    fn()
+    setLayoutMenuOpen(false)
+  }
+
+  // A relay tab is a live connection to another machine, never a workspace on this disk, so there
+  // is nothing here to write a layout into. Disabled with the reason rather than hidden - the rule
+  // this repo sets for the cwd-less add-menu rows and the trigger card.
+  const layoutsDisabled = !!activeProject?.remote
+  // Re-asked at render, not only at the click: switching to a relay tab while the menu is open
+  // would otherwise leave it (and its backdrop) standing over a canvas it cannot act on.
+  const layoutMenuVisible = layoutMenuOpen && !layoutsDisabled
+  const layoutRows = sortedLayouts(activeProject?.layouts)
+
   // The preset the readout currently sits on, or null between two — the menu's tick.
   const activePreset = activeZoomPreset(zoomPct)
 
@@ -151,6 +222,7 @@ export function Dock({
   // remote-connection is a different flow than the pane menu's remote picker).
   const hasCwd = !!(activeProject?.ssh?.remoteCwd ?? activeProject?.cwd)
   const isSshProject = !!activeProject?.ssh
+  const isWindowsCore = useCoreIsWindows()
   const dockAddHandlers: AddHandlers = {
     terminal: onAddTerminal,
     remote: onAddRemote,
@@ -159,204 +231,324 @@ export function Dock({
     sticky: onAddSticky,
     spawnTeam: onSpawnTeam,
     dino: onAddDino,
+    whiteboard: onAddWhiteboard,
     trigger: onAddTrigger,
     files: onAddFiles,
+    run: onAddRun,
+    simulator: onAddSimulator,
     openFile: onOpenFile,
     newFile: onNewFile,
     worktree: onAddWorktree
   }
   const contentRows = contentAddItemsToDockRows(CONTENT_ADD_ITEMS, dockAddHandlers, {
     hasCwd,
-    isSshProject
+    isSshProject,
+    isWindowsCore,
+    isRelayTab: !!activeProject?.remote
   })
 
   return (
     <>
-      {(menuOpen || zoomMenuOpen) && (
+      {(menuOpen || zoomMenuOpen || layoutMenuVisible) && (
         <div
           className="dock-backdrop"
           onClick={() => {
             setMenuOpen(false)
             setZoomMenuOpen(false)
+            setLayoutMenuOpen(false)
           }}
         />
       )}
 
       <div className="dock">
         {menuOpen && (
-          <div className="dock-menu">
-            <button onClick={pick(onAddTerminal)}>
-              <TerminalIcon />
-              <span>Terminal</span>
-            </button>
-            <button onClick={pick(onAddRemote)}>
-              <TerminalIcon />
-              <span>Remote…</span>
-            </button>
-            {BUILTIN_AGENT_IDS.filter((aid) => !disabledAgents.includes(aid)).flatMap((aid) => {
-              const inheriting = inheritingByBase.get(aid) ?? []
-              // No inheriting customs → the builtin stays a flat button (with Claude's account
-              // rows), byte-identical to before nesting existed.
-              if (inheriting.length === 0) {
-                const base = (
-                  <button key={aid} onClick={pick(() => onAddAgent(aid))}>
-                    <AgentIcon agentId={aid} size={18} />
-                    <span>{AGENT_CONFIG[aid].label}</span>
-                  </button>
-                )
-                if (aid !== 'claude') return [base]
-                // SSH project with no accounts on its host: a disabled row saying where this
-                // host's accounts come from (local accounts are correctly invisible here).
-                const acctHint = sshAccountsHint(activeProject, localAccounts)
-                if (acctHint) {
+          <div className="dock-menu dock-add-menu" ref={setAddMenuEl}>
+            <div
+              className="dock-menu__list nowheel"
+              onScroll={() => {
+                cancelFlyoutClose()
+                setOpenSub(null)
+              }}
+            >
+              <button onClick={pick(onAddTerminal)}>
+                <TerminalIcon />
+                <span>Terminal</span>
+              </button>
+              <button onClick={pick(onAddRemote)}>
+                <TerminalIcon />
+                <span>Remote…</span>
+              </button>
+              {BUILTIN_AGENT_IDS.filter((aid) => !disabledAgents.includes(aid)).flatMap((aid) => {
+                const inheriting = inheritingByBase.get(aid) ?? []
+                // No inheriting customs → the builtin stays a flat button (with Claude's account
+                // rows), byte-identical to before nesting existed.
+                if (inheriting.length === 0) {
+                  const base = (
+                    <button key={aid} title={AGENT_CONFIG[aid].notice} onClick={pick(() => onAddAgent(aid))}>
+                      <AgentIcon agentId={aid} size={18} />
+                      <span>{AGENT_CONFIG[aid].label}</span>
+                    </button>
+                  )
+                  if (aid !== 'claude') return [base]
+                  // SSH project with no accounts on its host: a disabled row saying where this
+                  // host's accounts come from (local accounts are correctly invisible here).
+                  const acctHint = sshAccountsHint(activeProject, localAccounts)
+                  if (acctHint) {
+                    return [
+                      base,
+                      <button key={`${aid}-acct-hint`} disabled title={acctHint}>
+                        <AgentIcon agentId={aid} size={18} />
+                        <span>No accounts on this host yet</span>
+                      </button>
+                    ]
+                  }
+                  // Claude picks up one flat entry per logged-in local account.
+                  if (localAccounts.length === 0) return [base]
                   return [
                     base,
-                    <button key={`${aid}-acct-hint`} disabled title={acctHint}>
-                      <AgentIcon agentId={aid} size={18} />
-                      <span>No accounts on this host yet</span>
-                    </button>
+                    ...localAccounts.map((a) => (
+                      <button key={`${aid}-${a.id}`} onClick={pick(() => onAddAgent(aid, a.id))}>
+                        <AgentIcon agentId={aid} size={18} />
+                        <span>
+                          Claude — {a.label}
+                          {a.id === defaultAccountId ? ' ✓' : ''}
+                        </span>
+                      </button>
+                    ))
                   ]
                 }
-                // Claude picks up one flat entry per logged-in local account.
-                if (localAccounts.length === 0) return [base]
+                // Has inheriting customs → render as a flyout submenu. The parent button still
+                // launches the base harness in one click (preserving today's behavior); hovering it
+                // reveals the base's variants — its account rows (Claude) and the inheriting customs.
+                const acctHint = sshAccountsHint(activeProject, localAccounts)
                 return [
-                  base,
-                  ...localAccounts.map((a) => (
-                    <button key={`${aid}-${a.id}`} onClick={pick(() => onAddAgent(aid, a.id))}>
+                  <div
+                    key={aid}
+                    className="dock-menu__has-sub"
+                    onMouseEnter={(e) => openFlyout(aid, e.currentTarget)}
+                    onMouseLeave={() => closeFlyoutSoon(aid)}
+                  >
+                    <button title={AGENT_CONFIG[aid].notice} onClick={pick(() => onAddAgent(aid))}>
                       <AgentIcon agentId={aid} size={18} />
-                      <span>
-                        Claude — {a.label}
-                        {a.id === defaultAccountId ? ' ✓' : ''}
-                      </span>
+                      <span>{AGENT_CONFIG[aid].label}</span>
+                      <span className="dock-menu__chevron">▸</span>
                     </button>
-                  ))
+                    {openSub === aid && addMenuEl && createPortal(
+                      <div className="dock-menu__sub" style={subPos ?? undefined}>
+                        {aid === 'claude' && localAccounts.length > 0 && (
+                          <>
+                            <div className="dock-menu__sub-label">Accounts</div>
+                            {localAccounts.map((a) => (
+                              <button
+                                key={a.id}
+                                onClick={pick(() => onAddAgent(aid, a.id))}
+                              >
+                                <AgentIcon agentId={aid} size={18} />
+                                <span>
+                                  {a.label}
+                                  {a.id === defaultAccountId ? ' ✓' : ''}
+                                </span>
+                              </button>
+                            ))}
+                          </>
+                        )}
+                        {aid === 'claude' && acctHint && (
+                          <button disabled title={acctHint}>
+                            <AgentIcon agentId={aid} size={18} />
+                            <span>No accounts on this host yet</span>
+                          </button>
+                        )}
+                        <div className="dock-menu__sub-label">Custom</div>
+                        {inheriting.map((c) => (
+                          <button key={c.id} onClick={pick(() => onAddAgent(c.id))}>
+                            <AgentIcon agentId={c.id} size={18} />
+                            <span>{c.label}</span>
+                          </button>
+                        ))}
+                      </div>,
+                      addMenuEl
+                    )}
+                  </div>
                 ]
-              }
-              // Has inheriting customs → render as a flyout submenu. The parent button still
-              // launches the base harness in one click (preserving today's behavior); hovering it
-              // reveals the base's variants — its account rows (Claude) and the inheriting customs.
-              const acctHint = sshAccountsHint(activeProject, localAccounts)
-              return [
-                <div
-                  key={aid}
-                  className="dock-menu__has-sub"
-                  onMouseEnter={() => setOpenSub(aid)}
-                  onMouseLeave={() => setOpenSub((cur) => (cur === aid ? null : cur))}
+              })}
+              {baselessCustoms.map((c) => (
+                <button key={c.id} onClick={pick(() => onAddAgent(c.id))}>
+                  <AgentIcon agentId={c.id} size={18} />
+                  <span>{c.label}</span>
+                </button>
+              ))}
+              {contentRows.map((row) => (
+                <button
+                  key={row.kind}
+                  disabled={row.disabled}
+                  title={row.hint}
+                  onClick={pick(row.onClick)}
                 >
-                  <button onClick={pick(() => onAddAgent(aid))}>
-                    <AgentIcon agentId={aid} size={18} />
-                    <span>{AGENT_CONFIG[aid].label}</span>
-                    <span className="dock-menu__chevron">▸</span>
-                  </button>
-                  {openSub === aid && (
-                    <div className="dock-menu__sub">
-                      {aid === 'claude' && localAccounts.length > 0 && (
-                        <>
-                          <div className="dock-menu__sub-label">Accounts</div>
-                          {localAccounts.map((a) => (
-                            <button
-                              key={a.id}
-                              onClick={pick(() => onAddAgent(aid, a.id))}
-                            >
-                              <AgentIcon agentId={aid} size={18} />
-                              <span>
-                                {a.label}
-                                {a.id === defaultAccountId ? ' ✓' : ''}
-                              </span>
-                            </button>
-                          ))}
-                        </>
-                      )}
-                      {aid === 'claude' && acctHint && (
-                        <button disabled title={acctHint}>
-                          <AgentIcon agentId={aid} size={18} />
-                          <span>No accounts on this host yet</span>
-                        </button>
-                      )}
-                      <div className="dock-menu__sub-label">Custom</div>
-                      {inheriting.map((c) => (
-                        <button key={c.id} onClick={pick(() => onAddAgent(c.id))}>
-                          <AgentIcon agentId={c.id} size={18} />
-                          <span>{c.label}</span>
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              ]
-            })}
-            {baselessCustoms.map((c) => (
-              <button key={c.id} onClick={pick(() => onAddAgent(c.id))}>
-                <AgentIcon agentId={c.id} size={18} />
-                <span>{c.label}</span>
+                  {row.icon}
+                  <span>{row.label}</span>
+                </button>
+              ))}
+              <button onClick={pick(onConnectRemote)}>
+                <RemoteIcon />
+                <span>New Remote Connection</span>
               </button>
-            ))}
-            {contentRows.map((row) => (
-              <button
-                key={row.kind}
-                disabled={row.disabled}
-                title={row.hint}
-                onClick={pick(row.onClick)}
-              >
-                {row.icon}
-                <span>{row.label}</span>
-              </button>
-            ))}
-            <button onClick={pick(onConnectRemote)}>
-              <RemoteIcon />
-              <span>New Remote Connection</span>
-            </button>
+            </div>
           </div>
         )}
 
-        <button
-          className={`dock-btn dock-add${menuOpen ? ' active' : ''}`}
-          title="Add node"
-          onClick={() => {
-            setZoomMenuOpen(false)
-            setMenuOpen((v) => !v)
-          }}
-        >
-          <PlusIcon />
-        </button>
+        <Tooltip label="Add node" placement="top">
+          <button
+            className={`dock-btn dock-add${menuOpen ? ' active' : ''}`}
+            aria-label="Add node"
+            onClick={() => {
+              setZoomMenuOpen(false)
+              setLayoutMenuOpen(false)
+              setMenuOpen((v) => !v)
+            }}
+          >
+            <PlusIcon />
+          </button>
+        </Tooltip>
 
         <span className="dock-sep" />
 
-        <button className="dock-btn" title={commandTooltip('Undo', 'canvas.undo')} disabled={!canUndo} onClick={onUndo}>
-          <UndoIcon />
-        </button>
-        <button className="dock-btn" title={commandTooltip('Redo', 'canvas.redo')} disabled={!canRedo} onClick={onRedo}>
-          <RedoIcon />
-        </button>
-        <button
-          className="dock-btn"
-          title={commandTooltip('Go back', 'canvas.goBack')}
-          disabled={!canGoBack}
-          onClick={onGoBack}
-        >
-          <ArrowLeftIcon />
-        </button>
-        <button
-          className="dock-btn"
-          title={commandTooltip('Go forward', 'canvas.goForward')}
-          disabled={!canGoForward}
-          onClick={onGoForward}
-        >
-          <ArrowRightIcon />
-        </button>
+        <Tooltip label={commandTooltip('Undo', 'canvas.undo')} placement="top">
+          <button className="dock-btn" aria-label="Undo" disabled={!canUndo} onClick={onUndo}>
+            <UndoIcon />
+          </button>
+        </Tooltip>
+        <Tooltip label={commandTooltip('Redo', 'canvas.redo')} placement="top">
+          <button className="dock-btn" aria-label="Redo" disabled={!canRedo} onClick={onRedo}>
+            <RedoIcon />
+          </button>
+        </Tooltip>
+        <Tooltip label={commandTooltip('Go back', 'canvas.goBack')} placement="top">
+          <button className="dock-btn" aria-label="Go back" disabled={!canGoBack} onClick={onGoBack}>
+            <ArrowLeftIcon />
+          </button>
+        </Tooltip>
+        <Tooltip label={commandTooltip('Go forward', 'canvas.goForward')} placement="top">
+          <button
+            className="dock-btn"
+            aria-label="Go forward"
+            disabled={!canGoForward}
+            onClick={onGoForward}
+          >
+            <ArrowRightIcon />
+          </button>
+        </Tooltip>
 
         <span className="dock-sep" />
 
-        <button className="dock-btn" title="Save" onClick={onSave}>
-          <SaveIcon />
-          <span className={`dock-dirty${dirty ? ' dirty' : ''}`} />
-        </button>
-        <button className="dock-btn" title="Fit view" onClick={onFitView}>
-          <FrameIcon />
-        </button>
-        <button
-          className={`dock-btn${dictateActive ? ' active' : ''}`}
-          title={
+        <Tooltip label={dirty ? 'Save (unsaved changes)' : 'Save'} placement="top">
+          <button className="dock-btn" aria-label="Save" onClick={onSave}>
+            <SaveIcon />
+            <span className={`dock-dirty${dirty ? ' dirty' : ''}`} />
+          </button>
+        </Tooltip>
+        <Tooltip label="Fit view" placement="top">
+          <button className="dock-btn" aria-label="Fit view" onClick={onFitView}>
+            <FrameIcon />
+          </button>
+        </Tooltip>
+        {/* An arrangement is view state, not a node you add, so it sits in the view cluster rather
+            than behind the "+". */}
+        <div className="dock-layouts-wrap">
+          {layoutMenuVisible && (
+            <div className="dock-menu dock-layouts-menu">
+              {layoutRows.length === 0 ? (
+                // Never an empty popover: a menu that opens onto nothing reads as broken rather
+                // than as empty.
+                <button disabled>
+                  <span>No layouts saved yet</span>
+                </button>
+              ) : (
+                layoutRows.map((layout) => (
+                  <div key={layout.id} className="dock-menu__row">
+                    <button
+                      className="dock-menu__row-main"
+                      onClick={pickLayout(() => onRestoreLayout(layout))}
+                    >
+                      <LayoutsIcon />
+                      <span className="dock-menu__row-text">
+                        <span className="dock-menu__row-name">{layout.name}</span>
+                        <span className="dock-menu__row-sub">{layoutSubtitle(layout)}</span>
+                      </span>
+                    </button>
+                    <span className="dock-menu__row-actions">
+<Tooltip label="Update to the arrangement on screen" placement="right">
+                        <button
+                          className="dock-menu__row-act"
+                          aria-label={`Update layout ${layout.name} to the current arrangement`}
+                          onClick={(e) => {
+                            // The row itself restores; these three must not.
+                            e.stopPropagation()
+                            setLayoutMenuOpen(false)
+                            onUpdateLayout(layout)
+                          }}
+                        >
+                          <UpdateIcon />
+                        </button>
+                      </Tooltip>
+                      <Tooltip label="Rename" placement="right">
+                        <button
+                          className="dock-menu__row-act"
+                          aria-label={`Rename layout ${layout.name}`}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            setLayoutMenuOpen(false)
+                            onRenameLayout(layout)
+                          }}
+                        >
+                          <PencilIcon />
+                        </button>
+                      </Tooltip>
+                      <Tooltip label="Delete" placement="right">
+                        <button
+                          className="dock-menu__row-act"
+                          aria-label={`Delete layout ${layout.name}`}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            setLayoutMenuOpen(false)
+                            onDeleteLayout(layout)
+                          }}
+                        >
+                          <CrossIcon />
+                        </button>
+                      </Tooltip>
+                    </span>
+                  </div>
+                ))
+              )}
+              <span className="dock-menu__rule" />
+              <button onClick={pickLayout(onSaveLayout)}>
+                <PlusSmallIcon />
+                <span>Save current layout…</span>
+              </button>
+            </div>
+          )}
+          <Tooltip
+            label={layoutsDisabled ? 'Layouts are managed on the host' : 'Layouts'}
+            placement="top"
+          >
+            <button
+              className={`dock-btn${layoutMenuOpen ? ' active' : ''}`}
+              aria-label="Layouts"
+              aria-haspopup="menu"
+              aria-expanded={layoutMenuOpen}
+              disabled={layoutsDisabled}
+              onClick={() => {
+                setMenuOpen(false)
+                setZoomMenuOpen(false)
+                setLayoutMenuOpen((v) => !v)
+              }}
+            >
+              <LayoutsIcon />
+            </button>
+          </Tooltip>
+        </div>
+        <Tooltip
+          label={
             dictationOff
               ? 'Dictation off — choose a model in Settings → Speech'
               : // The user unbound the shortcut: the mic button still dictates, so the tooltip
@@ -367,16 +559,24 @@ export function Dock({
                   ? `Dictate (hold ${formatShortcut(dictationShortcut, isMac)})`
                   : `Dictate (${formatShortcut(dictationShortcut, isMac)})`
           }
-          onClick={onDictate}
+          placement="top"
         >
-          <MicIcon />
-        </button>
+          <button
+            className={`dock-btn${dictateActive ? ' active' : ''}`}
+            aria-label="Dictate"
+            onClick={onDictate}
+          >
+            <MicIcon />
+          </button>
+        </Tooltip>
 
         <span className="dock-sep" />
 
-        <button className="dock-btn dock-zoom-btn" title="Zoom out" onClick={onZoomOut}>
-          <MinusIcon />
-        </button>
+        <Tooltip label="Zoom out" placement="top">
+          <button className="dock-btn" aria-label="Zoom out" onClick={onZoomOut}>
+            <MinusIcon />
+          </button>
+        </Tooltip>
         <div className="dock-zoom-wrap">
           {zoomMenuOpen && (
             <div className="dock-menu dock-zoom-menu">
@@ -399,22 +599,27 @@ export function Dock({
               </button>
             </div>
           )}
-          <button
-            className={`dock-zoom${zoomMenuOpen ? ' active' : ''}`}
-            title="Zoom presets"
-            aria-haspopup="menu"
-            aria-expanded={zoomMenuOpen}
-            onClick={() => {
-              setMenuOpen(false)
-              setZoomMenuOpen((v) => !v)
-            }}
-          >
-            {zoomPct}%
-          </button>
+          <Tooltip label="Zoom presets" placement="top">
+            <button
+              className={`dock-zoom${zoomMenuOpen ? ' active' : ''}`}
+              aria-label="Zoom presets"
+              aria-haspopup="menu"
+              aria-expanded={zoomMenuOpen}
+              onClick={() => {
+                setMenuOpen(false)
+                setLayoutMenuOpen(false)
+                setZoomMenuOpen((v) => !v)
+              }}
+            >
+              {zoomPct}%
+            </button>
+          </Tooltip>
         </div>
-        <button className="dock-btn dock-zoom-btn" title="Zoom in" onClick={onZoomIn}>
-          <PlusSmallIcon />
-        </button>
+        <Tooltip label="Zoom in" placement="top">
+          <button className="dock-btn" aria-label="Zoom in" onClick={onZoomIn}>
+            <PlusSmallIcon />
+          </button>
+        </Tooltip>
       </div>
     </>
   )
@@ -433,14 +638,14 @@ function PlusIcon() {
 function UndoIcon() {
   return (
     <svg {...S}>
-      <path d="M9 7L4 12l5 5M4 12h11a5 5 0 0 1 0 10h-2" />
+      <path d="M9 14L4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H10" />
     </svg>
   )
 }
 function RedoIcon() {
   return (
     <svg {...S}>
-      <path d="M15 7l5 5-5 5M20 12H9a5 5 0 0 0 0 10h2" />
+      <path d="M15 14l5-5-5-5M20 9H9.5a5.5 5.5 0 0 0 0 11H14" />
     </svg>
   )
 }
@@ -460,7 +665,7 @@ function ArrowRightIcon() {
 }
 function PlusSmallIcon() {
   return (
-    <svg {...S} width={15} height={15}>
+    <svg {...S}>
       <path d="M12 5v14M5 12h14" />
     </svg>
   )
@@ -474,7 +679,7 @@ function CheckIcon() {
 }
 function MinusIcon() {
   return (
-    <svg {...S} width={15} height={15}>
+    <svg {...S}>
       <path d="M5 12h14" />
     </svg>
   )
@@ -491,6 +696,35 @@ function FrameIcon() {
   return (
     <svg {...S}>
       <path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3" />
+    </svg>
+  )
+}
+function LayoutsIcon() {
+  return (
+    <svg {...S}>
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M10 4v16M10 12h11" />
+    </svg>
+  )
+}
+function UpdateIcon() {
+  return (
+    <svg {...S} width={13} height={13}>
+      <path d="M20 11a8 8 0 1 0-2.3 6.3M20 6v5h-5" />
+    </svg>
+  )
+}
+function PencilIcon() {
+  return (
+    <svg {...S} width={13} height={13}>
+      <path d="M4 20h4L19 9l-4-4L4 16v4zM14 6l4 4" />
+    </svg>
+  )
+}
+function CrossIcon() {
+  return (
+    <svg {...S} width={13} height={13}>
+      <path d="M6 6l12 12M18 6L6 18" />
     </svg>
   )
 }

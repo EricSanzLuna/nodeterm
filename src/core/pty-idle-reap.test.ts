@@ -76,7 +76,9 @@ vi.mock('child_process', () => {
     execCalls.push({ file, args })
     const ok = (stdout: string): void => cb?.(null, { stdout, stderr: '' })
     if (args.includes('has-session')) {
-      const target = args[args.indexOf('-t') + 1]
+      // Production asks with the EXACT form (`=nt-…` / `=nt-…:`); tmux matches it against the name.
+      const raw = args[args.indexOf('-t') + 1]
+      const target = raw.startsWith('=') ? raw.slice(1).replace(/:$/, '') : raw
       if (liveTmuxSessions.has(target)) ok('')
       else cb?.(Object.assign(new Error('no such session'), { code: 1 }))
     } else if (args[0] === '-ilc') {
@@ -178,11 +180,25 @@ describe('idle reap of unwatched client PTYs', () => {
     expect(spawned[0].killed).toBe(false)
   })
 
-  it('never reaps before the threshold — it must not race the renderer 5-minute park', async () => {
+  it('never reaps a session whose only subscriber is a QUIET client (a live link viewer)', async () => {
+    // A quiet client is absent from clientIds() by design (it receives no broadcast), so a sweep
+    // that asked clientIds() alone would release the pty under the viewer, and releaseClient sends
+    // that viewer no event at all: the link would go dead with nothing on either screen.
+    const WATCHER = 1_000_042
+    fake.quietClients.push(WATCHER)
+    await tmuxManager()
+    await create(WATCHER)
+
+    idle(REAP_IDLE_MS * 10)
+
+    expect(spawned[0].killed).toBe(false)
+  })
+
+  it('never reaps before the threshold', async () => {
     await tmuxManager()
     await create(ALICE)
 
-    idle(6 * 60 * 1000) // one minute past TERM_PARK_MS
+    idle(6 * 60 * 1000) // well inside REAP_IDLE_MS
 
     expect(spawned[0].killed).toBe(false)
   })

@@ -107,8 +107,10 @@ export function getWebglBudget(): number {
 }
 
 /**
- * THE CRISP GATE — above this canvas zoom the coordinator holds NO contexts, and every terminal
- * paints through xterm's DOM renderer instead.
+ * THE CRISP GATE — above this canvas zoom no terminal ON SCREEN holds a context: each one paints
+ * through xterm's DOM renderer instead. Hidden holders keep their warm contexts through the gate
+ * (the blur only matters where it can be seen), and one that comes into view while the gate is
+ * closed gives its context back at rest (see `setVisible`).
  *
  * A GPU terminal is a BITMAP: the addon rasterizes into a canvas sized from the element's LAYOUT
  * box in device pixels, and React Flow's `transform: scale()` then magnifies that bitmap. xterm
@@ -126,8 +128,8 @@ export function getWebglBudget(): number {
  * work from outside the addon: three variants (dpr override; + pinning the backing store; +
  * re-running the renderer resize) all left the terminal drawing almost nothing, because the
  * renderer assumes throughout that its canvas is at true device resolution. Swapping renderers is
- * what remains, and it is affordable exactly where it is needed: at this zoom only one or two
- * terminals fit on screen, so the swap is a couple of nodes, not a canvas-wide rebalance.
+ * what remains, and it is affordable because only what is on screen swaps: at this zoom that is
+ * one or two terminals, not a canvas-wide rebalance.
  *
  * This is deliberately the INVERSE of the zoom gate removed in the budget-only lifecycle change,
  * and it is not that gate returning: that one suspended the GPU when zoomed OUT past 40% on a
@@ -141,26 +143,86 @@ export const WEBGL_CRISP_ABOVE_ZOOM = 1.75
  *  boundary must not thrash swap cycles — renderer churn is its own hazard. */
 export const WEBGL_GPU_RESUME_BELOW_ZOOM = 1.6
 
-/** True while the canvas is zoomed past the crisp threshold — grants are blocked. */
+/**
+ * The crisp gate on a LOW-DPI display (devicePixelRatio under 2, issue #986). There is no spare
+ * resolution there, so any non-integer magnification of the GPU bitmap smears glyph edges, well
+ * below 175%. Measured at DPR 1 with the same metric as above: webgl 35.6% at 100%, ~62% from 110%
+ * all the way to 175%; dom 39.7% at 100%, 38.1% at 110%, falling to 26.5% at 200%. At DPR 2 the
+ * softening is milder and reads as fine, so a high-DPI display keeps the 175% threshold.
+ *
+ * On a low-DPI display every zoom-in past 100% therefore swaps the terminals on screen to DOM.
+ * That is more terminals than the high-DPI case (at 110% most of a canvas can still be on screen),
+ * so it costs DOM rendering where there used to be GPU; that is the trade #361 left open ("moves
+ * to ~1.2 and nothing else changes") and the one #986 asks for. 100% itself, and every zoom-out,
+ * stay on the GPU.
+ *
+ * It is also the COMMON path here, not a rare one: `goToNode` frames a node at up to 138%
+ * (`FIT_NODE_OPTIONS.maxZoom`), so on a low-DPI display every focus — sidebar, ⌘K, notification,
+ * double-click — crosses this line and comes back. That is why the gate leaves hidden holders
+ * warm. Releasing the whole pool instead, with 24 holders and the focused node registered last,
+ * put that node's release behind 22 off-screen ones (1.1 s after the canvas settled, at
+ * `WEBGL_SWAPS_PER_DRAIN` per `WEBGL_DRAIN_MS`) and cost 24 re-grants — shader compile + atlas
+ * build each — on the way back out, for a round trip that swapped nothing at all before #986.
+ */
+export const WEBGL_LOW_DPI_CRISP_ABOVE_ZOOM = 1.02
+/** Resume threshold for the low-DPI gate — the same hysteresis rule, just above 100%. */
+export const WEBGL_LOW_DPI_GPU_RESUME_BELOW_ZOOM = 1.01
+/** Below this devicePixelRatio the low-DPI thresholds apply. */
+const LOW_DPI_BELOW = 2
+
+/** True while the canvas is zoomed past the crisp threshold — grants are blocked, and every holder
+ *  on screen owes its context back. */
 let zoomCrisp = false
+/** Last reported canvas zoom, so a display change can re-evaluate it. */
+let lastZoom = 1
+/** Last reported devicePixelRatio. Unknown until the canvas reports one, and unknown behaves as
+ *  high-DPI — the thresholds this gate had before #986. */
+let devicePixelRatio = Number.POSITIVE_INFINITY
+
+/**
+ * Report the window's devicePixelRatio (it changes when the window moves between displays, and
+ * with browser zoom in the Server Edition). When the change crosses the low-DPI line, the current
+ * zoom is re-evaluated against the ENTRY threshold of the new display only: hysteresis guards a
+ * pinch hovering at one boundary, and a display change is not that — at 170% on a 1x display the
+ * terminals are crisp, and 170% on a retina display never crossed its 175% line, so they belong
+ * back on the GPU.
+ */
+export function setWebglDevicePixelRatio(dpr: number): void {
+  if (!Number.isFinite(dpr) || dpr <= 0 || dpr === devicePixelRatio) return
+  // Only a change of threshold pair skips the band: 2 → 3 keeps 175/160, and a terminal held
+  // crisp inside that band must stay crisp.
+  const thresholdsChanged = dpr < LOW_DPI_BELOW !== devicePixelRatio < LOW_DPI_BELOW
+  devicePixelRatio = dpr
+  applyZoomCrisp(lastZoom, thresholdsChanged)
+}
 
 /**
  * Report the canvas zoom (React Flow viewport scale). Cheap and idempotent — call it from the
  * zoom/pan handler; state only changes when a hysteresis boundary is crossed. Crossing UP marks
- * every held context release-OWED and drains; crossing DOWN forgives owed releases still held
- * (kept warm through a brief overshoot) and queues budget-gated grants for visible clients. Both
- * directions go through `owed`/`drain`, so nothing swaps mid-gesture and a multi-node crossing
- * trickles.
+ * every context held ON SCREEN release-OWED and drains (hidden holders stay warm); crossing DOWN
+ * forgives the owed releases still held (kept warm through a brief overshoot) and queues
+ * budget-gated grants for visible clients. Both directions go through `owed`/`drain`, so nothing
+ * swaps mid-gesture and a multi-node crossing trickles.
  */
 export function setWebglZoom(zoom: number): void {
   if (!Number.isFinite(zoom)) return
-  const next = zoomCrisp ? zoom > WEBGL_GPU_RESUME_BELOW_ZOOM : zoom > WEBGL_CRISP_ABOVE_ZOOM
+  lastZoom = zoom
+  applyZoomCrisp(zoom)
+}
+
+function applyZoomCrisp(zoom: number, displayChanged = false): void {
+  const lowDpi = devicePixelRatio < LOW_DPI_BELOW
+  const crispAbove = lowDpi ? WEBGL_LOW_DPI_CRISP_ABOVE_ZOOM : WEBGL_CRISP_ABOVE_ZOOM
+  const resumeBelow = lowDpi ? WEBGL_LOW_DPI_GPU_RESUME_BELOW_ZOOM : WEBGL_GPU_RESUME_BELOW_ZOOM
+  const next = zoomCrisp && !displayChanged ? zoom > resumeBelow : zoom > crispAbove
   if (next === zoomCrisp) return
   zoomCrisp = next
   if (zoomCrisp) {
     for (const c of clients.values()) {
       cancelAcquire(c)
-      if (c.granted) {
+      // Only the terminals on screen show the blur. A hidden holder keeps its warm context for the
+      // zoom back out; if it is panned into view first, `setVisible` queues its release then.
+      if (c.granted && c.visible) {
         c.releaseOwed = true
         owed.add(c)
       }
@@ -171,8 +233,10 @@ export function setWebglZoom(zoom: number): void {
   if (!enabled) return
   for (const c of clients.values()) {
     // Zoomed back in under the threshold before the drain got to this client: keep the context,
-    // releasing and re-granting it back to back is the churn this design forbids.
-    if (c.granted && c.releaseOwed) c.releaseOwed = false
+    // releasing and re-granting it back to back is the churn this design forbids. Visible only:
+    // those are the gate's releases, while a HIDDEN holder's owed release is the pressure sweep's
+    // (`releaseAllHiddenGrants`), which a zoom has no business cancelling.
+    if (c.granted && c.releaseOwed && c.visible) c.releaseOwed = false
     if (c.visible && !c.granted) {
       c.releaseOwed = false
       owed.add(c)
@@ -291,7 +355,50 @@ export function loseWebglContexts(canvases: ArrayLike<HTMLCanvasElement> | null)
       // fail open — losing a context is an optimization, never worth breaking release for.
     }
   }
+  lossCounts.released += lost
   return lost
+}
+
+/**
+ * Per-session WebGL loss telemetry. Before this a GPU reset
+ * left no trace: the terminals silently fell back to the DOM renderer and were re-granted, and
+ * the only evidence was a user saying "the text went soft for a second". Each EXTERNAL loss now
+ * writes one `[webgl]` warn — which main's `console-message` mirror carries into the debug log
+ * ring with its tag (in a Server Edition browser tab it stays in the tab's console: no main, a
+ * documented degrade) — and the line carries the running totals so a soak can read the budget's
+ * real loss rate off any single entry.
+ *
+ * The two external kinds are counted apart because they are different failures:
+ *  - `lost`: the addon's own `onContextLoss` — the context stayed lost past the addon's 3s
+ *    restore window (force-eviction, or a GPU that did not come back).
+ *  - `restored`: the browser lost AND restored it (a GPU-process reset; sleep/wake) and we
+ *    rebuilt on a fresh addon instead of trusting the in-place recovery (TerminalNode.tsx).
+ * `released` is the SELF-INFLICTED kind — `loseWebglContexts` on our own release — counted
+ * separately so it is never mistaken for the browser taking contexts away, and never logged per
+ * event (it is routine churn on every pan). Plain integer increments: free on the hot path.
+ */
+export type WebglLossKind = 'lost' | 'restored'
+const lossCounts = { lost: 0, restored: 0, released: 0 }
+
+export function getWebglLossCounts(): { lost: number; restored: number; released: number } {
+  return { ...lossCounts }
+}
+
+/** The `[webgl]` line for one external loss, with the session totals (exported for the test). */
+export function formatWebglLoss(
+  kind: WebglLossKind,
+  counts: { lost: number; restored: number; released: number },
+  held: number,
+  ceiling: number
+): string {
+  const what =
+    kind === 'lost'
+      ? 'context lost (not restored within the addon window)'
+      : 'context lost and restored by the browser (GPU reset; rebuilding on a fresh addon)'
+  return (
+    `[webgl] ${what} — this session: ${counts.lost} lost, ${counts.restored} restored ` +
+    `externally; ${counts.released} released by us; ${held}/${ceiling} held`
+  )
 }
 
 /**
@@ -319,8 +426,9 @@ export interface WebglClientCallbacks {
 export interface WebglClientHandle {
   /** Report this node's viewport visibility (driven by its IntersectionObserver). */
   setVisible(visible: boolean): void
-  /** Report that the addon's own `onContextLoss` fired: drop this grant from the accounting. */
-  contextLost(): void
+  /** Report that the context was lost from outside: drop this grant from the accounting.
+   *  `kind` only labels the telemetry (see `WebglLossKind`); the accounting is identical. */
+  contextLost(kind?: WebglLossKind): void
   /** Node unmount: release any held context, cancel timers, and forget this client. */
   dispose(): void
 }
@@ -463,7 +571,16 @@ function setVisible(c: Client, visible: boolean): void {
     // Re-visible: keep the warm context, and forgive a release parked in the deferred-drain
     // queue (a pressure sweep that queued this client before it came back).
     c.releaseOwed = false
-    if (c.granted) return
+    if (c.granted) {
+      // …unless the canvas is zoomed past the crisp threshold: a warm holder panned into view
+      // there must go crisp like the ones already on screen. Queued, so it swaps at rest.
+      if (zoomCrisp) {
+        c.releaseOwed = true
+        owed.add(c)
+        drain()
+      }
+      return
+    }
     // Debounce the acquire so a fast pan-through never grabs a context for a two-frame flash.
     if (!c.acquireTimer) {
       c.acquireTimer = setTimeout(() => {
@@ -477,6 +594,10 @@ function setVisible(c: Client, visible: boolean): void {
   // any length, and the LRU reclaim candidate the moment a visible newcomer needs the slot.
   c.hiddenAt = ++visibilityClock
   cancelAcquire(c)
+  // A release still owed from while it was on screen is the crisp gate's (the pressure sweep only
+  // queues hidden holders). Off screen the blur no longer shows, so this holder stays warm like
+  // every other hidden one — a zoomed-in pan must not tear down each node it merely crossed.
+  if (zoomCrisp) c.releaseOwed = false
 }
 
 /**
@@ -519,8 +640,18 @@ export function registerWebglClient(id: string, callbacks: WebglClientCallbacks)
       const c = clients.get(id)
       if (c === client) setVisible(c, visible)
     },
-    contextLost() {
+    contextLost(kind: WebglLossKind = 'lost') {
+      // Counted BEFORE the stale-handle guard: the browser took a real context either way; only
+      // the accounting below belongs to the live registration.
+      lossCounts[kind] += 1
       const c = clients.get(id)
+      try {
+        // `held` AFTER this loss: the live grant being dropped below no longer holds a context.
+        const held = grantCount() - (c === client && client.granted ? 1 : 0)
+        console.warn(formatWebglLoss(kind, lossCounts, held, budget))
+      } catch {
+        /* telemetry must never break the loss path */
+      }
       if (c !== client) return
       // The browser (or our own dispose) already tore the context down; drop the accounting.
       c.granted = false
@@ -569,8 +700,13 @@ export function __resetWebglBudgetForTests(): void {
   budget = WEBGL_BUDGET
   enabled = true
   zoomCrisp = false
+  lastZoom = 1
+  devicePixelRatio = Number.POSITIVE_INFINITY
   gestureActive = false
   owed.clear()
+  lossCounts.lost = 0
+  lossCounts.restored = 0
+  lossCounts.released = 0
   if (drainTimer) {
     clearTimeout(drainTimer)
     drainTimer = null

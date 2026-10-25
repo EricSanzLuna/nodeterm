@@ -26,10 +26,30 @@
  *    error, no record. And no hook fires while it runs, so a node whose only activity is a long
  *    background job looks EXACTLY like the target profile (`done`, offscreen, idle for hours): the
  *    stamp the launch left behind (`agentStatus.backgroundTaskAt`, cleared at the next turn start)
- *    is the only signal there is.
+ *    is the only signal there is. Claude's `Stop` also stamps it while its `background_tasks`
+ *    inventory lists running work — which is what covers a background SUBAGENT that is only paused
+ *    (its native SubagentStop marked its card done; core/claude-subagent-lifecycle.ts).
  *  - **Unknown idle is NOT idle.** A candidate with no `lastEventAt` (no hook event has ever been
  *    seen for it in this run) is never eligible — the same rule as pendingLaunch's "an unknown
  *    dependency state is not satisfied". Guessing here costs the user a live session.
+ *  - **A restored clock is not an idle proof.** `agentStatus.lastSeen` (the last hook event before
+ *    an app restart) is persisted so the sidebar can order and age rows; it deliberately never
+ *    reaches `lastEventAt` or this plan, so Eco stays inert for a session with no hook event in
+ *    the current run. Two reasons, either sufficient: (1) the hook server was down with the app,
+ *    so a turn that started or ended in between left no trace and the restored `done` may describe
+ *    a pane that has been working for an hour; (2) even a PROVEN-idle prompt after boot is not
+ *    enough, because the two other guards this plan needs — `backgroundTaskAt` (a background shell
+ *    inside the CLI) and the subagent cards (async children still running) — are transient and
+ *    cannot be rebuilt after a restart, and `/exit` kills both silently. A session becomes a
+ *    candidate again with its next live `done`, from which the idle window is counted.
+ *  - **Never a pane the agent does not OWN.** Eco's contract is "quit the CLI in this pane and
+ *    resume it in this pane", and `#{pane_current_command}` cannot tell whether that is what the
+ *    pane holds: an npm-installed CLI reports as `node`, and a CLI reached over an interactive
+ *    `ssh` reports as `ssh` while running on another machine entirely. The exit therefore asks the
+ *    kernel who owns the pane's foreground group (`decideHibernateExit`), and a node it refused is
+ *    kept out of subsequent plans by this flag. Issue #823: without the ownership question, a node
+ *    whose ssh had since died was exited — `/exit` typed into the local login shell — recorded as
+ *    SLEEPING, and its wake typed `claude --resume <remote id>` into that same local shell.
  *  - **Never a REMOTE session** (SSH project / relay tab) in v1 — and excluded at PLAN time, not
  *    only when the exit is attempted: the plan is a deterministic sort-and-slice, so two remote
  *    nodes at the head of the oldest-idle order would occupy both batch slots on every pass and no
@@ -96,6 +116,19 @@ export interface HibernationCandidate {
    * to prevent, reachable here through the automatic sweep instead.
    */
   paused: boolean
+  /**
+   * The last exit attempt proved there is no agent in this node's pane, so nothing was quit
+   * (`agentStatus.paneUnverified`; the verdict itself is `decideHibernateExit`).
+   *
+   * Excluded HERE, at plan time, for exactly the reason `remote` is — and this one is worse. A node
+   * in this state is `done`, offscreen and idle, and NOTHING about it will change on its own: it
+   * sorts to the head of the oldest-idle order and stays there. Left in the plan it would take a
+   * batch slot on every sweep for the rest of the run, refuse at fire time, and starve every
+   * eligible node behind it. Two such nodes would switch Eco off entirely, silently.
+   *
+   * Transient, and withdrawn by any live hook event — a CLI that fires a hook is a CLI in the pane.
+   */
+  paneUnverified: boolean
 }
 
 export interface HibernationConfig {
@@ -158,6 +191,7 @@ export function planHibernation(
         !c.hibernated &&
         !c.paused &&
         !c.remote &&
+        !c.paneUnverified &&
         c.wired &&
         c.offscreen &&
         c.state === 'done' &&

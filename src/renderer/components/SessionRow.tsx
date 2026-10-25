@@ -1,9 +1,12 @@
 import { useState } from 'react'
 import { AccountChip, useAccountChip } from './AccountChip'
-import { IconBellFilled, IconCircleCheck } from './icons'
+import { LiveLinkChip } from './LiveLinkChip'
+import type { SessionSource } from '../session/session'
+import { IconBellFilled, IconCircleCheck, IconClose } from './icons'
 import { NodeIconView } from './NodeIcon'
 import { ProjectGlyph } from './ProjectGlyph'
 import type { SessionRowVM } from '../lib/sessionList'
+import { sessionStateAgeTitle } from '../lib/sessionList'
 import { useContextWindow } from '../state/contextWindow'
 import { useSessionNaming } from '../state/sessionNaming'
 import { useSettings } from '../state/settings'
@@ -20,6 +23,9 @@ export interface SessionRowProps {
   onDragEnd(): void
   /** Status-group mode only: elapsed time since the current state began. */
   stateAgeLabel?: string
+  /** The session this row's PROJECT belongs to (`projectSessionSource`): only a local one shows
+   *  this machine's LIVE chip — a relay tab's node with the same id is not ours (R57). */
+  liveLinkSource: SessionSource | null
 }
 
 function dirName(p?: string): string {
@@ -37,7 +43,8 @@ export function SessionRow({
   onContextMenu,
   onDragStart,
   onDragEnd,
-  stateAgeLabel
+  stateAgeLabel,
+  liveLinkSource
 }: SessionRowProps): JSX.Element {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(row.title)
@@ -148,8 +155,15 @@ export function SessionRow({
               {row.title}
             </span>
           )}
-          {row.session && <span className="ss-chip">{row.session}</span>}
-          <AccountChip chip={accountChip} />
+          {/* `title`, because the chip now yields to the name and can be ellipsised: a truncated
+              chip with no tooltip is the one state where the session name is unrecoverable. */}
+          {row.session && (
+            <span className="ss-chip" title={row.session}>
+              {row.session}
+            </span>
+          )}
+          <AccountChip chip={accountChip} className="ss-account" />
+          <LiveLinkChip nodeId={row.id} source={liveLinkSource} className="ss-live" />
           {row.loop && (
             <span className="ss-loop">
               {row.loop.kind} · {row.loop.count}
@@ -158,30 +172,36 @@ export function SessionRow({
           {row.usesContext && usage && (
             <span
               className="ss-ctx"
-              title={`Context window — ${percentText(usage.usedPercent, percentMode)}`}
+              title={`${usage.windowSource === 'estimate' ? 'Estimated context window' : 'Context window'} — ${percentText(usage.usedPercent, percentMode)}`}
               style={{ background: contextFillColor(usage.usedPercent) }}
             >
-              {contextPillText(usage.usedTokens, usage.windowTokens, usage.usedPercent, percentMode)}
+              {usage.windowSource === 'estimate' ? '~' : ''}{contextPillText(usage.usedTokens, usage.windowTokens, usage.usedPercent, percentMode)}
             </span>
           )}
-          <button
-            className="ss-row__ai"
-            title="Name with AI (from terminal output)"
-            disabled={naming}
-            onClick={aiName}
-          >
-            {naming ? '…' : '✦'}
-          </button>
-          <button
-            className="ss-row__close"
-            title="End session"
-            onClick={(e) => {
-              e.stopPropagation()
-              onClose()
-            }}
-          >
-            ×
-          </button>
+          {/* Both buttons are invisible until the row is hovered, yet they used to hold 46px of a
+              253px line — a quarter of it — away from the NAME. The cluster is taken out of flow
+              and floated over the line's tail on hover instead: the tail is what an ellipsis was
+              already eating, and the name gets those pixels back at every other moment. */}
+          <span className="ss-row__actions">
+            <button
+              className="ss-row__ai"
+              title="Name with AI (from terminal output)"
+              disabled={naming}
+              onClick={aiName}
+            >
+              {naming ? '…' : '✦'}
+            </button>
+            <button
+              className="ss-row__close"
+              title="End session"
+              onClick={(e) => {
+                e.stopPropagation()
+                onClose()
+              }}
+            >
+              <IconClose />
+            </button>
+          </span>
         </div>
         {(row.projectName || row.cwd || row.sshHost || stateAgeLabel) && (
           <div className="ss-meta">
@@ -189,7 +209,10 @@ export function SessionRow({
             {row.sshHost && <span className="ss-meta__ssh">⇅ {row.sshHost}</span>}
             {row.cwd && <span className="ss-meta__cwd">{dirName(row.cwd)}</span>}
             {stateAgeLabel && (
-              <span className="ss-meta__state-age" title={`Entered this state ${stateAgeLabel}`}>
+              <span
+                className={`ss-meta__state-age${row.statusClock === 'restored' ? ' ss-meta__state-age--restored' : ''}`}
+                title={sessionStateAgeTitle(stateAgeLabel, row.statusClock, row.lastSeenState)}
+              >
                 {stateAgeLabel}
               </span>
             )}

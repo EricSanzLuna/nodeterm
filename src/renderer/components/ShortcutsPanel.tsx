@@ -20,7 +20,8 @@
  * the two zoom chords (`lib/zoomShortcut.ts`), the ⌘1-9 project jump (`lib/projectJump.ts`) and
  * the terminal's own behaviors. They are literal because the registry does not know them — but
  * they are still DERIVED from settings wherever the behavior is: the hover dwell prints
- * `settings.panHoverDelay`, and the drag rows follow `settings.canvasDragMode`, because the panel
+ * `settings.panHoverDelay` (or "Click" when `settings.terminalFocusFollowsPointer` is off, #757),
+ * and the drag rows follow `settings.canvasDragMode`, because the panel
  * used to claim a fixed 0.6 s and a right-drag pan that React Flow (`panOnDrag={[1]}` — middle
  * button only) has never done.
  *
@@ -44,6 +45,8 @@ import { isMacPlatform, keyLabel } from '@shared/platform-utils'
 import { isBrowserRuntime } from '../bridge/runtime'
 import { effectiveBindings } from '../lib/keybindingOverrides'
 import { useSettings } from '../state/settings'
+import { resolveFocusFollowsPointer } from '../lib/terminalFocusMode'
+import { IconClose } from './icons'
 
 export interface ShortcutsPanelProps {
   onClose: () => void
@@ -65,6 +68,7 @@ export interface ShortcutRow {
 export interface ShortcutSection {
   title: string
   rows: ShortcutRow[]
+  note?: string
 }
 
 export interface ShortcutSectionsOptions {
@@ -79,8 +83,13 @@ export interface ShortcutSectionsOptions {
   doubleClickFocus: boolean
   /** `settings.wheelZoom` — a plain wheel zooms too. */
   wheelZoom: boolean
+  /** `settings.terminalFocusFollowsPointer` (issue #757). Off = click to focus: no hover dwell
+   *  ever takes the keyboard, so the dwell row would advertise a gesture that does nothing. */
+  focusFollowsPointer: boolean
   /** Canonical effective binding strings for a command; `[]` when unbound or disabled. */
   bindingsFor: (id: CommandId) => readonly string[]
+  /** `settings.terminalFontZoomKeys` (issue #915). Optional: absent = off, the shipped default. */
+  terminalFontZoomKeys?: boolean
 }
 
 /** The section order IS the registry's group order (first appearance), so a new `CommandGroup`
@@ -125,6 +134,8 @@ function extraRows(group: CommandGroup, o: ShortcutSectionsOptions): ShortcutRow
             row(['Middle-drag'], 'Pan the canvas')
           ]),
       row(['Space', 'drag'], 'Pan the canvas (any drag mode)'),
+      // lib/modifierPan: deliberately ⌘ on mac and Ctrl elsewhere, so spelled per platform.
+      row([o.isMac ? '⌘' : 'Ctrl', 'middle-drag'], 'Pan the canvas, even while it is locked'),
       row(['⇧', 'click'], 'Add a node to the selection'),
       ...(o.doubleClickFocus
         ? [row(['Double-click'], 'Center & focus a node')]
@@ -145,20 +156,34 @@ function extraRows(group: CommandGroup, o: ShortcutSectionsOptions): ShortcutRow
 }
 
 /** Terminal facts the registry knows nothing about: tmux owns the mouse, xterm owns two remaps,
- *  and the hover guard owns the first ~half second. Each verified against the code that
+ *  and the hover guard owns the first ~half second (or, in click-to-focus mode, everything until
+ *  the first click). Each verified against the code that
  *  implements it (see CLAUDE.md "tmux owns the mouse" and terminal/terminal-config.ts). */
 function behaviorRows(o: ShortcutSectionsOptions): ShortcutRow[] {
   const seconds = Math.round(o.panHoverDelay / 100) / 10
   const forceSelect = o.isMac ? '⌥' : 'Shift'
+  // Click to focus (#757): the terminal takes the keyboard on a click and keeps it until you click
+  // elsewhere, so ANY drag over an unfocused terminal moves it — there is no "quick" window.
+  const enter = o.focusFollowsPointer ? [`Hover ${seconds}s`] : ['Click']
+  const move = o.focusFollowsPointer ? ['Quick drag'] : ['Drag']
   return [
-    row([`Hover ${seconds}s`], 'Enter the terminal (type / select)'),
-    row(['Quick drag'], 'Move the terminal (before it focuses)'),
+    row(enter, 'Enter the terminal (type / select)'),
+    row(move, 'Move the terminal (before it focuses)'),
     row(['Wheel'], "Scroll tmux's own history"),
     row(['Drag'], 'Select — copies to the system clipboard'),
     row([forceSelect, 'drag'], 'Select in the emulator (apps that grab the mouse)'),
     row(['⇧', 'Enter'], 'Insert a newline instead of submitting'),
     row(['⌘', 'click'], 'Open a link, file or folder from the output'),
-    row(['✦'], 'Name the terminal with AI')
+    row(['✦'], 'Name the terminal with AI'),
+    // Opt-in (issue #915), so only listed when on. Spelled per platform rather than with the
+    // panel's usual ⌘ glyph: this chord is deliberately ⌘ on mac and Ctrl elsewhere, never either
+    // (terminal-font-zoom.ts), and advertising ⌘ off-mac would name a key that does nothing.
+    ...(o.terminalFontZoomKeys
+      ? [
+          row([o.isMac ? '⌘' : 'Ctrl', '+ / −'], 'Terminal font size bigger / smaller'),
+          row([o.isMac ? '⌘' : 'Ctrl', '0'], 'Terminal font size back to the global size')
+        ]
+      : [])
   ]
 }
 
@@ -182,6 +207,20 @@ export function buildShortcutSections(o: ShortcutSectionsOptions): ShortcutSecti
     if (rows.length) sections.push({ title: group, rows })
   }
   sections.push({ title: 'Terminal behavior', rows: behaviorRows(o) })
+  // These are platform/program keys, not remappable nodeterm commands. A configured agent
+  // cannot prove the foreground program reads images from this viewer's clipboard (#712).
+  if (o.isMac) {
+    sections.push({
+      title: 'Pasting screenshots on macOS',
+      rows: [
+        row(['⌘', 'V'], 'Save the image and paste its file path'),
+        row(['Ctrl', 'V'], 'Send a control key to the foreground program')
+      ],
+      note: o.browser
+        ? 'In Server Edition, the image is uploaded to the terminal host. Ctrl+V does not transfer your browser clipboard to that host. Image paste depends on browser clipboard access.'
+        : 'A local agent that supports clipboard images (such as Claude Code) may attach an image with Ctrl+V. Use it only at that agent’s input prompt; shells and editors give this key other meanings. For SSH sessions, use Cmd+V to upload the image and paste its remote path. nodeterm does not detect image support or retry with the other route.'
+    })
+  }
   return sections
 }
 
@@ -197,6 +236,10 @@ export function ShortcutsPanel({ onClose, onCustomize }: ShortcutsPanelProps) {
   const dragMode = useSettings((s) => s.settings.canvasDragMode)
   const doubleClickFocus = useSettings((s) => s.settings.doubleClickFocus)
   const wheelZoom = useSettings((s) => s.settings.wheelZoom)
+  const terminalFontZoomKeys = useSettings((s) => s.settings.terminalFontZoomKeys)
+  const focusFollowsPointer = resolveFocusFollowsPointer(
+    useSettings((s) => s.settings.terminalFocusFollowsPointer)
+  )
   const isMac = isMacPlatform()
   const sections = buildShortcutSections({
     isMac,
@@ -205,6 +248,8 @@ export function ShortcutsPanel({ onClose, onCustomize }: ShortcutsPanelProps) {
     dragMode: dragMode === 'pan' ? 'pan' : 'select',
     doubleClickFocus,
     wheelZoom,
+    terminalFontZoomKeys,
+    focusFollowsPointer,
     bindingsFor: effectiveBindings
   })
 
@@ -221,8 +266,8 @@ export function ShortcutsPanel({ onClose, onCustomize }: ShortcutsPanelProps) {
       <div className="shortcuts" onClick={(e) => e.stopPropagation()}>
         <div className="shortcuts__head">
           <h2>Keyboard shortcuts</h2>
-          <button className="drawer__close" onClick={onClose}>
-            ×
+          <button className="drawer__close" aria-label="Close" onClick={onClose}>
+            <IconClose />
           </button>
         </div>
         <div className="shortcuts__body">
@@ -246,6 +291,7 @@ export function ShortcutsPanel({ onClose, onCustomize }: ShortcutsPanelProps) {
                   </span>
                 </div>
               ))}
+              {s.note && <p className="shortcuts__note">{s.note}</p>}
             </section>
           ))}
         </div>

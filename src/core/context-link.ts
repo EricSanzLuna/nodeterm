@@ -15,19 +15,18 @@
 // that already knows the difference. The link documents are also still written to
 // <userData>/context-links/ as a debugging aid.
 import fs from 'fs'
-import os from 'os'
 import path from 'path'
 import { platform } from './platform'
+import { syncWindowsShLauncher, writeManagedHookFileAtomic } from './agents/hooks/install-helper'
 import { IPC } from '../shared/ipc'
-import type { ContextLinkMap } from '../shared/types'
+import type { ContextLinkInfo, ContextLinkMap } from '../shared/types'
 import { type PtyManager } from './pty-manager'
+import { findInLoginPath } from './exec-path'
+import { isSafeOpencodeSessionId, runOpencodeExportAt } from './opencode-export'
 import { TMUX_SOCKET } from './tmux-naming'
 import {
   buildContextShimScript,
-  buildContextLinkSkillBody,
   buildLinkDoc,
-  buildLinkedContextInstructions,
-  mergeInstructionsBlock,
   resolveLinkTranscript,
   transcriptPathOf,
   type LinkDoc,
@@ -41,8 +40,14 @@ import {
   type ContextLinkVerb
 } from './context-link-render'
 import { hookServer } from './agents/hook-server'
-import { locateClaude, locateCodex, locateGemini, locateGrok } from './handoff/locate'
-import { opencodeConfigDir } from './agents/hooks/opencode'
+import {
+  locateAntigravity,
+  locateClaude,
+  locateCodex,
+  locateGemini,
+  locateGrok
+} from './handoff/locate'
+import { cursorTranscriptText, locateCursorChat } from './cursor-chat'
 
 export { setNodeTranscript } from './context-link-core'
 
@@ -54,59 +59,25 @@ export function contextLinkDir(): string {
 function cliShimPath(): string {
   return path.join(contextLinkDir(), 'context.sh')
 }
-function skillPath(): string {
-  return path.join(os.homedir(), '.claude', 'skills', 'get-linked-context', 'SKILL.md')
+/** The context-link shim the get-linked-context skill points at (written by `initContextLink`).
+ *  The skill itself is installed by the consent lifecycle (`core/agent-integrations.ts`). */
+export function contextLinkShimPath(): string {
+  return cliShimPath()
 }
 
 function writeCliFiles(): void {
   const d = contextLinkDir()
   fs.mkdirSync(d, { recursive: true })
-  fs.writeFileSync(cliShimPath(), buildContextShimScript(codexThreadIdentityRoot()))
-  try {
-    fs.chmodSync(cliShimPath(), 0o755)
-  } catch {
-    /* fail open */
-  }
+  // Temp + rename, never a truncating write: agents execute this file (see canvas-control.ts).
+  writeManagedHookFileAtomic(cliShimPath(), buildContextShimScript(codexThreadIdentityRoot()), undefined, 0o755)
+  // Windows: `context.cmd` beside it for PowerShell-run agents (see canvas-control.ts).
+  syncWindowsShLauncher(d, 'context.sh')
   // Sweep the retired Electron-as-Node CLI off upgraders' disks: the shim no longer execs it,
   // and it would sit there pointing at a binary path that moves with every app update.
   try {
     fs.rmSync(path.join(d, 'context-cli.mjs'), { force: true })
   } catch {
     /* fail open */
-  }
-}
-
-function installSkill(): void {
-  try {
-    fs.mkdirSync(path.dirname(skillPath()), { recursive: true })
-    fs.writeFileSync(skillPath(), buildContextLinkSkillBody(cliShimPath()), 'utf8')
-  } catch (e) {
-    console.warn('[context-link] skill install failed', e)
-  }
-}
-
-// Codex/Gemini/opencode have no skill system — merge an instructions block into their global
-// instruction files instead (marker-delimited, idempotent, other content preserved).
-function installAgentInstructions(): void {
-  const block = buildLinkedContextInstructions(cliShimPath())
-  const targets = [
-    path.join(os.homedir(), '.codex', 'AGENTS.md'),
-    path.join(os.homedir(), '.gemini', 'GEMINI.md'),
-    path.join(opencodeConfigDir(), 'AGENTS.md')
-  ]
-  for (const p of targets) {
-    try {
-      let existing = ''
-      try {
-        existing = fs.readFileSync(p, 'utf8')
-      } catch {
-        /* new file */
-      }
-      fs.mkdirSync(path.dirname(p), { recursive: true })
-      fs.writeFileSync(p, mergeInstructionsBlock(existing, block), 'utf8')
-    } catch (e) {
-      console.warn('[context-link] instructions install failed', p, e)
-    }
   }
 }
 
@@ -133,31 +104,50 @@ export interface ContextLinkDeps {
 // start mid-line, which only costs that one line (it fails to parse and is dropped).
 const REMOTE_TRANSCRIPT_MAX_BYTES = 2 * 1024 * 1024
 
-const LINK_LOCATORS = { claude: locateClaude, codex: locateCodex, gemini: locateGemini, grok: locateGrok }
+// cursor's locator takes (id, cwd?), NOT the shared (id, accountId?), wrapped so an account id can
+// never be read as a cwd. It locates strictly by the whole-UUID chat id.
+const LINK_LOCATORS = {
+  claude: locateClaude,
+  codex: locateCodex,
+  gemini: locateGemini,
+  grok: locateGrok,
+  antigravity: locateAntigravity,
+  cursor: (sessionId: string) => locateCursorChat(sessionId)
+}
+
+/** Agents whose "transcript path" is not a text file: the path names a store the agent's own reader
+ *  turns into transcript text. Everything else is read as utf-8. */
+const TRANSCRIPT_TEXT_READERS: Record<string, (p: string) => Promise<string | null>> = {
+  cursor: cursorTranscriptText
+}
 
 // The link documents, by node id — the same objects written to disk, kept in memory because they
 // are what authorizes a read (a node may only ever name a link inside ITS OWN document).
-const linkDocs = new Map<string, LinkDoc>()
+let linkDocs = new Map<string, LinkDoc>()
+let linkRevision = 0
+// Only paths resolved for this exact identity may survive an intermediate publication.
+// Include the hook path so a replaced/invalidated hook cannot reuse an older resolution.
+let verifiedPaths = new Map<string, string>()
+function transcriptIdentity(n: ContextLinkInfo): string {
+  return JSON.stringify([n.id, n.agentId, n.sessionId, n.accountId, n.cwd,
+    !!deps.isRemoteNode?.(n.id), transcriptPathOf(n.id)])
+}
 
 // Write one enriched link file per node id present in the map. Removed links should not
 // linger, so we clear stale per-node files first. Async fs throughout — this runs on edge
 // changes and scales with node/link count, and sync I/O here sits on the main event loop.
-async function writeLinkFiles(map: ContextLinkMap): Promise<void> {
+async function writeLinkFiles(map: ContextLinkMap, revision: number): Promise<void> {
+  if (revision !== linkRevision) return
   const d = contextLinkDir()
   const bin = pty?.getTmuxBin() ?? null
-  try {
-    for (const f of await fs.promises.readdir(d)) {
-      if (f.endsWith('.json')) await fs.promises.rm(path.join(d, f), { force: true })
-    }
-  } catch {
-    /* dir may not exist yet */
-  }
   // Resolve each linked node's transcript once (hook-fed for claude, locator-by-sessionId
   // for codex/gemini), so buildLinkDoc stays pure and sync.
   const resolved = new Map<string, string>()
+  const verified = new Map<string, string>()
   for (const links of Object.values(map)) {
     for (const n of links) {
       if (n.note != null || resolved.has(n.id)) continue
+      const identity = transcriptIdentity(n)
       resolved.set(
         n.id,
         await resolveLinkTranscript(n, {
@@ -166,16 +156,31 @@ async function writeLinkFiles(map: ContextLinkMap): Promise<void> {
           isRemote: deps.isRemoteNode
         })
       )
+      if (identity === transcriptIdentity(n)) verified.set(identity, resolved.get(n.id)!)
+      else resolved.set(n.id, '')
     }
   }
-  linkDocs.clear()
+  if (revision !== linkRevision) return
+  const docs = new Map<string, LinkDoc>()
   for (const [nodeId, links] of Object.entries(map)) {
     const doc = buildLinkDoc(nodeId, links, {
       transcriptOf: (id) => resolved.get(id) ?? '',
       tmuxBin: bin,
       tmuxSocket: TMUX_SOCKET
     })
-    linkDocs.set(nodeId, doc)
+    docs.set(nodeId, doc)
+  }
+  // Publish all enriched documents together; never expose a partially rebuilt map.
+  verifiedPaths = verified
+  linkDocs = docs
+  try {
+    for (const f of await fs.promises.readdir(d)) {
+      if (f.endsWith('.json')) await fs.promises.rm(path.join(d, f), { force: true })
+    }
+  } catch {
+    /* dir may not exist yet */
+  }
+  for (const [nodeId, doc] of docs) {
     try {
       await fs.promises.writeFile(path.join(d, `${nodeId}.json`), JSON.stringify(doc, null, 2))
     } catch (e) {
@@ -195,6 +200,8 @@ async function fetchTranscript(node: LinkDocEntry): Promise<string | null> {
       ? await deps.readRemoteFile(node.id, node.transcriptPath, REMOTE_TRANSCRIPT_MAX_BYTES)
       : null
   }
+  const read = node.agent ? TRANSCRIPT_TEXT_READERS[node.agent] : undefined
+  if (read) return read(node.transcriptPath)
   try {
     return await fs.promises.readFile(node.transcriptPath, 'utf-8')
   } catch {
@@ -202,23 +209,27 @@ async function fetchTranscript(node: LinkDocEntry): Promise<string | null> {
   }
 }
 
+// The id check and the export bounds live in `opencode-export.ts`, shared with the ⌘M chat view's
+// reader. Re-exported so this module's callers are unchanged.
+export { isSafeOpencodeSessionId } from './opencode-export'
+
+// With no timeout a wedged CLI holds the linked agent's read open for good.
+const OPENCODE_EXPORT_TIMEOUT_MS = 60_000
+
+export async function opencodeExportAt(bin: string, sessionId: string): Promise<string | null> {
+  const out = await runOpencodeExportAt(bin, sessionId, OPENCODE_EXPORT_TIMEOUT_MS)
+  return out.ok ? out.stdout : null
+}
+
 async function fetchOpencodeExport(node: LinkDocEntry): Promise<string | null> {
-  if (!node.sessionId) return null
+  if (!node.sessionId || !isSafeOpencodeSessionId(node.sessionId)) return null
   if (deps.isRemoteNode?.(node.id)) {
     return deps.runRemoteCommand
       ? await deps.runRemoteCommand(node.id, `opencode export ${shellQuote(node.sessionId)}`)
       : null
   }
-  try {
-    const { execFile } = await import('node:child_process')
-    return await new Promise<string | null>((resolve) => {
-      execFile('opencode', ['export', node.sessionId ?? ''], { encoding: 'utf-8' }, (err, stdout) =>
-        resolve(err ? null : stdout)
-      )
-    })
-  } catch {
-    return null
-  }
+  const bin = await findInLoginPath('opencode')
+  return bin ? opencodeExportAt(bin, node.sessionId) : null
 }
 
 /** Single-quote for a POSIX shell. The session id reaches a remote command line, and it is
@@ -275,35 +286,50 @@ let writeChain: Promise<void> = Promise.resolve()
  * (src/server/context-link.ts), which is why the map setter is a function and not only a handler.
  */
 export function setContextLinks(map: ContextLinkMap): Promise<void> {
-  writeChain = writeChain.then(() => writeLinkFiles(map && typeof map === 'object' ? map : {}))
+  const snapshot = structuredClone(map && typeof map === 'object' ? map : {})
+  const revision = ++linkRevision
+  // Authorization changes immediately, before transcript discovery or debug-file I/O. A slow
+  // locator must neither hide a new edge from list nor retain a removed read permission.
+  const retained = new Map<string, string>()
+  const paths = new Map<string, string>()
+  for (const links of Object.values(snapshot)) {
+    for (const n of links) {
+      if (n.note != null) continue
+      // Dependency lookup can fail; leave discovery to report the failure asynchronously.
+      try {
+        const identity = transcriptIdentity(n)
+        const prior = verifiedPaths.get(identity)
+        if (prior) { retained.set(identity, prior); paths.set(n.id, prior) }
+      } catch { /* no verified path */ }
+    }
+  }
+  verifiedPaths = retained
+  linkDocs = new Map(Object.entries(snapshot).map(([nodeId, links]) => [nodeId, buildLinkDoc(
+    nodeId, links, { transcriptOf: (id) => paths.get(id) ?? '', tmuxBin: pty?.getTmuxBin() ?? null, tmuxSocket: TMUX_SOCKET }
+  )]))
+  const write = () => writeLinkFiles(snapshot, revision)
+  writeChain = writeChain.then(write, write)
   return writeChain
 }
 
 /**
- * Boot Context Link: register the hook-server read handler, (re)write the shim under `dataDir`,
- * and — only when `options.installAgentIntegrations` says so — install the discovery surface into
- * the machine's REAL agent configuration directories (`~/.claude/skills/get-linked-context`, plus
- * the marker block in `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` and opencode's `AGENTS.md`).
+ * Boot Context Link: register the hook-server read handler and (re)write the shim under `dataDir`.
  *
- * `options` is REQUIRED and its flag is a plain `boolean`, deliberately: those instruction files
- * belong to the user and are loaded by every agent session on the machine, ours or not, so
- * writing them is a decision each caller owes an answer to (issue #490). The previous shape —
- * an optional options bag whose flag was read as `!== false` — meant the WRITE was what you got
- * by saying nothing, which is the wrong default direction for a filesystem effect outside our own
- * data dir, and it is exactly how a unit test that never thought about `HOME` came to rewrite the
- * developer's own `~/.codex/AGENTS.md` on every run. Same asymmetry as
- * `session-memory-service.ts`'s required `remote.isRemoteProject`: acting-without-knowing is a
- * compile error. `platformDeps` lost its default with it — every caller already passes one, and a
- * defaulted parameter in front of a required one is unreachable anyway.
+ * Nothing here writes outside our own data dir. The discovery surface (the `get-linked-context`
+ * skill in each consented agent's skills dir) is installed by the consent lifecycle
+ * (`core/agent-integrations.ts`, issue #744) — the one place that decides what nodeterm may write
+ * into user-owned agent configuration. `platformDeps` carries the shell's remote reach.
  */
-export function initContextLink(
-  ptyManager: PtyManager,
-  platformDeps: ContextLinkDeps,
-  options: { installAgentIntegrations: boolean }
-): void {
+export function initContextLink(ptyManager: PtyManager, platformDeps: ContextLinkDeps): void {
   pty = ptyManager
   deps = platformDeps
+  // Re-derive from the platform this init runs under: a process that boots a second core (the
+  // server e2e suites start several, each on its own dataDir) must not keep writing into the
+  // FIRST one's directory — which is how a test's removed dataDir came back, `context.sh` and all.
+  dir = ''
+  linkRevision++
   linkDocs.clear()
+  verifiedPaths.clear()
   hookServer.setContextLinkHandler(handleContextLinkRequest)
   try {
     const d = contextLinkDir()
@@ -312,14 +338,12 @@ export function initContextLink(
       if (f.endsWith('.json')) fs.rmSync(path.join(d, f), { force: true })
     }
     writeCliFiles()
-    if (options.installAgentIntegrations) {
-      installSkill()
-      installAgentInstructions()
-    }
   } catch (e) {
     console.error('[context-link] setup failed', e)
     return
   }
   platform().handle(IPC.contextLinkSetLinks, (map: ContextLinkMap) => setContextLinks(map))
-  platform().handle(IPC.contextLinkInfo, () => ({ shimPath: cliShimPath() }))
+  // `platform` is THIS core's: the renderer words the connect-time note for the machine whose shim
+  // it names (a Windows core's non-claude agents run the `.cmd` launcher), never the viewer's.
+  platform().handle(IPC.contextLinkInfo, () => ({ shimPath: cliShimPath(), platform: process.platform }))
 }

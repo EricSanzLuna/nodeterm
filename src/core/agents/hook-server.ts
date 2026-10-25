@@ -1,12 +1,32 @@
+import { REPORT_OUTCOME_CONTROL_REFUSAL } from '../../shared/station-outcome'
+import { sessionContextWindow } from '../model-window'
+import { labelHeldForRevision } from './permission-decision'
+import { createCursorApprovalWatch, type CursorApprovalWatch } from './cursor-approval'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'http'
 import { randomUUID, timingSafeEqual } from 'crypto'
-import { writeFileSync, mkdirSync, chmodSync, unlinkSync } from 'fs'
+import { readFileSync, mkdirSync, chmodSync, unlinkSync } from 'fs'
+import { assertHookEndpointAvailable, clearStaleHookSocket, HookSocketOwnedError } from './hook-socket-owner'
 import { homedir } from 'os'
 import path from 'path'
 import { platform } from '../platform'
+import { writeFileAtomic } from '../fs-atomic'
+import { parseEndpointEnv } from './hook-endpoint-parse'
 import { hookSockPath } from './hook-sock-path'
+import { browserRequestRefusal } from './hook-browser-guard'
 import { canControlCanvas, type AgentId } from '../../shared/agents/config'
 import { normalizeFor, type NormalizedAgentEvent } from '../../shared/agents/normalize'
+import {
+  createGrokPermissionGate,
+  defaultGrokPermissionGateDeps,
+  type GrokPermissionGate,
+  type GrokPermissionGateDeps
+} from './grok-permission-gate'
+import {
+  createCodexPermissionGate,
+  defaultCodexPermissionGateDeps,
+  type CodexPermissionGate,
+  type CodexPermissionGateDeps
+} from './codex-permission-gate'
 import { classifyClaudeConfigDir, configDirFromTranscriptPath } from '../claude-accounts-core'
 import { claudeAccountsSnapshot } from '../claude-config-dir'
 import type { CodexIdentityEvent, ObservedClaudeAccount } from '../../shared/types'
@@ -27,6 +47,22 @@ import {
   type IdentityDecision
 } from './node-identity-policy'
 import { posixQuote } from '../../shared/ssh'
+import { dryRunRequested } from '../../shared/control-verbs'
+import {
+  ControlRequestLedger,
+  REQUEST_ID_RETRYABLE,
+  REQUEST_ID_UNVERIFIED_NOTE,
+  controlCallFingerprint,
+  requestIdGate,
+  requestIdOutcomeMessage,
+  requestIdReplayLine,
+  requestIdRetryHint,
+  type LedgerClaim,
+  CONTROL_REQUEST_FACT,
+  type PersistedLedgerRow
+} from '../control-request-ledger'
+import { DurableFactFile } from '../durable-state'
+import { createPaneOriginGate, parseClaudeHookOrigin, type PaneOriginGate } from './claude-pane-origin'
 
 // v2 advertises NODETERM_NODE_TOKEN_DIR so clients read their per-node capability from a file
 // rather than receiving it in argv. Nothing consumes the posted version server-side, so the bump
@@ -38,10 +74,10 @@ const SLOWLORIS_MS = 2000
 // phase (a client that dribbles bytes to pin a socket), not for the handler. But it is replaced
 // with a HIGHER ceiling, never removed: a confirmation-gated control verb legitimately parks
 // while the renderer waits for the user's answer, yet nothing may park forever. The desktop shell
-// bounds a control request at 120s (`pendingControl` in src/main/index.ts) — a bound that lives
-// OUTSIDE core, so a future core-side handler with no bound of its own would inherit an unbounded
-// socket if this were `setTimeout(0)`. 130s sits comfortably above that, so in the desktop the
-// handler's own timeout always wins and this only ever fires as a backstop.
+// bounds a control request at 120s (`createControlForwarder`, src/main/control-forward.ts) — a
+// bound that lives OUTSIDE core, so a future core-side handler with no bound of its own would
+// inherit an unbounded socket if this were `setTimeout(0)`. 130s sits comfortably above that, so
+// in the desktop the handler's own timeout always wins and this only ever fires as a backstop.
 // Exported so a caller that parks on this socket can assert its own deadline sits under it by
 // RUNNING the comparison rather than by copying the number into a comment (the delivery receipt,
 // `agent-message.ts`, does exactly that).
@@ -95,15 +131,37 @@ function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
   ]).finally(() => clearTimeout(timer))
 }
 
-// Parses application/x-www-form-urlencoded bodies (what the managed script posts).
+const CP1252 = new TextDecoder('windows-1252')
+
+/**
+ * `decodeURIComponent`, except it never throws. On Windows the shims run under Git Bash but post
+ * through a NATIVE curl, which reads its argv in the ANSI code page: `--data-urlencode "arg.prompt=é"`
+ * goes out as `%E9`, not `%C3%A9`. `decodeURIComponent` rejects that with a URIError, which escaped
+ * the request handler and came back as an empty 204 — the shim exited 1 with no message, and every
+ * `open-claude --prompt` holding one accented letter failed silently. Bytes that are not UTF-8 are
+ * read as windows-1252, the code page that produced them; characters outside it were already lost
+ * to `?` by the argv conversion, before the request existed.
+ */
+function decodeFormComponent(s: string): string {
+  try {
+    return decodeURIComponent(s)
+  } catch {
+    const latin1 = s.replace(/%([0-9a-fA-F]{2})/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+    return CP1252.decode(Buffer.from(latin1, 'latin1'))
+  }
+}
+
+// Parses application/x-www-form-urlencoded bodies (what the managed script posts). Field names come
+// from the request, so they go into a Map and out through `Object.fromEntries`, which defines own
+// properties: a `__proto__` field is an ordinary key, never a prototype write.
 function parseForm(body: string): Record<string, string> {
-  const out: Record<string, string> = {}
+  const out = new Map<string, string>()
   for (const pair of body.split('&')) {
     const i = pair.indexOf('=')
     if (i < 0) continue
-    out[decodeURIComponent(pair.slice(0, i))] = decodeURIComponent(pair.slice(i + 1).replace(/\+/g, ' '))
+    out.set(decodeFormComponent(pair.slice(0, i)), decodeFormComponent(pair.slice(i + 1).replace(/\+/g, ' ')))
   }
-  return out
+  return Object.fromEntries(out)
 }
 
 /**
@@ -117,18 +175,26 @@ function parseForm(body: string): Record<string, string> {
 export function parseControlBody(
   raw: string,
   contentType: string
-): { nodeId: string; args: Record<string, string> } {
+): { nodeId: string; args: Record<string, string>; requestId?: string } {
   if (contentType.includes('application/x-www-form-urlencoded')) {
     const form = parseForm(raw)
-    const args: Record<string, string> = {}
-    for (const [k, v] of Object.entries(form)) {
-      if (k.startsWith('arg.') && k.length > 4) args[k.slice(4)] = v
-    }
-    return { nodeId: form.nodeId ?? '', args }
+    const args: Record<string, string> = Object.fromEntries(
+      Object.entries(form)
+        .filter(([k]) => k.startsWith('arg.') && k.length > 4)
+        .map(([k, v]) => [k.slice(4), v])
+    )
+    // `requestId` is the id the shim generates once per RUN (not the caller's `--request-id`,
+    // which arrives as `arg.request-id`): what lets the shim's own endpoint-walk re-post be
+    // recognised as the same call. See control-request-ledger.ts.
+    return { nodeId: form.nodeId ?? '', args, ...(form.requestId ? { requestId: form.requestId } : {}) }
   }
   try {
-    const parsed = JSON.parse(raw) as { nodeId?: string; args?: Record<string, string> }
-    return { nodeId: parsed.nodeId ?? '', args: parsed.args ?? {} }
+    const parsed = JSON.parse(raw) as { nodeId?: string; args?: Record<string, string>; requestId?: unknown }
+    return {
+      nodeId: parsed.nodeId ?? '',
+      args: parsed.args ?? {},
+      ...(typeof parsed.requestId === 'string' && parsed.requestId ? { requestId: parsed.requestId } : {})
+    }
   } catch {
     return { nodeId: '', args: {} }
   }
@@ -190,6 +256,8 @@ function observedClaudeAccount(
  * it. A later task makes the label useful; until then, false must cost a caller nothing.
  */
 export interface HookEventMeta {
+  /** undefined: old/unverified client; null: observed env has no valid override. */
+  contextWindow?: number | null
   verified: boolean
 }
 
@@ -216,6 +284,10 @@ export interface HookEventMeta {
  * `open-project`, and a grant recorded for an unverifiable caller would authorize whoever can
  * name that caller's node id. NEW verb, so fail-closed from day one strands nobody.
  *
+ * `settings` (@shared/settings-verb) joins for the same reason again: its `--set` raises a dialog
+ * that names the requesting node, and the user's click grants what the requester asked for — a
+ * requester nobody can verify is a requester the dialog would be lying about. NEW verb.
+ *
  * Consulted in the `/control/` route BEFORE `identityGate`'s decision is, so no future change to
  * the policy table can widen it; `messaging-verified-only.test.ts` drives the route on both sides
  * of every hatch and is the test that fails if either half of this comment stops being true.
@@ -225,7 +297,22 @@ export const requiresVerified: ReadonlySet<string> = new Set([
   'reply',
   'notify',
   'sticky',
-  'open-project'
+  'open-project',
+  'settings',
+  // Publishes text from this machine to a repository. `legacy` means "we cannot judge this
+  // caller", and an unjudgeable caller must never be the one that files.
+  'report-issue',
+  // Starts a process the user is not watching (#925).
+  'run',
+  // A station's own task outcome (@shared/station-outcome): a reported success RELEASES every
+  // dependent armed with `--after-success`, so the claim must come from the node it is about — and
+  // only a verified caller is provably that node.
+  'report-outcome',
+  // The board's GitHub lane (core/github/control-read.ts). The project read is resolved from the
+  // CALLER's node, so a caller nobody can verify could name any node and read another project's
+  // lane — bound sessions and dispatch state included. NEW verbs: fail-closed strands nobody.
+  'issues',
+  'prs'
 ])
 
 /**
@@ -243,15 +330,53 @@ export const STICKY_CONTROL_REFUSAL = 'Sticky write refused.'
  *  diagnosis, no token or restart advice — a designed refusal, not a rollout accident. */
 export const OPEN_PROJECT_CONTROL_REFUSAL = 'Project open refused.'
 
+/** Same posture for `settings`: a caller that cannot prove which node it is must not read this
+ *  machine's settings, and must never be the one a settings dialog names as the requester. */
+export const SETTINGS_CONTROL_REFUSAL = 'Settings access refused.'
+/** One sentence, names what was refused, no diagnosis — house style for every refusal here. */
+export const REPORT_ISSUE_CONTROL_REFUSAL = 'Issue reporting refused.'
+/** Same posture for `run` (#925): it starts a queued session the user is not watching, and the
+ *  refusal says only that the run was refused. */
+export const RUN_CONTROL_REFUSAL = 'Run refused.'
+/** Same posture for `report-outcome` (defined beside its grammar, @shared/station-outcome). */
+export { REPORT_OUTCOME_CONTROL_REFUSAL }
+
+/** The flat refusal for an unverified `issues` / `prs` read (core/github/control-read.ts). */
+export const GITHUB_READ_CONTROL_REFUSAL = 'GitHub lane read refused.'
+
+/**
+ * Issue #1088: appended to a verified-only refusal when THIS INSTANCE has no node-auth secret, so no
+ * session on the machine can ever be `verified`. The flat refusals deliberately carry no per-node
+ * diagnosis (advice to a prober), but this is not one: it is a fact about the instance that no
+ * caller can change, and leaving it out made the refusal permanent AND causeless — the reporter
+ * had only a `console.warn` in a log they could not see. It names no token and no restart, because
+ * neither helps; the cause is fixed on the machine, then NodeTerm is restarted.
+ */
+export function identityUnavailableNote(reason: string | null): string {
+  const why = reason ? ` (${reason.replace(/\s+/g, ' ').trim().slice(0, 200)})` : ''
+  return (
+    `Node identity is unavailable in this NodeTerm instance: it could not load its node-identity key at startup${why}, ` +
+    'so no session on this machine can be verified and restarting a node will not help. ' +
+    'Fix the cause and restart NodeTerm; details are in its log under [node-identity].'
+  )
+}
+
 /** The verified-only refusal, worded for the verb that was refused. */
 export function verifiedRefusalFor(verb: string): string {
+  if (verb === 'open-terminal') return 'Terminal command refused.'
+  if (verb === 'settings') return SETTINGS_CONTROL_REFUSAL
+  if (verb === 'report-issue') return REPORT_ISSUE_CONTROL_REFUSAL
   if (verb === 'sticky') return STICKY_CONTROL_REFUSAL
   if (verb === 'open-project') return OPEN_PROJECT_CONTROL_REFUSAL
+  if (verb === 'run') return RUN_CONTROL_REFUSAL
+  if (verb === 'report-outcome') return REPORT_OUTCOME_CONTROL_REFUSAL
+  if (verb === 'issues' || verb === 'prs') return GITHUB_READ_CONTROL_REFUSAL
   return MESSAGING_CONTROL_REFUSAL
 }
 
-class HookServer {
+export class HookServer {
   private server: Server | null = null
+  private starting: Promise<void> | null = null
   /**
    * The unix-domain twin of the loopback TCP listener (issue #367). Same HTTP handler, same
    * bearer + per-node token auth — the whole identity machinery is transport-agnostic (nothing
@@ -297,13 +422,30 @@ class HookServer {
         // claims a node ONLY when this is true — a `legacy`/warned caller opens a browser but owns
         // nothing, so it can drive nothing. `browser-ownership-source.test.ts` guards the source.
         verified: boolean
+        // Present only when the request CLAIMED a row in the request ledger. A handler that gives
+        // up before its effect is known (desktop main's 120s wait on the renderer) answers with
+        // `indeterminate: true` and may hand the real answer back here when it arrives: the
+        // ledger then replays it to a retry instead of refusing it as unknown.
+        onLateAnswer?: (reply: { ok: boolean; message?: string; result?: unknown; error?: string }) => void
       }) => Promise<{
         ok: boolean
         message?: string
         result?: unknown
         error?: string
+        // The handler could not tell whether its effect happened (see control-request-ledger.ts).
+        indeterminate?: boolean
+        // Set by the route, never a handler: the id an indeterminate call is filed under.
+        requestId?: string
       }>)
     | null = null
+  /**
+   * Retried control calls (`--request-id`, or the shim's per-run id). Durable: `start()` loads it
+   * from `<userData>/orchestration-state/control-requests.json` and every change is mirrored there,
+   * so a retry after an app restart is answered from the row instead of opening a second node (the
+   * header of control-request-ledger.ts states what a restart does to each row). `stop()` flushes.
+   */
+  private requestLedger = this.newRequestLedger()
+  private requestLedgerFile: DurableFactFile<PersistedLedgerRow> | null = null
   // Context-link reads. Same shape as the control handler, but it answers with TEXT (a rendered
   // transcript / summary / terminal capture) rather than acting on the canvas.
   private contextLinkHandler:
@@ -333,8 +475,15 @@ class HookServer {
       }) => Promise<void>)
     | null = null
   private codexIdentityListener: ((e: CodexIdentityEvent) => void) | null = null
+  private previousEndpointToken = ''
+
+  getPreviousEndpointToken(): string { return this.previousEndpointToken }
+
   private endpointPath = ''
+  private publishedEndpoint = ''
   private nodeAuthSecret: Buffer | null = null
+  /** Why the shell could not arm a secret, when it tried and failed (see `setNodeIdentityUnavailable`). */
+  private nodeIdentityUnavailableReason: string | null = null
   /**
    * `settings.hookIdentityStrict`, read LIVE (a getter, not a snapshot) so flipping it in Settings
    * takes effect on the next request rather than the next launch. `undefined` — the default, and
@@ -366,6 +515,72 @@ class HookServer {
 
   setListener(cb: (e: NormalizedAgentEvent) => void): void {
     this.listener = cb
+  }
+
+  /** Cursor's approval prompt has no hook, so a pending tool call earns up to three pane reads
+   *  (CURSOR_APPROVAL_READS_MS, core/agents/cursor-approval.ts). Both shells pass their pty manager's `captureSession`;
+   *  unset = cursor never shows NEEDS YOU, as before. The synthetic `blocked` rides `listener`. */
+  private cursorWatch: CursorApprovalWatch | null = null
+  setPaneReader(readPane: (nodeId: string) => Promise<string | null>): void {
+    this.cursorWatch = createCursorApprovalWatch({ readPane, emit: (e) => this.listener?.(e) })
+  }
+  /** A node was closed or recycled: its pending pane reads must not resurrect it as `blocked`. */
+  releaseCursorNode(nodeId: string): void {
+    this.cursorWatch?.release(nodeId)
+  }
+
+  private grokPermissionGate: GrokPermissionGate | null = null
+  private grokGateDeps: GrokPermissionGateDeps | undefined
+  /** Test seam: the grok permission gate's file/timer deps. */
+  setGrokPermissionGateDeps(deps: GrokPermissionGateDeps): void {
+    this.grokPermissionGate?.dispose()
+    this.grokPermissionGate = null
+    this.grokGateDeps = deps
+  }
+  private grokGate(): GrokPermissionGate {
+    if (!this.grokPermissionGate) {
+      this.grokPermissionGate = createGrokPermissionGate(
+        (e) => this.listener?.(e),
+        this.grokGateDeps ?? defaultGrokPermissionGateDeps()
+      )
+    }
+    return this.grokPermissionGate
+  }
+
+  private codexPermissionGate: CodexPermissionGate | null = null
+  private codexGateDeps: CodexPermissionGateDeps | undefined
+  /** Test seam: the codex permission gate's file/timer deps. */
+  setCodexPermissionGateDeps(deps: CodexPermissionGateDeps): void {
+    this.codexPermissionGate?.dispose()
+    this.codexPermissionGate = null
+    this.codexGateDeps = deps
+  }
+  private codexGate(): CodexPermissionGate {
+    if (!this.codexPermissionGate) {
+      this.codexPermissionGate = createCodexPermissionGate(
+        (e) => this.listener?.(e),
+        this.codexGateDeps ?? defaultCodexPermissionGateDeps()
+      )
+    }
+    return this.codexPermissionGate
+  }
+
+  /**
+   * Which claude may speak for a node (issues #1112, #1153 — claude-pane-origin.ts). Created
+   * eagerly: the "not the foreground of any terminal" half needs no shell at all, so a shell that
+   * never wires a resolver still drops a detached `claude -p`. The pane-tty half needs
+   * `setPaneTtyResolver`, which BOTH shells call (hook-verified-parity.test.ts pins it).
+   */
+  private readonly paneOrigin: PaneOriginGate = createPaneOriginGate()
+
+  /** The node's pane tty, read by each shell from its own PtyManager (`paneOwner(...).tty`). */
+  setPaneTtyResolver(fn: ((nodeId: string) => Promise<string | null>) | undefined): void {
+    this.paneOrigin.setPaneTtyResolver(fn)
+  }
+
+  /** Drop the cached pane tty of a node whose session ended or was recycled (new pane, new tty). */
+  forgetPaneOrigin(nodeId: string): void {
+    this.paneOrigin.forgetNode(nodeId)
   }
 
   // Raw payload listener: receives the parsed (un-normalized) hook JSON. Drives the
@@ -495,6 +710,17 @@ class HookServer {
   setNodeAuthSecret(secret: Uint8Array): void {
     if (secret.byteLength < 32) throw new Error('Invalid NodeTerm node-auth secret')
     this.nodeAuthSecret = Buffer.from(secret)
+    this.nodeIdentityUnavailableReason = null
+  }
+
+  /**
+   * The shell's boot-time arming FAILED (issue #1088). Recorded so a verified-only refusal can say
+   * the cause is the instance, not the node — see `identityUnavailableNote`. Both shells call it
+   * from the catch around their arming; a later successful `setNodeAuthSecret` supersedes it.
+   */
+  setNodeIdentityUnavailable(reason: unknown): void {
+    this.nodeIdentityUnavailableReason =
+      reason instanceof Error ? reason.message : typeof reason === 'string' ? reason : 'unknown error'
   }
 
   /** True once a valid secret is set; false before, and after a failed load (nothing was set). The
@@ -512,6 +738,7 @@ class HookServer {
   /** Test seam only: this server is a module singleton, so its secret otherwise leaks across tests. */
   clearNodeAuthSecretForTests(): void {
     this.nodeAuthSecret = null
+    this.nodeIdentityUnavailableReason = null
   }
 
   /**
@@ -530,8 +757,61 @@ class HookServer {
     this.identityNow = now
   }
 
+  /** Shell boot must continue even when optional hooks cannot safely take ownership. */
+  async startForApp(): Promise<string | null> {
+    try {
+      await this.start()
+      return null
+    } catch {
+      this.stop()
+      // Do not include raw errors: an invalid HTTP header may contain the bearer.
+      return `Agent hooks are disabled because their endpoint is occupied, malformed, or unavailable. ` +
+        `The application can still run, but agent status and canvas commands may be unavailable. ` +
+        `Close any other nodeterm instance using this data directory. If none is running, inspect ` +
+        `${this.endpointFilePath()} and its advertised listener; back up and remove a stale file, ` +
+        `then restart nodeterm. No other owner's endpoint was replaced.`
+    }
+  }
+
   async start(): Promise<void> {
+    if (this.starting) return this.starting
     if (this.server) return
+    this.starting = this.startOwnedEndpoint()
+    try {
+      await this.starting
+    } finally {
+      this.starting = null
+    }
+  }
+
+  private newRequestLedger(): ControlRequestLedger {
+    return new ControlRequestLedger({
+      inFlightStaleMs: CONTROL_CEILING_MS,
+      onChange: () => this.requestLedgerFile?.save(this.requestLedger.exportRows())
+    })
+  }
+
+  /** Load the durable request ledger for this data dir (start), replacing the in-memory one. */
+  private attachRequestLedgerFile(userDataDir: string): void {
+    this.requestLedgerFile?.dispose()
+    const file = new DurableFactFile(CONTROL_REQUEST_FACT, { userDataDir })
+    const ledger = this.newRequestLedger()
+    ledger.restore(file.load())
+    this.requestLedger = ledger
+    this.requestLedgerFile = file
+  }
+
+  private async startOwnedEndpoint(): Promise<void> {
+    await assertHookEndpointAvailable(this.endpointFilePath())
+    this.attachRequestLedgerFile(platform().userDataDir)
+    this.previousEndpointToken = ''
+    try {
+      const previous = parseEndpointEnv(readFileSync(this.endpointFilePath(), 'utf8'))
+      // Only our conventional local endpoint supplies upgrade proof, never a tunnel record.
+      if (previous.NODETERM_HOOK_SOCK === hookSockPath(platform().userDataDir)) {
+        this.previousEndpointToken = previous.NODETERM_HOOK_TOKEN ?? ''
+      }
+    } catch { /* a first run has no prior bearer */ }
     this.token = randomUUID()
     // ONE handler, shared verbatim by the TCP and the unix-socket listeners: every gate (bearer,
     // per-node verdict, verified-only verbs) runs identically on both transports.
@@ -543,9 +823,27 @@ class HookServer {
           res.end()
           return
         }
+        // Belt-and-braces BEFORE the bearer: a browser page (DNS rebinding included) is refused
+        // on the Origin / Host it cannot help sending, and learns nothing about the bearer — not
+        // even the 403-vs-421 distinction below. The bearer stays the real gate; every client we
+        // ship passes this unchanged (measured list in hook-browser-guard.ts).
+        const browserRefusal = browserRequestRefusal(req.headers)
+        if (browserRefusal) {
+          res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' })
+          res.end(`${browserRefusal}\n`)
+          return
+        }
         if (!this.tokenMatches(req.headers['x-nodeterm-hook-token'])) {
-          res.writeHead(403)
-          res.end()
+          if (!req.headers['x-nodeterm-hook-token']) {
+            res.writeHead(403)
+            res.end()
+            return
+          }
+          res.writeHead(421, { 'Content-Type': 'text/plain; charset=utf-8' })
+          res.end(
+            'hook-endpoint-wrong-owner: This endpoint does not own the presented bearer. ' +
+            'Retry after endpoint discovery; this is not an unsupported capability.\n'
+          )
           return
         }
         req.setTimeout(SLOWLORIS_MS, () => req.destroy())
@@ -574,10 +872,11 @@ class HookServer {
         }
         if (reqUrl.pathname.startsWith('/control/')) {
           const verb = decodeURIComponent(reqUrl.pathname.replace(/^\/control\//, ''))
-          const { nodeId, args } = parseControlBody(
-            await readBody(req),
-            String(req.headers['content-type'] ?? '')
-          )
+          const {
+            nodeId,
+            args: rawArgs,
+            requestId: cliRequestId
+          } = parseControlBody(await readBody(req), String(req.headers['content-type'] ?? ''))
           // Body fully received: hand the socket from the receive-phase guard to the much larger
           // handler ceiling. A destructive control verb parks here for as long as the user takes
           // to answer the confirmation dialog, and the 2s guard used to destroy the socket mid-
@@ -585,6 +884,11 @@ class HookServer {
           // late confirm still delivered, so the agent was told nothing happened when it had.
           req.setTimeout(CONTROL_CEILING_MS, () => req.destroy())
           const wantsText = String(req.headers.accept ?? '').includes('text/plain')
+          // The request id is not an argument of any verb: take it out here, once, so no handler
+          // (and no parser that refuses flags it does not know) ever meets it. A bad EXPLICIT id is
+          // refused below, after identity — the order every other refusal on this route keeps.
+          const idGate = requestIdGate(verb, rawArgs, cliRequestId)
+          const args = idGate.kind === 'pass' ? idGate.args : rawArgs
           // IDENTITY, and it runs BEFORE the handler: the promise of a refusal is that nothing
           // happened, and a check after the handler is a check that happened too late.
           const { verdict, decision } = this.identityGate(
@@ -600,8 +904,14 @@ class HookServer {
           // VERIFIED-ONLY VERBS, decided on the VERDICT and never on the decision: the policy's
           // `decision` is what the escape hatch and the warning window can reach, and neither may
           // reach these. See `requiresVerified` for the whole argument.
-          if (requiresVerified.has(verb) && verdict !== 'verified') {
-            const refusal = verifiedRefusalFor(verb)
+          // Issue #653: command execution requires proof even when rollout policy allows
+          // legacy callers. Presence (including empty --cmd and dry runs) decides this;
+          // plain terminals keep their existing policy. Both shells and transports use this gate.
+          const commandOpen = verb === 'open-terminal' && args.cmd !== undefined
+          if ((requiresVerified.has(verb) || commandOpen) && verdict !== 'verified') {
+            const refusal = this.identityAvailable()
+              ? verifiedRefusalFor(verb)
+              : `${verifiedRefusalFor(verb)} ${identityUnavailableNote(this.nodeIdentityUnavailableReason)}`
             if (wantsText) {
               res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' })
               res.end(`${refusal}\n`)
@@ -634,12 +944,93 @@ class HookServer {
             }
             return
           }
-          const result = this.controlHandler
-            ? await this.controlHandler({ verb, nodeId, args, verified: verdict === 'verified' })
-            : { ok: false, error: 'control unavailable' }
+          if (idGate.kind === 'refuse') {
+            const refusal = requestIdOutcomeMessage(idGate.outcome, { verb })
+            this.writeControlReply(res, wantsText, 400, { ok: false, error: idGate.outcome, message: refusal })
+            return
+          }
+          // RETRIED CALLS. Claimed HERE, before the handler, because from this instant the truthful
+          // answer to "did it happen?" is "it may have" — and here is the one place both shells'
+          // handlers pass. Keyed by the VERIFIED caller only: an unverified caller's id would share
+          // a bucket with anyone claiming its node id, so it gets no dedupe at all (and is told, when
+          // it asked for one). A dry run creates nothing, so it neither claims nor answers from a row.
+          let claim: LedgerClaim | undefined
+          let idNote = ''
+          if (idGate.requestId && !dryRunRequested(args)) {
+            if (verdict === 'verified') {
+              const decided = this.requestLedger.begin(
+                nodeId,
+                idGate.requestId,
+                controlCallFingerprint(verb, args)
+              )
+              if (decided.kind === 'replay') {
+                const stored = decided.reply
+                const lead = requestIdReplayLine(idGate.requestId, Date.now() - decided.firstRunAt)
+                if (wantsText) {
+                  const text = stored.ok
+                    ? stored.message ?? JSON.stringify(stored.result ?? {})
+                    : stored.message ?? stored.error ?? 'control request failed'
+                  res.writeHead(stored.ok ? 200 : 400, { 'content-type': 'text/plain; charset=utf-8' })
+                  res.end(`${lead}\n${text}\n`)
+                } else {
+                  res.writeHead(stored.ok ? 200 : 400, { 'content-type': 'application/json' })
+                  res.end(JSON.stringify({ ...stored, replayed: true, requestId: idGate.requestId }))
+                }
+                return
+              }
+              if (decided.kind === 'refuse') {
+                const refusal = requestIdOutcomeMessage(decided.outcome, {
+                  verb,
+                  requestId: idGate.requestId,
+                  ageMs: Date.now() - decided.firstRunAt
+                })
+                this.writeControlReply(res, wantsText, 409, {
+                  ok: false,
+                  error: decided.outcome,
+                  message: refusal,
+                  retryable: REQUEST_ID_RETRYABLE[decided.outcome]
+                })
+                return
+              }
+              claim = decided.claim
+            } else if (idGate.explicit) {
+              idNote = REQUEST_ID_UNVERIFIED_NOTE
+            }
+          }
+          const held = claim
+          let result: Awaited<ReturnType<NonNullable<HookServer['controlHandler']>>>
+          try {
+            result = this.controlHandler
+              ? await this.controlHandler({
+                  verb,
+                  nodeId,
+                  args,
+                  verified: verdict === 'verified',
+                  ...(held ? { onLateAnswer: (late) => held.settleLate(late) } : {})
+                })
+              : { ok: false, error: 'control unavailable' }
+          } catch (e) {
+            // Nobody can say what a handler that threw got done: the id stays unknown, and its retry
+            // is refused rather than run a second time.
+            held?.settleUnknown()
+            throw e
+          }
+          held?.settle(result)
+          // A call that may still complete names the id it is filed under, and how to pass it back:
+          // for the shim's per-run id this is the only place the caller ever sees it.
+          if (held && idGate.requestId && result.indeterminate) {
+            const hint = requestIdRetryHint(idGate.requestId)
+            result = {
+              ...result,
+              message: `${result.message ?? result.error ?? 'control request failed'}\n${hint}`,
+              requestId: idGate.requestId
+            }
+          }
           // Which note, not whether: an unmintable node warned with the restart line is sent round
           // the same loop the refusal path already knows better than to send it round.
-          const note = decision === 'allow-with-warning' ? this.identityWarningNote(nodeId) : ''
+          const note = [decision === 'allow-with-warning' ? this.identityWarningNote(nodeId) : '', idNote]
+            .filter(Boolean)
+            .join('\n')
           // The POSIX-sh shim asks for text/plain: it has no JSON parser, so the server does the
           // rendering the Node CLI used to do client-side. Everything else keeps the JSON shape.
           if (wantsText) {
@@ -753,9 +1144,39 @@ class HookServer {
           // so the normalizer sees it and maps it to a synthetic working transition. See
           // docs/hook-reply-approvals.md.
           if (form.nodeterm_answered) payload.nodeterm_answered = form.nodeterm_answered
+          // The EVENT NAME, for an agent whose hook payload does not carry one. Antigravity (`agy`)
+          // sends five events with no name in any of them, and two of them (Pre/PostInvocation) have
+          // identical keys, so the managed command exports the name and the script sends it as this
+          // field. Assigned AFTER JSON.parse, so the form wins over a value planted in the agent's
+          // JSON. Deliberately NOT `hook_event_name`: that is a real payload field for claude, codex,
+          // gemini and copilot, and a name of our own cannot collide with any of them. The value is
+          // only ever compared against a closed set (normalizeAntigravity), never interpolated.
+          // Antigravity only: no other normalizer reads it, and for antigravity the form is the ONE
+          // source — an empty field DELETES a value planted in the JSON rather than letting it stand.
+          if (agentId === 'antigravity') {
+            if (form.nodeterm_hook_event) payload.nodeterm_hook_event = form.nodeterm_hook_event
+            else delete payload.nodeterm_hook_event
+          }
+          // A claude event from a process that merely INHERITED this node's id — a detached
+          // `claude -p`, Claude's own daemon hosting a fork — is not the node's, and must reach
+          // NEITHER listener: the raw one rebinds the node's session, meter and context-link
+          // transcript, the normalized one the mirror's session id, title and badge (#1112,
+          // #1153). Decided per node in arrival order; see claude-pane-origin.ts for the rule and
+          // the measurement behind it. Every claude event goes through the gate, with or without
+          // an origin, so an event waiting for a pane read is never overtaken by the next one.
+          if (agentId === 'claude' && !(await this.paneOrigin.admit(nodeId, parseClaudeHookOrigin(form)))) {
+            res.writeHead(204)
+            res.end()
+            return
+          }
           // Raw listener first: it drives the transcript-tailing features (which need
           // transcript_path). Inside the try so a throwing raw listener still ends 204.
-          this.rawListener?.(agentId, nodeId, payload, { verified })
+          this.rawListener?.(agentId, nodeId, payload, {
+            verified,
+            ...(verified && agentId === 'claude' && form.nodeterm_context_window !== undefined
+              ? { contextWindow: sessionContextWindow(form.nodeterm_context_window) }
+              : {})
+          })
           // WHICH CLAUDE ACCOUNT this session is on. A third LABEL alongside
           // `verified`/`clientRevision`, computed HERE so ONE implementation serves both shells —
           // the "both raw listeners change together" rule is sidestepped rather than violated,
@@ -763,9 +1184,24 @@ class HookServer {
           // dir for claude alone (codex rollouts and gemini chats live in unrelated trees, and
           // those agents have their own identity spine).
           const account = observedClaudeAccount(agentId, payload)
-          const normalized = normalizeFor(agentId, { nodeId, agentId, payload })
-          if (normalized && this.listener)
-            this.listener({ ...normalized, verified, clientRevision, ...(account ? { account } : {}) })
+          // A held request keeps its `held` ticket only when the posting script can honor a
+          // structured answer (core/agents/permission-decision.ts, MIN_STRUCTURED_ANSWER_REVISION).
+          const raw = normalizeFor(agentId, { nodeId, agentId, payload })
+          const normalized = raw ? labelHeldForRevision(raw, clientRevision) : raw
+          const labelled = normalized
+            ? { ...normalized, verified, clientRevision, ...(account ? { account } : {}) }
+            : null
+          // Grok's permission prompt is confirmed against grok's own event log before it is
+          // published, and cleared from it once answered (core/agents/grok-permission-gate.ts).
+          // Every grok event goes through the gate so their order is kept per node.
+          if (agentId === 'grok') this.grokGate().handle(nodeId, payload, labelled)
+          // Codex's PermissionRequest is checked against the session rollout: under codex's own
+          // auto-reviewer nobody is asked, so it must not read as NEEDS YOU (issue #1171,
+          // core/agents/codex-permission-gate.ts). Every codex event goes through the gate so their
+          // order is kept per node.
+          else if (agentId === 'codex') this.codexGate().handle(nodeId, payload, labelled)
+          else if (labelled && this.listener) this.listener(labelled)
+          if (agentId === 'cursor') this.cursorWatch?.observe(nodeId, payload, verified)
         }
         res.writeHead(204)
         res.end()
@@ -782,8 +1218,8 @@ class HookServer {
         // before the bind, so leaving it set makes every later start() a silent early-return with
         // port 0 — while a previous run's endpoint file keeps advertising a dead port to every
         // tmux session on the machine. Reset to the clean never-started state so start() can be
-        // retried without restarting the app, and drop the stale advertisement (the file reflects
-        // listener liveness; a client that still holds the path fails over — see the sh shims).
+        // retried without restarting the app. Only an advertisement this run actually published
+        // may be removed; a file found on disk can belong to a different live instance.
         this.server?.close()
         this.server = null
         this.port = 0
@@ -802,13 +1238,21 @@ class HookServer {
       this.server!.listen(0, '127.0.0.1', onOk)
     })
     // Second leg, then ONE endpoint write that advertises whatever actually came up. A failed
-    // socket bind must not cost the TCP endpoint file (or the boot).
-    await this.startUnixListener(handler)
-    this.writeEndpointFile()
+    // unavailable transport can fall back to TCP, but a different owner must refuse the boot.
+    try {
+      await this.startUnixListener(handler)
+    } catch (e) {
+      this.server?.close()
+      this.server = null
+      this.port = 0
+      this.token = ''
+      throw e // Never publish over the listener whose ownership check refused this boot.
+    }
+    await this.writeEndpointFile()
   }
 
-  /** Bind the unix-socket twin (see `unixServer`). Never throws — a socket that cannot bind is
-   *  simply not advertised, and everything keeps running on loopback TCP. */
+  /** Bind the Unix twin. Transport unavailability can degrade to TCP; ownership conflicts throw
+   *  so a second instance cannot replace the first instance's endpoint advertisement. */
   private async startUnixListener(
     handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>
   ): Promise<void> {
@@ -823,15 +1267,8 @@ class HookServer {
       // mode is what actually keeps other local users off the socket (the file chmod below only
       // lands after listen, and the socket is world-connectable for that instant otherwise).
       chmodSync(dir, 0o700)
-      // A stale socket file BLOCKS bind with EADDRINUSE even when nothing is listening — the
-      // StreamLocalBindUnlink lesson from the SSH reverse tunnels. Unlink-then-bind is safe here:
-      // the path is ours alone (0700 dir, digest-keyed fallback), so anything at it is our own
-      // leftover from a crash.
-      try {
-        unlinkSync(p)
-      } catch {
-        /* nothing stale to clear */
-      }
+      // A filesystem path is not proof of ownership: another live instance may hold it.
+      await clearStaleHookSocket(p)
       const srv = createServer(handler)
       await new Promise<void>((resolve, reject) => {
         const onErr = (e: Error): void => {
@@ -851,6 +1288,7 @@ class HookServer {
       this.unixServer = srv
       this.sockPath = p
     } catch (e) {
+      if (e instanceof HookSocketOwnedError || (e as NodeJS.ErrnoException).code === 'EADDRINUSE') throw e
       console.warn('[agent-hooks] unix hook socket unavailable, staying TCP-only', e)
       this.unixServer = null
       this.sockPath = ''
@@ -879,6 +1317,26 @@ class HookServer {
    */
   private nodeTokenVerified(nodeId: string, provided: string | string[] | undefined): boolean {
     return verifyNodeToken(this.nodeAuthSecretOrNull(), nodeId, provided) === 'verified'
+  }
+
+  /**
+   * One control reply in either dialect, for the route's own answers (the request-id outcomes):
+   * the sentence for the POSIX-sh shim, which prints one line and has no JSON parser; the whole
+   * object for a structured client, which keys on `error`.
+   */
+  private writeControlReply(
+    res: ServerResponse,
+    wantsText: boolean,
+    status: number,
+    body: { ok: false; error: string; message: string; retryable?: boolean }
+  ): void {
+    if (wantsText) {
+      res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' })
+      res.end(`${body.message}\n`)
+      return
+    }
+    res.writeHead(status, { 'content-type': 'application/json' })
+    res.end(JSON.stringify(body))
   }
 
   /**
@@ -1082,12 +1540,11 @@ class HookServer {
 
   // The managed script sources this file at invocation to get the LIVE port/token.
   // tmux sessions outlive the app, so env-baked coords go stale after a restart.
-  private writeEndpointFile(): void {
+  private async writeEndpointFile(): Promise<void> {
     try {
       const p = this.endpointFilePath()
       mkdirSync(path.dirname(p), { recursive: true })
-      writeFileSync(
-        p,
+      const contents =
         // Every value is `posixQuote`d: the managed script SOURCES this file (`. "$file"`) under
         // /bin/sh, so an unquoted space or shell metachar in a path or token would break the source
         // (issue #351: macOS userDataDir lives under "Application Support" — the space made sh try
@@ -1106,11 +1563,15 @@ class HookServer {
           // `[ -n "$NODETERM_HOOK_SOCK" ]` — so advertising it moves local hook traffic off the
           // TCP port; the PORT line stays above for sessions holding a pre-socket script. Quoted
           // like every other value (#351/#358): macOS data dirs carry a space.
-          (this.sockPath ? `NODETERM_HOOK_SOCK=${posixQuote(this.sockPath)}\n` : ''),
+          (this.sockPath ? `NODETERM_HOOK_SOCK=${posixQuote(this.sockPath)}\n` : '')
+      await writeFileAtomic(
+        p,
+        contents,
         // 0o600: this file holds the bearer token — owner read/write only so another local user
         // can't read it and forge hook events.
-        { encoding: 'utf8', mode: 0o600 }
+        { mode: 0o600 }
       )
+      this.publishedEndpoint = contents
     } catch (e) {
       console.warn('[agent-hooks] could not write endpoint file', e)
     }
@@ -1125,7 +1586,10 @@ class HookServer {
    */
   private removeEndpointFile(): void {
     try {
+      // A failed/unstarted instance must not erase another run's advertisement.
+      if (!this.publishedEndpoint || readFileSync(this.endpointFilePath(), 'utf8') !== this.publishedEndpoint) return
       unlinkSync(this.endpointFilePath())
+      this.publishedEndpoint = ''
     } catch {
       /* nothing to remove — or no booted platform to name the path (tests); both are fine */
     }
@@ -1172,6 +1636,13 @@ class HookServer {
   }
 
   stop(): void {
+    // Write what the ledger learned before the process can go: an awaited write races exit.
+    this.requestLedgerFile?.dispose()
+    this.requestLedgerFile = null
+    this.grokPermissionGate?.dispose()
+    this.grokPermissionGate = null
+    this.codexPermissionGate?.dispose()
+    this.codexPermissionGate = null
     this.server?.close()
     this.server = null
     // The file must not advertise a listener that no longer exists (issue #445): a stopped server
@@ -1181,7 +1652,7 @@ class HookServer {
     this.unixServer?.close()
     this.unixServer = null
     // Unlink so the NEXT bind is clean even if close() lost the race with process exit; the
-    // startup unlink above is still the backstop for a crash that skipped this entirely.
+    // startup probe can reclaim a confirmed stale socket after a crash.
     if (this.sockPath) {
       try {
         unlinkSync(this.sockPath)
@@ -1192,6 +1663,11 @@ class HookServer {
     }
     this.port = 0
     this.token = ''
+    // Forget the memoized path only now, after removeEndpointFile() used it: the next start()
+    // re-derives it from the platform it runs under. A process that boots a second core (the
+    // server e2e suites do, each on its own dataDir) otherwise advertised into the FIRST core's
+    // directory — recreating a dataDir its test had already removed.
+    this.endpointPath = ''
   }
 }
 

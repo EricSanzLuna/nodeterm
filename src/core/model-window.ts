@@ -1,4 +1,12 @@
-// Resolves a Claude model id → its context window (max input tokens).
+/** A hook reports only this session's effective env, never nodeterm's global environment.
+ * Decimal safe integers only: reject partial parses, exponents, infinities and zero. */
+export function sessionContextWindow(value: unknown): number | null {
+  if (typeof value !== 'string' || !/^[0-9]{1,16}$/.test(value)) return null
+  const window = Number(value)
+  return Number.isSafeInteger(window) && window > 0 ? window : null
+}
+
+// Legacy Claude model-family ESTIMATES only; session env takes precedence in both tails.
 //
 // Empirically (verified via `/context` on this machine) Claude Code runs opus/sonnet/fable
 // sessions in a 1M window — the model id in the transcript stays bare ("claude-opus-4-8")
@@ -63,9 +71,21 @@ export function geminiWindowFor(model: string | null): number | null {
 }
 
 /**
- * Kept only for call-site compatibility with context-tail.ts. Window resolution is fully
- * synchronous via cachedWindowFor/staticWindowFor, so there is nothing to resolve — no-op.
+ * Context window for an Antigravity (`agy`) model id or display name (`modelName` in hook payloads
+ * or `Model Selection` in `USER_INPUT` steps).
+ *
+ * MEASURED catalogue (`agy models`, 1.2.7):
+ * - `gemini-4-argon-*`, `gemini-3.8-flash-*` ("Gemini 4 Argon ...", "Gemini 3.8 Flash ...") → 1M
+ * - `claude-opus-*`, `claude-sonnet-*` ("Claude Opus ...", "Claude Sonnet ...") → `staticWindowFor`
+ * - `gpt-oss-120b-*` ("GPT-OSS 120B ...") → 128k
+ * - Unknown or empty → `null` (never guess a denominator).
  */
-export async function resolveModelWindow(_model: string | null): Promise<void> {
-  // intentional no-op
+export function antigravityWindowFor(model: string | null | undefined): number | null {
+  const m = model?.trim()
+  if (!m) return null
+  if (/^gemini\b|^gemini-/i.test(m)) return LARGE_WINDOW
+  if (/^claude\b|^claude-/i.test(m)) return staticWindowFor(m)
+  if (/^gpt-oss-120b\b|^gpt-oss-120b-/i.test(m)) return 128_000
+  return null
 }
+

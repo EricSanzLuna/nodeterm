@@ -35,15 +35,6 @@ describe('where readiness is published (source pins)', () => {
     expect(src).toContain('setSessionReady(id, !!parked)')
   })
 
-  it('a fresh session is published through the SAME shell settle the initialCommand writer uses', () => {
-    // Both write an agent CLI command line into the pane. A line delivered across zsh's rc-file
-    // tty flush comes out mangled, which is exactly what `whenShellSettled` exists to avoid — so
-    // the armed launch must not be released on a bare create-resolve.
-    expect(src).toContain('whenShellSettled(() => setSessionReady(id, true))')
-    expect(src).toContain('const writeWhenShellReady = (cmd: string): void => {')
-    expect(src).toMatch(/whenShellSettled\(\(\) => \{[\s\S]{0,400}?deliverCommand\(/)
-  })
-
   it('only a REAL teardown clears it — a park keeps the session typeable by name', () => {
     // The park branch returns before this line; a parked tmux session is still addressable by
     // `sendText`, so clearing there would strand a launch that could have been delivered.
@@ -77,13 +68,27 @@ describe('an offscreen release keeps a tmux-backed session READY (source pins)',
 
 describe('an ARMED node does not cold-start its agent under the hold (source pins)', () => {
   it('the cold-restore relaunch is gated on there being no pendingLaunch', () => {
-    // A first open is `fresh` by definition, so without this every `--after` / `verify` node
+    // A first open is a cold start by definition, so without this every `--after` / `verify` node
     // launched a bare CLI on mount — and Canvas's held launch then arrived as TEXT typed into
     // the session the hold existed to prevent.
-    // Matched inside the condition rather than as one literal line: the branch also carries the
-    // `paused` gate (shouldColdResume), and the two guards are independent refusals that must
-    // both survive a reformat.
-    expect(src).toMatch(/fresh &&\s*\n?\s*agentId &&\s*\n?\s*canResume\(agentId\) &&\s*\n?\s*!data\.pendingLaunch/)
+    //
+    // The four refusals now live in ONE predicate (`canColdRestore`) because the late cold-start
+    // check asks the same question before spending two probe round trips — so this pins the
+    // predicate's contents rather than the branch's old inline shape. `!data.pendingLaunch` and
+    // `shouldColdResume` are independent refusals and must both survive a reformat.
+    expect(src).toMatch(
+      /const canColdRestore =\s*\n?\s*session\.source !== 'relay' && !!agentId && canResume\(agentId\) && !data\.pendingLaunch && shouldColdResume\(pausedNow\)/
+    )
+    // …and the relaunch branch is the one that reads it.
+    expect(src).toContain('} else if (coldStart && canColdRestore) {')
+  })
+
+  it('the LATE cold-start check refuses the same node an armed hold would', () => {
+    // Same reason, one layer earlier: an armed node must not even pay the probe, and it must
+    // certainly not be handed a relaunch behind the hold's back.
+    expect(src).toMatch(
+      /if \(!fresh && freshUnverified && !data\.initialCommand && canColdRestore\) \{/
+    )
   })
 })
 
@@ -92,20 +97,28 @@ describe('the QUEUED badge carries the delivery state (source pins)', () => {
     expect(src).toContain("useLaunchDelivery((s) => s.byId[id])")
     expect(src).toContain('term-node__status--queued-warn')
     // `pendingErroredOn` is the fourth argument since #521 — an errored upstream is idle, so
-    // without it the tooltip would promise a wait that never ends.
+    // without it the tooltip would promise a wait that never ends. The relay flag also
+    // keeps unsupported queued delivery from promising a working Run now action, and the last
+    // arguments name an `--after-pr` wait and an `--after-success` wait (with their deadlines)
+    // beside the stations.
     expect(src).toContain(
-      'launchTooltip(launchDelivery, pendingWaitingOn, pendingLaunch.command, pendingErroredOn)'
+      "launchTooltip(launchDelivery, pendingWaitingOn, pendingLaunch.command, pendingErroredOn, session.source === 'relay', prTooltip, successTooltip, pendingInterruptedOn, pendingHandedOverOn)"
     )
   })
 
-  it('the manual ▶ disarms only on a delivery that landed', () => {
-    // Dropping `pendingLaunch` unconditionally threw the command away whenever the session was
-    // not up — precisely the state a user reaches for this button in.
+  it('a background start reads STARTING, without the warning, and disables ▶ (#925)', () => {
+    // Core is typing the launch into this pane; a ▶ click would splice a second copy into it.
+    expect(src).toContain("const startingNow = launchDelivery?.kind === 'starting'")
     expect(src).toMatch(
-      /pty\.sendText\(id, pendingLaunch\.command\)\.then\(\(ok\) => \{[\s\S]{0,600}?if \(ok\)[\s\S]{0,300}?pendingLaunch: undefined/
+      /\(launchDelivery \|\| prExpired \|\| successExpired \|\| successBlocked\) && !startingNow\s*\?\s*' term-node__status--queued-warn'/
     )
-    expect(src).toMatch(/else \{[\s\S]{0,200}?markFailed\(id, 1\)/)
+    // STARTING wins over every warning; a blocked success wait is a warning of its own.
+    expect(src).toMatch(
+      /\{startingNow\s*\?\s*'STARTING'\s*:\s*launchDelivery\s*\?\s*'⚠ QUEUED'\s*:\s*prExpired \|\| successExpired\s*\?\s*'⚠ EXPIRED'\s*:\s*successBlocked\s*\?\s*'⚠ BLOCKED'\s*:\s*'QUEUED'\}/
+    )
+    expect(src).toContain("disabled={session.source === 'relay' || startingNow}")
   })
+
 })
 
 describe('the eye button hides cards AND connections (source pins)', () => {

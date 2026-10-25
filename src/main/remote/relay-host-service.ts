@@ -15,14 +15,16 @@
 //   - `onPeerPending` (the E2EE handshake completed, the SAS is known) → send `relay:host:peer-pending`
 //     to the renderer and WAIT. The peer is NOT a client yet: connectRelayHost registers no sink and
 //     joins no presence until its trust gate's `onOpen` fires (BOTH humans confirmed the same SAS).
-//   - the human's `relay:host:confirm` → `session.confirm()` (the ONLY local-confirm call site).
+//   - the human's `relay:host:confirm` → `session.confirm()` (this file's only local-confirm call
+//     site; src/core/relay/relay-trust.ts lists every one).
 //   - `onOpen` (mutual) → `relay:host:open`; `onClose` (socket gone) → `relay:host:closed`.
 // This module never dispatches peer traffic, never registers a sink, never touches a handler — it
 // cannot serve a peer early even by accident, because it holds none of the machinery that serves.
 //
 // REVOCATION reaches sessions started here for free: `connectRelayHost` adds every session to its own
-// module-level `live` set, and index.ts's revoker calls `killRelayHostsByPeerKey` (relay-host.ts)
-// against THAT set — independent of the bookkeeping below. `relay:host:revoke` here uses the same cut.
+// module-level `live` set, and relay-host.ts registers a killer over THAT set with the one revoke
+// primitive (peer-revoke.ts) — independent of the bookkeeping below. `relay:host:revoke` here uses
+// the same primitive, and also unpins the guest's key.
 import { randomUUID } from 'crypto'
 import { ipcMain, type BrowserWindow } from 'electron'
 import { IPC } from '../../shared/ipc'
@@ -35,6 +37,9 @@ import { loadOrCreatePeerKeyPair } from './peer-identity'
 import { isPremium as licenseIsPremium, getStoredEntitlement, licensedSeats as licenseSeats } from '../../core/license'
 import { RELAY_URL, relayAllowed as hostRelayAllowed, mintPairingToken } from './host-service'
 import { canAcceptSeat } from './seat-cap'
+import type { ScopedGuestDeps } from '../../core/relay/scoped-guest-policy'
+import { shareRootProblem } from '../../core/relay/share-root'
+import { revokePeerKey } from './peer-revoke'
 
 /** Thrown (as an Error message) when a new invite would exceed the licensed seat cap. The renderer
  *  maps it to "All seats in use — add a seat." Host-side/UX enforcement only (see below). */
@@ -58,6 +63,9 @@ export interface RelayHostDeps {
   licensedSeats?: () => number
   /** TEST ONLY: override the wire-up (defaults to `connectRelayHost`). */
   connect?: typeof connectRelayHost
+  /** What a project-scoped seat's policy reads from this core (scoped-guest-policy.ts). A scoped
+   *  invite without it is refused (connectRelayHost throws before any socket opens). */
+  scope?: ScopedGuestDeps
 }
 
 /** Metadata options for a new seat. `email` is a DISPLAY label only (never trust/identity — the SAS
@@ -113,7 +121,21 @@ export function initRelayHost(
    * await, then filled in once the listener is wired. Returns the offer to hand to the invited device
    * plus the seat's renderer `id`.
    */
+  /** Why this project may not be the scope of an invite, or null (share-root.ts): a folder that is the
+   *  disk root, the home directory or an ancestor of either (or of userData) would hand the guest every
+   *  file under it. The UI greys such a project out; this is the gate. */
+  function scopeRefusal(projectId: string | undefined): string | null {
+    if (!projectId || !deps.scope) return null
+    return shareRootProblem(deps.scope.projectCwd(projectId), {
+      home: deps.scope.homeDir,
+      dataDir: deps.scope.hostDataDir,
+      realpath: deps.scope.realpath
+    })
+  }
+
   async function addSeat({ projectId, email }: AddSeatOptions): Promise<{ offer: string; id: string }> {
+    const refusal = scopeRefusal(projectId)
+    if (refusal) throw new Error(refusal)
     if (!isPremium()) {
       throw new Error('Remote access requires nodeterm Pro.')
     }
@@ -153,7 +175,9 @@ export function initRelayHost(
         platform,
         transport: deps.transport,
         // The single project this hosting session shares with the peer. Absent → unscoped, as before.
+        // Present → every peer message is judged by the scoped-guest policy over `deps.scope`.
         sharedProjectId: projectId,
+        scope: deps.scope,
         // The SAS is known — ask the human to compare it. NOTHING is served yet. Reuse the reserved
         // id (do NOT mint a fresh one) so onOpen/onClose/revoke all name the same seat.
         onPeerPending: (s) => {
@@ -215,6 +239,19 @@ export function initRelayHost(
       addSeat({ projectId: opts?.projectId, email: opts?.email })
   )
 
+  // Which of these projects may NOT be shared, and why (the invite UI disables them with the reason).
+  // Host-only (`relay:host:` prefix): a relay peer can never ask it.
+  ipcMain.handle(IPC.relayHostScopeProblems, (_e, projectIds: unknown): Record<string, string> => {
+    const out: Record<string, string> = {}
+    if (!Array.isArray(projectIds)) return out
+    for (const id of projectIds.slice(0, 1000)) {
+      if (typeof id !== 'string') continue
+      const problem = scopeRefusal(id)
+      if (problem) out[id] = problem
+    }
+    return out
+  })
+
   // The human compared the SAS and pressed Confirm → advance the trust gate for THAT peer. Only the
   // session named by the id is touched; an unknown id (stale event) or a reserved-not-yet-open seat is
   // a no-op.
@@ -230,16 +267,24 @@ export function initRelayHost(
     const entry = msg?.id ? byId.get(msg.id) : undefined
     if (!entry) return
     // A reserved-but-not-yet-open seat has no live socket to cut (`session` null, or a session with no
-    // peer key yet) — freeing the reservation is all that's owed. A live peer is cut by IDENTITY, the
-    // same primitive index.ts's 4c revoker uses (killRelayHostsByPeerKey, relay-host.ts): it closes
-    // every live session holding that key, the right "remove this device" semantic. Host-side revoke +
-    // the seat cap are UX/host enforcement, NOT a server-guaranteed limit (v2 = server-side). On the
-    // desktop relay path a pin never auto-admits (isPinned is phone-only), so cutting the socket
-    // already forces a fresh SAS+consent re-pair — no separate unpin is needed.
+    // peer key yet) — freeing the reservation is all that's owed. A live peer is cut by IDENTITY:
+    // `killRelayHostsByPeerKey` closes every live session holding that key, synchronously, before any
+    // await. Then the revoke primitive (peer-revoke.ts) unpins the key from the GUEST store and runs
+    // the cut again across every host surface (idempotent). The unpin matters even though a desktop
+    // guest pin never auto-admits: it used to share a file with the phone pins, which the standing
+    // host DID auto-admit from, so a revoked guest stayed a silently-admitted "phone". The stores are
+    // split now (approved-devices.ts), and a revoked seat leaves no pin behind in any of them.
+    // Host-side revoke + the seat cap are UX/host enforcement, NOT a server-guaranteed limit
+    // (v2 = server-side).
     const peerKeyB64 = entry.session?.peerKeyB64()
     // killRelayHostsByPeerKey → session.close() does NOT fire our `onClose` (that runs only on a wire
     // drop, not a local close), so free the seat and notify the renderer here.
-    if (peerKeyB64) killRelayHostsByPeerKey(peerKeyB64)
+    if (peerKeyB64) {
+      killRelayHostsByPeerKey(peerKeyB64)
+      void revokePeerKey(peerKeyB64, ['guest']).then((r) => {
+        if (!r.persisted || !r.killed) console.warn('[relay-host] seat revoke incomplete', r)
+      })
+    }
     byId.delete(msg.id!)
     send(IPC.relayHostClosed, { id: msg.id })
   })

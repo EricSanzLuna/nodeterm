@@ -1,9 +1,11 @@
 import { describe, it, expect } from 'vitest'
+import { normalizeFor } from './normalize'
 import {
   AGENT_CONFIG,
   BUILTIN_AGENT_IDS,
   canBranch,
   canChat,
+  chatReadsLocalOnly,
   mintsSessionId,
   supportsSessionIdFlag,
   readsClaudeShapedTranscript,
@@ -18,14 +20,28 @@ import {
   canSwitchModel,
   createdAgentId,
   hasHooks,
+  hasGatewayModels,
   hasPermissionMode,
   hasUsage,
+  MODEL_SWITCH_CAPABLE,
+  OWN_MODEL_CATALOGUE,
   reportsOwnCopy,
   RENAME_CAPABLE,
   hasSharedIdentity,
   agentLaunchProgram,
-  resumeCommand
+  resumeCommand,
+  hasHooksOverSsh,
+  CHAT_CAPABLE,
+  TYPED_INPUT_CAPABLE,
+  typesChatInput,
+  readsScreenDialogs,
+  queuesInputWhileWorking,
+  LOCAL_ONLY_HOOK_AGENTS,
+  reportsSessionEnd,
+  resumeCommandWith,
+  submitsSeparately
 } from './config'
+import { CURSOR_HOOK_EVENTS } from './hook-events'
 
 describe('CONTEXT_LINK_CAPABLE', () => {
   it('all three builtin agents can context-link', () => {
@@ -43,9 +59,27 @@ describe('MODEL_SWITCH_CAPABLE', () => {
     expect(canSwitchModel('claude')).toBe(true)
     expect(canSwitchModel('codex')).toBe(true)
     expect(canSwitchModel('copilot')).toBe(true)
-    for (const id of ['gemini', 'opencode', 'grok', 'custom:plain'] as const) {
+    // grok joined once its leaf existed: `-m/--model` in the launch grammar plus `grok models` for
+    // discovery. It is NOT in this list as an example of a non-capable agent any more.
+    expect(canSwitchModel('grok')).toBe(true)
+    // cursor: `--model <id>` (a root option, measured before and after `agent`). Its models are its
+    // own catalogue, so it joins the list WITHOUT the gateway's models (OWN_MODEL_CATALOGUE).
+    expect(canSwitchModel('cursor')).toBe(true)
+    expect(canSwitchModel('antigravity')).toBe(true)
+    expect(hasGatewayModels('cursor')).toBe(false)
+    expect(hasGatewayModels('grok')).toBe(false)
+    expect(hasGatewayModels('antigravity')).toBe(false)
+    for (const id of ['claude', 'codex', 'copilot'] as const)
+      expect(hasGatewayModels(id), id).toBe(true)
+    for (const id of ['gemini', 'opencode', 'custom:plain'] as const) {
       expect(canSwitchModel(id), id).toBe(false)
+      expect(hasGatewayModels(id), id).toBe(false)
     }
+  })
+
+  it('OWN_MODEL_CATALOGUE is a subset of the switch-capable list', () => {
+    for (const id of OWN_MODEL_CATALOGUE)
+      expect(MODEL_SWITCH_CAPABLE as readonly string[]).toContain(id)
   })
 })
 
@@ -57,7 +91,8 @@ describe('copilot capabilities', () => {
       color: '#8957e5',
       launchCmd: 'copilot',
       promptInjectionMode: 'flag-interactive',
-      expectedProcess: 'copilot'
+      expectedProcess: 'copilot',
+      vanillaEnvPattern: '^COPILOT_PROVIDER_'
     })
     expect(hasHooks('copilot')).toBe(true)
     expect(canResume('copilot')).toBe(true)
@@ -72,7 +107,6 @@ describe('copilot capabilities', () => {
       canRecur,
       canBranch,
       hasUsage,
-      canChat,
       canTransferFrom,
       canRename,
       canReadTitle,
@@ -80,6 +114,15 @@ describe('copilot capabilities', () => {
     ]) {
       expect(can('copilot')).toBe(false)
     }
+  })
+
+  it('shows its conversation in the chat panel from its OWN journal, never through claude\'s resolver', () => {
+    // The ⌘M leaf is `core/copilot-chat.ts` (`<COPILOT_HOME>/session-state/<id>/events.jsonl`, keyed
+    // strictly by session id). Joining CHAT_CAPABLE must not join CLAUDE_TRANSCRIPT_READABLE: that
+    // list gates the find bar's index and the meter's rehydration, both of which resolve through
+    // claude's cwd fallback and would hand a copilot node someone else's claude session.
+    expect(canChat('copilot')).toBe(true)
+    expect(readsClaudeShapedTranscript('copilot')).toBe(false)
   })
 })
 
@@ -99,9 +142,16 @@ describe('opencode capabilities', () => {
     expect(canControlCanvas('opencode')).toBe(true)
   })
   it('stays out of the claude-only capability lists', () => {
-    for (const can of [canSubagent, canRecur, canBranch, hasUsage, canChat, canTransferFrom, canRename, canReadTitle, hasPermissionMode]) {
+    for (const can of [canSubagent, canRecur, canBranch, hasUsage, canTransferFrom, canRename, canReadTitle, hasPermissionMode]) {
       expect(can('opencode')).toBe(false)
     }
+  })
+  it('shows its conversation in the ⌘M chat panel — read through `opencode export`, never claude\'s resolver', () => {
+    // Same pair grok pins below: opencode's sessions live in a database read by `opencode export`
+    // (core/opencode-chat.ts), so claude's resolver — whose cwd fallback returns a stranger's newest
+    // transcript — must never be asked for one.
+    expect(canChat('opencode')).toBe(true)
+    expect(readsClaudeShapedTranscript('opencode')).toBe(false)
   })
 })
 
@@ -150,10 +200,11 @@ describe('grok capabilities', () => {
     expect(AGENT_CONFIG.grok.argvPromptSeparator).toBe('--')
   })
 
-  it('is the ONLY agent that asks for a separator', () => {
+  it('is the only agent besides cursor that asks for a separator', () => {
     // claude takes a positional too, but has no subcommand a one-word prompt could shadow — and
-    // adding `--` there would change a command line that works today.
-    for (const id of BUILTIN_AGENT_IDS.filter((a) => a !== 'grok')) {
+    // adding `--` there would change a command line that works today. cursor needs one for the
+    // same reason as grok, but its CLI ignores `--` (see the cursor block below).
+    for (const id of BUILTIN_AGENT_IDS.filter((a) => a !== 'grok' && a !== 'cursor')) {
       expect(AGENT_CONFIG[id].argvPromptSeparator, id).toBeUndefined()
     }
   })
@@ -248,9 +299,128 @@ describe('grok capabilities', () => {
     expect(supportsSessionIdFlag('claude', false, true)).toBe(false)
   })
 
+  it('picks a model through the base-harness mapping, from grok\'s own catalogue', () => {
+    // The whole capability is the leaf: membership plus `grok models` for discovery and `--model`
+    // in the launch grammar. No frontend spells a grok model id, and none spells `grok` here either
+    // — `modelsForAgent` decides who is offered which catalogue.
+    expect(canSwitchModel('grok')).toBe(true)
+  })
+
+  it('shows one card per subagent INSTANCE, not one per type', () => {
+    // Keyed by `subagentId`, measured by running two `explore` children in parallel: same type,
+    // different ids. The premise this task started from — that grok only exposes a TYPE, so two
+    // children of one type would have to share an aggregated card — was wrong, and running the two
+    // is the only thing that could have told us.
+    expect(canSubagent('grok')).toBe(true)
+  })
+
   it('does not yet claim the capabilities whose per-agent leaf is unwritten', () => {
     expect(canBranch('grok')).toBe(false)
-    expect(canSubagent('grok')).toBe(false)
+  })
+})
+
+/**
+ * Antigravity (`agy`) joins with exactly ONE capability list: AGENT_HOOK_TARGETS. Its leaves are a
+ * normalizer (normalizeAntigravity) and an installer for `~/.gemini/config/hooks.json`. Every other
+ * list is a separate leaf it does not have yet, and joining one early lights a badge that never
+ * updates or offers an action that silently does the wrong thing (rule 2 in CLAUDE.md). Each
+ * exclusion below says which leaf is missing — measured facts (`agy` 1.2.3, Windows 11).
+ */
+describe('antigravity capabilities', () => {
+  it('is offered ABOVE gemini wherever agents are listed (BUILTIN_AGENT_IDS is display order)', () => {
+    // Google moved personal accounts from Gemini CLI to Antigravity on 2026-06-18.
+    expect(BUILTIN_AGENT_IDS.indexOf('antigravity')).toBeLessThan(BUILTIN_AGENT_IDS.indexOf('gemini'))
+  })
+
+  it('reports status on THIS machine only — an SSH host has no agy hook installer yet', () => {
+    // `--after` asks this before accepting a dependency in an SSH project: a node that can never
+    // report "done" there would hold its dependant QUEUED forever.
+    expect(hasHooksOverSsh('antigravity')).toBe(false)
+    expect(LOCAL_ONLY_HOOK_AGENTS as readonly string[]).toEqual(['antigravity'])
+    for (const id of BUILTIN_AGENT_IDS.filter((a) => a !== 'antigravity')) {
+      expect(hasHooksOverSsh(id), id).toBe(hasHooks(id))
+    }
+  })
+
+  it('is a builtin that launches `agy`, prompt through --prompt-interactive', () => {
+    expect(BUILTIN_AGENT_IDS).toContain('antigravity')
+    expect(AGENT_CONFIG.antigravity.launchCmd).toBe('agy')
+    expect(AGENT_CONFIG.antigravity.expectedProcess).toBe('agy')
+    expect(AGENT_CONFIG.antigravity.label).toBe('Antigravity')
+    expect(AGENT_CONFIG.antigravity.promptInjectionMode).toBe('flag-interactive')
+    expect(AGENT_CONFIG.antigravity.promptFlag).toBe('--prompt-interactive')
+  })
+
+  it('is the only agent that overrides the interactive prompt flag', () => {
+    // copilot's `--interactive` must stay the default, byte-identical.
+    for (const id of BUILTIN_AGENT_IDS.filter((a) => a !== 'antigravity')) {
+      expect(AGENT_CONFIG[id].promptFlag, id).toBeUndefined()
+    }
+  })
+
+  it('reports status through its own hooks', () => {
+    // Badge, unread, completion notification, `--after` dependency and trigger target all follow.
+    expect(hasHooks('antigravity')).toBe(true)
+  })
+
+  it('joins the measured transcript, context-link, canvas-control, model-switch, and permission-mode capabilities without joining claude-transcript readers', () => {
+    expect(hasUsage('antigravity')).toBe(true)
+    expect(canChat('antigravity')).toBe(true)
+    expect(readsClaudeShapedTranscript('antigravity')).toBe(false)
+    expect(canTransferFrom('antigravity')).toBe(true)
+    expect(canContextLink('antigravity')).toBe(true)
+    expect(canControlCanvas('antigravity')).toBe(true)
+    expect(hasPermissionMode('antigravity')).toBe(true)
+    expect(canSwitchModel('antigravity')).toBe(true)
+  })
+
+  it('does not claim the capabilities whose per-agent leaf is unwritten', () => {
+    // No SessionEnd-shaped event exists among agy's five, so a DROPPED chip would be a coin flip.
+    expect(reportsSessionEnd('antigravity')).toBe(false)
+    // `agy --conversation=<id>` resumes; the id is validated at the interpolation site
+    // (SAFE_SESSION_ID) and a dead one is ignored by agy itself (it starts fresh). Not minted.
+    expect(canResume('antigravity')).toBe(true)
+    expect(resumeCommand('antigravity', '5f0c2f8e-9a51-4c41-9d2e-2b6f0f3e7a11')).toBe(
+      'agy --conversation=5f0c2f8e-9a51-4c41-9d2e-2b6f0f3e7a11'
+    )
+    expect(resumeCommand('antigravity', "x'; rm -rf ~")).toBeNull()
+    expect(mintsSessionId('antigravity')).toBe(false)
+    // No subagent/recurring/branch events are wired (invoke_subagent exists in the enum, unmeasured).
+    expect(canSubagent('antigravity')).toBe(false)
+    expect(canRecur('antigravity')).toBe(false)
+    expect(canBranch('antigravity')).toBe(false)
+    // Title lives in SQLite (unmeasured) and there is no rename command; read ⊇ write holds.
+    expect(canReadTitle('antigravity')).toBe(false)
+    expect(canRename('antigravity')).toBe(false)
+    expect(RENAME_CAPABLE as readonly string[]).not.toContain('antigravity')
+    // No shared app-server mode, and agy does not announce its own copies.
+    expect(hasSharedIdentity('antigravity')).toBe(false)
+    expect(reportsOwnCopy('antigravity')).toBe(false)
+  })
+})
+
+/**
+ * Cursor's lists so far: AGENT_HOOK_TARGETS (badge, unread dot, completion notification, `--after`
+ * dependency and trigger target; leaves `normalizeCursor` + the `~/.cursor/hooks.json` installer),
+ * PERMISSION_MODE_CAPABLE and MODEL_SWITCH_CAPABLE (leaf: CURSOR_MODES in approval-mode.ts).
+ * Everything else is a separate leaf that does not exist yet; docs/cursor-agent.md says which.
+ */
+describe('cursor capabilities', () => {
+  it('reports status through its own hooks, locally and on an SSH host (RemoteHooks.installCursorRemote)', () => {
+    expect(hasHooks('cursor')).toBe(true)
+    expect(hasHooksOverSsh('cursor')).toBe(true)
+  })
+
+  it('takes a permission mode and a model on its launch line', () => {
+    expect(hasPermissionMode('cursor')).toBe(true)
+    expect(canSwitchModel('cursor')).toBe(true)
+  })
+
+  it('does not claim the capabilities whose per-agent leaf is unwritten', () => {
+    for (const can of [canRecur, canBranch]) {
+      expect(can('cursor')).toBe(false)
+    }
+    expect(readsClaudeShapedTranscript('cursor')).toBe(false)
   })
 })
 
@@ -330,5 +500,116 @@ describe('title read vs rename write', () => {
   it('a custom agent claims neither', () => {
     expect(canReadTitle('custom:abc')).toBe(false)
     expect(canRename('custom:abc')).toBe(false)
+  })
+})
+
+describe('cursor capabilities (transcript leaf)', () => {
+  it("shows its conversation in ⌘M from its own SQLite store, never through claude's resolver", () => {
+    expect(canChat('cursor')).toBe(true)
+    expect(readsClaudeShapedTranscript('cursor')).toBe(false)
+  })
+  it('is local-only for the chat view: a remote node says "not supported yet"', () => {
+    expect(chatReadsLocalOnly('cursor')).toBe(true)
+  })
+  it('joins context link, transfer-from and the title READ leg', () => {
+    expect(canContextLink('cursor')).toBe(true)
+    expect(canTransferFrom('cursor')).toBe(true)
+    expect(canReadTitle('cursor')).toBe(true)
+  })
+})
+
+/**
+ * Cursor orchestration parity (docs/cursor-agent.md "Orchestration parity"), MEASURED on
+ * cursor-agent 2026.10.01 in the interactive TUI.
+ */
+describe('cursor capabilities (orchestration)', () => {
+  it('drives the canvas: ~/.claude/skills is listed by cursor, so membership is the whole wiring', () => {
+    expect(canControlCanvas('cursor')).toBe(true)
+  })
+  it('shows subagent cards (start: parent Task preToolUse, end: parent stop)', () => {
+    expect(canSubagent('cursor')).toBe(true)
+  })
+  it('renames: /rename lands in the store meta the READ leg reads, so read ⊇ write holds', () => {
+    expect(canRename('cursor')).toBe(true)
+    expect(canReadTitle('cursor')).toBe(true)
+  })
+  it('submits a one-way line with a SEPARATE Enter; claude and grok keep the one-shot paste', () => {
+    expect(submitsSeparately('cursor')).toBe(true)
+    for (const id of ['claude', 'grok', 'codex', 'gemini']) expect(submitsSeparately(id), id).toBe(false)
+  })
+  it('does NOT join RECURRING_CAPABLE: the loop skill was seen arming, its ticks were never measured', () => {
+    expect(canRecur('cursor')).toBe(false)
+  })
+})
+
+describe('cursor capabilities (context meter)', () => {
+  it('joins USAGE_CAPABLE with the agent’s own store numbers', () => {
+    expect(hasUsage('cursor')).toBe(true)
+  })
+  it('stays off claude’s transcript resolver: no find-bar index, no cold-resume, no cwd fallback', () => {
+    // hasUsage also gates context.ensure and the find bar's index in older code; the split is
+    // readsClaudeShapedTranscript, which must stay false or a cursor node is handed a stranger's claude session.
+    expect(readsClaudeShapedTranscript('cursor')).toBe(false)
+    expect(readsClaudeShapedTranscript('claude')).toBe(true)
+  })
+})
+
+describe('cursor capabilities (session continuity)', () => {
+  it('resumes with `--resume <id>` before the `agent` subcommand', () => {
+    expect(canResume('cursor')).toBe(true)
+    expect(resumeCommandWith('cursor-agent', 'cursor', 'abc-123')).toBe('cursor-agent --resume abc-123')
+    expect(resumeCommandWith('cursor-agent', 'cursor', 'x; rm -rf ~')).toBeNull()
+  })
+  it('mints with no probe of its own (the flag is resume, a fresh uuid is adopted)', () => {
+    expect(mintsSessionId('cursor')).toBe(true)
+    expect(supportsSessionIdFlag('cursor', false, false)).toBe(true)
+  })
+  it('reports a session end (normalizeCursor maps sessionEnd, CURSOR_HOOK_EVENTS subscribes it)', () => {
+    expect(reportsSessionEnd('cursor')).toBe(true)
+    expect(CURSOR_HOOK_EVENTS).toContain('sessionEnd')
+  })
+})
+
+/**
+ * Cursor wave 2 (F2): NEEDS YOU from a pane read, the SSH hook installer, the lost-stop net.
+ * No capability list gates the approval watch: it is the hook server's own seam
+ * (core/agents/cursor-approval.ts) and only `agentId === 'cursor'` posts reach it.
+ */
+describe('cursor NEEDS YOU, SSH hooks and lost stop', () => {
+  it('is no longer local-only: RemoteHooks installs into the host ~/.cursor/hooks.json', () => {
+    expect(LOCAL_ONLY_HOOK_AGENTS as readonly string[]).not.toContain('cursor')
+    expect(hasHooksOverSsh('cursor')).toBe(true)
+  })
+
+  it('the normalizer itself still never says blocked (the pane read adds it, not a hook)', () => {
+    for (const hook_event_name of ['preToolUse', 'beforeShellExecution', 'beforeMCPExecution', 'notification']) {
+      const ev = normalizeFor('cursor', { nodeId: 'n', agentId: 'cursor', payload: { hook_event_name, tool_use_id: 't' } })
+      expect(ev?.state === 'blocked', hook_event_name).toBe(false)
+    }
+  })
+})
+
+describe('typed chat input (TYPED_INPUT_CAPABLE)', () => {
+  it('types only for claude — M-Enter is a measured newline there and unmeasured anywhere else', () => {
+    expect(typesChatInput('claude')).toBe(true)
+    for (const id of CHAT_CAPABLE.filter((a) => a !== 'claude')) expect(typesChatInput(id)).toBe(false)
+  })
+
+  it('is a subset of CHAT_CAPABLE: only the chat view types', () => {
+    for (const id of TYPED_INPUT_CAPABLE) expect((CHAT_CAPABLE as readonly string[]).includes(id)).toBe(true)
+  })
+})
+
+describe('readsScreenDialogs — whose own dialogs the chat view can see on screen', () => {
+  it('is claude only: its reader would read every other CLI\'s screen as a permanent dialog', () => {
+    expect(readsScreenDialogs('claude')).toBe(true)
+    for (const id of BUILTIN_AGENT_IDS.filter((a) => a !== 'claude')) expect(readsScreenDialogs(id)).toBe(false)
+  })
+})
+
+describe('queuesInputWhileWorking — who may be sent to mid-turn from the chat view', () => {
+  it('is claude only: every other CLI\'s mid-turn input is unmeasured and may answer what is on screen', () => {
+    expect(queuesInputWhileWorking('claude')).toBe(true)
+    for (const id of BUILTIN_AGENT_IDS.filter((a) => a !== 'claude')) expect(queuesInputWhileWorking(id)).toBe(false)
   })
 })

@@ -1,10 +1,12 @@
 import { describe, it, expect } from 'vitest'
 import { pinNeutralMachineNoun } from './testMachineNoun'
-import type { LicenseDetail } from '@shared/types'
+import type { LicenseDetail, LicenseStatus } from '@shared/types'
 import {
+  proStatusLine,
   licenseSentence,
   canReleaseDevices,
   canUseKeyElsewhere,
+  offersBillingPortal,
   isReleaseRefusal,
   releaseFailureSentence,
   activationErrorSentence
@@ -68,7 +70,7 @@ describe('licenseSentence — sources that have no key and no device count', () 
   it('says an App Store subscription bridged Pro here, and prints no counts', () => {
     const s = licenseSentence({ key: null, used: 0, seats: 0, source: 'apple', error: null })
     expect(s).toBe(
-      'Pro on this computer comes from the App Store subscription on your paired phone, so there is no license key or device count to show here.'
+      'Pro on this computer comes from the App Store subscription on your paired phone, so there is no license key or device count to show here. That subscription is managed by Apple, not by nodeterm: to see when it renews or to cancel it, open the App Store on that phone and go to Subscriptions in your account.'
     )
     // The zeros are "not applicable", not a measurement. Rendering them here is the exact
     // misdirection this branch exists to prevent.
@@ -76,6 +78,16 @@ describe('licenseSentence — sources that have no key and no device count', () 
     // …and it must not borrow the keygen "no key on file" line, which would send an App Store
     // subscriber to support asking for a key that will never exist.
     expect(s).not.toContain('get in touch')
+  })
+
+  it('says a Google Play subscription bridged Pro here, mirroring the App Store sentence', () => {
+    const s = licenseSentence({ key: null, used: 0, seats: 0, source: 'google', error: null })
+    expect(s).toBe(
+      'Pro on this computer comes from the Google Play subscription on your paired phone, so there is no license key or device count to show here. That subscription is managed by Google, not by nodeterm: to see when it renews or to cancel it, open the Play Store on that phone and go to Payments & subscriptions → Subscriptions.'
+    )
+    expect(s).not.toContain('0')
+    expect(s).not.toContain('get in touch')
+    expect(s).not.toContain('App Store')
   })
 
   it('says plainly that a `free` source is not backed by a key, inventing no origin story', () => {
@@ -190,6 +202,24 @@ describe('licenseSentence — before the first read', () => {
   })
 })
 
+describe('offersBillingPortal', () => {
+  it('offers the billing page for a stated keygen (Stripe) source', () => {
+    expect(offersBillingPortal(keygen())).toBe(true)
+  })
+
+  it('hides it only for a STATED store source — the store bills those, not Stripe', () => {
+    expect(offersBillingPortal({ key: null, used: 0, seats: 0, source: 'apple', error: null })).toBe(false)
+    expect(offersBillingPortal({ key: null, used: 0, seats: 0, source: 'google', error: null })).toBe(false)
+  })
+
+  it('offers it when no source was stated — the inverse of the release gate', () => {
+    // A renewal whose card failed reads back `inactive` with no source, and that buyer is the one
+    // who most needs the page. An `=== 'keygen'` gate (the release rule) would hide it from them.
+    expect(offersBillingPortal({ key: null, used: 0, seats: 0, source: null, error: 'inactive' })).toBe(true)
+    expect(offersBillingPortal(null)).toBe(true)
+  })
+})
+
 describe('canReleaseDevices', () => {
   it('is true only for a STATED keygen source', () => {
     expect(canReleaseDevices(keygen())).toBe(true)
@@ -200,6 +230,9 @@ describe('canReleaseDevices', () => {
       false
     )
     expect(canReleaseDevices({ key: null, used: 0, seats: 0, source: 'free', error: null })).toBe(
+      false
+    )
+    expect(canReleaseDevices({ key: null, used: 0, seats: 0, source: 'google', error: null })).toBe(
       false
     )
   })
@@ -365,5 +398,42 @@ describe('activationErrorSentence', () => {
       'Could not activate this key. Check it was pasted in full and try again — get in touch if it keeps failing.'
     )
     expect(s).not.toContain('gremlins')
+  })
+})
+
+describe('proStatusLine — the date is the subscription term or nothing (issue #800)', () => {
+  const NOW = Date.UTC(2026, 8, 15, 12) // the day the reporter opened the page
+  const WEEK_S = 7 * 24 * 60 * 60
+  const pro = (over: Partial<LicenseStatus>): LicenseStatus => ({
+    tier: 'pro',
+    active: true,
+    expiresAt: Math.floor(NOW / 1000) + WEEK_S,
+    termEndsAt: null,
+    seats: 3,
+    error: null,
+    ...over
+  })
+
+  it('prints no date from the token TTL', () => {
+    // The reported screen: a 7-day token beside no stated term used to read "active until 9/22/2026".
+    expect(proStatusLine(pro({}), NOW)).toBe('Pro — active.')
+  })
+
+  it('prints the term when the server stated one', () => {
+    const term = Date.UTC(2027, 8, 13) / 1000
+    expect(proStatusLine(pro({ termEndsAt: term }), NOW)).toBe(
+      `Pro — active. Current term runs through ${new Date(term * 1000).toLocaleDateString()}.`
+    )
+  })
+
+  it.each([
+    ['null', null],
+    ['zero', 0],
+    ['NaN', Number.NaN],
+    ['in the past', Math.floor(NOW / 1000) - 60]
+  ])('a term that is %s prints no date — never an epoch', (_label, termEndsAt) => {
+    const line = proStatusLine(pro({ termEndsAt }), NOW)
+    expect(line).toBe('Pro — active.')
+    expect(line).not.toContain(new Date(0).toLocaleDateString())
   })
 })

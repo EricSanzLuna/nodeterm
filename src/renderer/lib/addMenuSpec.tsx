@@ -1,9 +1,16 @@
 /**
- * The single declarative source of truth for the "add node" content items that appear in every
- * creation menu: the canvas pane right-click, the sessions-sidebar project-header "+", the bottom
- * Dock "+", and the kanban column "+ New session".
+ * The single declarative source of truth for the "add node" content items that appear in the
+ * creation menus that can offer every node kind: the canvas pane right-click, the
+ * sessions-sidebar project-header "+", and the bottom Dock "+".
  *
- * The duplication this kills: each of those four surfaces used to hand-maintain its own list of
+ * **The kanban column's "+ New session" is deliberately NOT one of them** — this doc used to list
+ * it as a fourth consumer, which was never true and is worth stating so nobody "fixes" it by
+ * wiring it up. Its `KanbanCreateChoice` is a closed union of terminal / browser / sticky / agent
+ * because those are the only kinds `canvas/toKanbanSession.ts` turns INTO A CARD; feeding it this
+ * list would offer kinds (a trigger, a worktree, an editor) that create a node the board can never
+ * show. A surface that can only render part of the list is a different list, not a lagging copy.
+ *
+ * The duplication this kills: each of those surfaces used to hand-maintain its own list of
  * which node kinds you can add, so they drifted out of parity (the pane menu had "New browser" but
  * the Dock and the sidebar "+" did not, etc.). Now they all derive their CONTENT items from
  * {@link CONTENT_ADD_ITEMS}, filtered by project context (cwd / SSH). Agent entries are layered on
@@ -11,7 +18,9 @@
  * `agentCreationItems()`, and the Dock's agent-account hover flyouts are intentionally bespoke UX —
  * so this spec owns the CONTENT list only, not the agents.
  *
- * Two render adapters map the same {@link AddItem} list to the two menu worlds:
+ * Three render adapters map the same {@link AddItem} list to the menu worlds:
+ *  - {@link buildGroupedAddMenu} → the GROUPED tree the two `ContextMenu` surfaces show (see the
+ *    grouping section at the bottom of this file for why).
  *  - {@link contentAddItemsToMenuItems} → the {@link MenuItem} type the `ContextMenu` component
  *    consumes (pane menu, project-header "+").
  *  - {@link contentAddItemsToDockRows} → the Dock's custom `<button>` JSX.
@@ -20,16 +29,24 @@
  */
 import type { ReactNode } from 'react'
 import type { MenuItem } from '../components/ContextMenu'
+import { ACCOUNT_CAPABLE_AGENT_IDS } from '@shared/agents/account-binding'
+import { SIMULATOR_SSH_HINT } from '@shared/simulator'
+import { isBrowserRuntime } from '../bridge/runtime'
 import {
+  IconAgent,
   IconBranch,
+  IconCanvasView,
   IconDino,
   IconEditor,
   IconExplorer,
   IconGroup,
   IconNote,
+  IconPhone,
+  IconPlay,
   IconRemote,
   IconTerminal,
   IconWeb,
+  IconWhiteboard,
   IconBellFilled
 } from '../components/icons'
 
@@ -44,9 +61,12 @@ export type AddPos = { x: number; y: number } | undefined
 export type AddItem =
   | { kind: 'terminal' }
   | { kind: 'remote' }
+  | { kind: 'run' } // disabledOnSsh
+  | { kind: 'simulator' } // macOS desktop only
   | { kind: 'browser' }
   | { kind: 'web' }
   | { kind: 'sticky' }
+  | { kind: 'whiteboard' }
   | { kind: 'files' } // requiresCwd
   | { kind: 'dino' }
   | { kind: 'trigger' }
@@ -65,6 +85,9 @@ export type AddItem =
 export const CONTENT_ADD_ITEMS: readonly AddItem[] = [
   { kind: 'terminal' },
   { kind: 'remote' },
+  { kind: 'run' },
+  { kind: 'simulator' },
+  { kind: 'whiteboard' },
   { kind: 'browser' },
   { kind: 'web' },
   { kind: 'sticky' },
@@ -83,6 +106,12 @@ export interface AddCtx {
   hasCwd: boolean
   /** Whether the active project is an SSH project. Disables "New worktree…". */
   isSshProject: boolean
+  /** Whether the core that owns the active project runs on Windows (`hostPlatformFor`). Disables
+   *  "New run configuration" — its launcher is a POSIX `sh` script. Absent = not Windows. */
+  isWindowsCore?: boolean
+  /** Whether the active project is a relay tab (another machine's core). Disables "New simulator":
+   *  the node would show THIS machine's devices inside the host's project. Absent = not relay. */
+  isRelayTab?: boolean
 }
 
 /**
@@ -96,11 +125,16 @@ export interface AddCtx {
 export interface AddHandlers {
   terminal: (at?: AddPos) => void
   remote: (screenPos: { x: number; y: number }) => void
+  /** A run node (a `.vscode/launch.json` configuration with Run/Stop/Restart), in the project folder. */
+  run: (at?: AddPos) => void
+  /** A Simulator node: a live iOS simulator screen with touch, keyboard and buttons. */
+  simulator: (at?: AddPos) => void
   browser: (at?: AddPos) => void
   web: (at?: AddPos) => void
   sticky: (at?: AddPos) => void
   files: (at?: AddPos) => void
   dino: (at?: AddPos) => void
+  whiteboard: (at?: AddPos) => void
   /** Adds a trigger node (issue #493) — a canvas-owned schedule that fires into another node. */
   trigger: (at?: AddPos) => void
   openFile: (at?: AddPos) => void
@@ -112,6 +146,37 @@ export interface AddHandlers {
 
 /** The SSH worktree hint shown on the disabled row — kept here so every surface shows the same one. */
 export const WORKTREE_SSH_HINT = 'Not supported in SSH projects yet'
+/** A run node's launcher, processes and (Flutter) simulators all live on THIS machine. */
+export const RUN_SSH_HINT = 'Run configurations run on this machine — not in SSH projects yet'
+/** iOS simulators live on the Mac the desktop app runs on; a browser tab (Server Edition) is not it. */
+export const SIMULATOR_UNAVAILABLE_HINT = 'Simulators need the desktop app'
+/** Whether this renderer can show a Simulator node: the desktop app on any OS — Android emulators
+ *  run everywhere; iOS simulators are simply absent from the list off macOS. Not a Server Edition
+ *  tab, whose emulators would be the server's. */
+export function simulatorAvailable(relayTab = false): boolean {
+  return !isBrowserRuntime() && !relayTab
+}
+/** A relay tab's project lives on another machine; this machine's simulators do not belong in it. */
+export const SIMULATOR_RELAY_HINT = 'Simulators run on this machine — not in a relay tab'
+export { SIMULATOR_SSH_HINT }
+/** The simulator row's gate, one rule for the menu, the Dock, ⌘K and the canvas refusal. */
+export function simulatorRefusal(relayTab = false, sshProject = false): string | undefined {
+  if (isBrowserRuntime()) return SIMULATOR_UNAVAILABLE_HINT
+  if (relayTab) return SIMULATOR_RELAY_HINT
+  if (sshProject) return SIMULATOR_SSH_HINT
+  return undefined
+}
+
+/** The core's launcher is a POSIX `sh` script stopped by POSIX signals (see `RUN_WINDOWS_REASON`). */
+export const RUN_WINDOWS_HINT = 'Run configurations that launch a process are not supported on Windows yet'
+
+/** The run row's gate, one rule for the menu and the Dock: SSH first (its reason is the more
+ *  specific one), then a Windows core. */
+function runGate(ctx: AddCtx): { disabled: boolean; hint?: string } {
+  if (ctx.isSshProject) return { disabled: true, hint: RUN_SSH_HINT }
+  if (ctx.isWindowsCore) return { disabled: true, hint: RUN_WINDOWS_HINT }
+  return { disabled: false }
+}
 
 /**
  * The two rows that need a project FOLDER, shown disabled with their reason rather than hidden.
@@ -156,6 +221,25 @@ export function contentAddItemsToMenuItems(
       case 'remote':
         out.push({ label: 'New remote…', icon: <IconTerminal />, onClick: () => handlers.remote(remotePos) })
         break
+      case 'simulator': {
+        const refusal = simulatorRefusal(ctx.isRelayTab, ctx.isSshProject)
+        out.push({
+          label: 'New simulator',
+          icon: <IconPhone />,
+          disabled: !!refusal,
+          hint: refusal,
+          onClick: () => handlers.simulator(at)
+        })
+        break
+      }
+      case 'run':
+        out.push({
+          label: 'New run configuration',
+          icon: <IconPlay />,
+          ...runGate(ctx),
+          onClick: () => handlers.run(at)
+        })
+        break
       case 'browser':
         out.push({ label: 'New browser', icon: <IconRemote />, onClick: () => handlers.browser(at) })
         break
@@ -178,6 +262,9 @@ export function contentAddItemsToMenuItems(
           hint: ctx.hasCwd ? undefined : FILES_NO_CWD_HINT,
           onClick: () => handlers.files(at)
         })
+        break
+      case 'whiteboard':
+        out.push({ label: 'New whiteboard', icon: <IconWhiteboard />, onClick: () => handlers.whiteboard(at) })
         break
       case 'dino':
         out.push({ label: 'New dino game', icon: <IconDino />, onClick: () => handlers.dino(at) })
@@ -257,6 +344,27 @@ export function contentAddItemsToDockRows(
         // The Dock uses its own "New Remote Connection" affordance, not the remote picker. Skip
         // here so the Dock's content rows don't duplicate it.
         break
+      case 'simulator': {
+        const refusal = simulatorRefusal(ctx.isRelayTab, ctx.isSshProject)
+        out.push({
+          kind: 'simulator',
+          label: 'Simulator',
+          icon: <IconPhone />,
+          disabled: !!refusal,
+          hint: refusal,
+          onClick: () => handlers.simulator()
+        })
+        break
+      }
+      case 'run':
+        out.push({
+          kind: 'run',
+          label: 'Run Configuration',
+          icon: <IconPlay />,
+          ...runGate(ctx),
+          onClick: () => handlers.run()
+        })
+        break
       case 'browser':
         out.push({ kind: 'browser', label: 'Browser', icon: <IconRemote />, onClick: () => handlers.browser() })
         break
@@ -275,6 +383,9 @@ export function contentAddItemsToDockRows(
           hint: ctx.hasCwd ? undefined : FILES_NO_CWD_HINT,
           onClick: () => handlers.files()
         })
+        break
+      case 'whiteboard':
+        out.push({ kind: 'whiteboard', label: 'Whiteboard', icon: <IconWhiteboard />, onClick: () => handlers.whiteboard() })
         break
       case 'dino':
         out.push({ kind: 'dino', label: 'Dino Game', icon: <IconDino />, onClick: () => handlers.dino() })
@@ -315,4 +426,170 @@ export function contentAddItemsToDockRows(
     }
   }
   return out
+}
+
+// ─── Grouping (the pane right-click and the sidebar "+") ─────────────────────────────────────
+//
+// Both of those surfaces used to render the whole flat list — 18 "New …" rows before the four
+// canvas actions — which is a list you read rather than a menu you aim at. The ⌘K palette already
+// makes every one of these searchable, and the keybinding registry already carries a remappable
+// command per agent and per node kind (`node.new*`, #365), so this menu does not have to be
+// EXHAUSTIVE; it has to be FAST. Grouping trades one hover for a target you can hit without
+// reading, and leaves the exhaustive paths exactly where they already were.
+//
+// **Two levels here is a choice, not a cap.** `ContextMenu` used to drop a third level silently
+// (`if (child.type === 'submenu') return null`), and this shape was built around that. It now
+// renders any depth (the node menu's "Transfer conversation ▸ <agent> ▸ <model>" needs three), but
+// the rule below is kept: an agent row that is ALREADY a submenu (Claude's and Codex's account
+// pickers) stays at the first level, so picking an account never costs two hovers.
+
+/** Which section of the grouped menu a content kind belongs to. `top` = stays a first-level row. */
+export type AddGroupId = 'top' | 'view' | 'files' | 'orchestrate'
+
+/**
+ * The routing table, as a total `Record` over the kind union **on purpose**: a new `AddItem` kind
+ * is a COMPILE ERROR here until somebody decides where it belongs. The alternative (a lookup with
+ * a default) would silently drop a new kind into one bucket forever, which is the drift this
+ * module exists to prevent.
+ *
+ * `terminal` and `remote` stay at the top because they are the two fastest paths to a session, and
+ * because `remote` is not an agent — the one entry point to an SSH session must not be buried
+ * under a menu named "New agent", where nobody would look for it.
+ */
+export const ADD_ITEM_GROUP: Record<AddItem['kind'], AddGroupId> = {
+  terminal: 'top',
+  remote: 'top',
+  run: 'view',
+  simulator: 'view',
+  browser: 'view',
+  web: 'view',
+  sticky: 'view',
+  files: 'view',
+  dino: 'view',
+  whiteboard: 'view',
+  'open-file': 'files',
+  'new-file': 'files',
+  'spawn-team': 'orchestrate',
+  trigger: 'orchestrate',
+  worktree: 'orchestrate'
+}
+
+/** Submenu labels, kept here so every surface names the same group the same way. */
+export const AGENT_GROUP_LABEL = 'New agent'
+export const ADD_GROUP_LABEL: Record<Exclude<AddGroupId, 'top'>, string> = {
+  view: 'New view',
+  files: 'Files',
+  orchestrate: 'Orchestrate'
+}
+
+/**
+ * One "New <agent>" row plus the agent it belongs to. The surfaces build the ROW (accounts,
+ * disabled reasons and custom agents all live in Canvas); this module only needs the id to decide
+ * whether the row may be nested.
+ */
+export interface AgentAddEntry {
+  agentId: string
+  item: MenuItem
+}
+
+/**
+ * Whether an agent row must stay at the FIRST level. Two independent reasons:
+ *
+ *  1. **It is already a submenu.** Nesting it would put the account picker two hovers deep, for
+ *     exactly the users who have accounts. This half is derived from the row itself, so an agent
+ *     that grows a picker later is kept at the top on the day it does.
+ *  2. **It CAN own a managed account** (`ACCOUNT_CAPABLE_AGENT_IDS`). Rule 1 alone would move a
+ *     row in and out of the submenu as the user adds or removes accounts — a menu that rearranges
+ *     itself is a menu you cannot learn. Pinning the account-capable agents keeps the shape stable
+ *     whether or not an account exists yet.
+ *
+ * Both halves are DERIVED — no agent id is spelled here — so a new builtin agent joins the
+ * submenu by itself, and one that gains managed accounts is promoted by itself.
+ */
+export function isPinnedAgentEntry(entry: AgentAddEntry): boolean {
+  if (entry.item.type === 'submenu') return true
+  return ACCOUNT_CAPABLE_AGENT_IDS.includes(entry.agentId)
+}
+
+/**
+ * Pinned agent rows, then the rest behind one `New agent ▸`. An empty tail emits NO submenu — an
+ * empty flyout is a dead target.
+ */
+export function agentEntriesToMenuItems(agents: readonly AgentAddEntry[]): MenuItem[] {
+  const pinned = agents.filter(isPinnedAgentEntry).map((e) => e.item)
+  const rest = agents.filter((e) => !isPinnedAgentEntry(e)).map((e) => e.item)
+  return [
+    ...pinned,
+    ...(rest.length > 0
+      ? [
+          {
+            type: 'submenu',
+            label: AGENT_GROUP_LABEL,
+            icon: <IconAgent />,
+            children: rest
+          } as MenuItem
+        ]
+      : [])
+  ]
+}
+
+const GROUP_ICON: Record<Exclude<AddGroupId, 'top'>, ReactNode> = {
+  view: <IconCanvasView />,
+  files: <IconEditor />,
+  orchestrate: <IconGroup />
+}
+
+/**
+ * The grouped "add" menu shared by the canvas pane right-click and the sessions-sidebar "+".
+ *
+ * Rows come from {@link contentAddItemsToMenuItems} — the same per-kind builder the flat list and
+ * the Dock use — so a row's label, icon, handler and **disabled reason** are written exactly once.
+ * That is what keeps "New worktree…" greyed with `WORKTREE_SSH_HINT` inside its submenu instead of
+ * quietly losing the explanation on the way in: a `hint` on a leaf renders in a flyout the same as
+ * at the top level.
+ *
+ * Order is the canonical one: top rows, then agents, then view / files / orchestrate. A group
+ * whose rows are all filtered out emits no submenu at all.
+ */
+export function buildGroupedAddMenu(
+  items: readonly AddItem[],
+  handlers: AddHandlers,
+  ctx: AddCtx,
+  agents: readonly AgentAddEntry[],
+  at?: AddPos,
+  screenPos?: { x: number; y: number }
+): MenuItem[] {
+  const top: MenuItem[] = []
+  const buckets: Record<Exclude<AddGroupId, 'top'>, MenuItem[]> = {
+    view: [],
+    files: [],
+    orchestrate: []
+  }
+  for (const item of items) {
+    // Built one at a time through the SHARED mapper rather than re-implemented here: a second
+    // copy of the per-kind rows is exactly how these surfaces drifted apart before this module.
+    const [row] = contentAddItemsToMenuItems([item], handlers, ctx, at, screenPos)
+    if (!row) continue
+    const group = ADD_ITEM_GROUP[item.kind]
+    if (group === 'top') top.push(row)
+    else buckets[group].push(row)
+  }
+  const submenu = (id: Exclude<AddGroupId, 'top'>): MenuItem[] =>
+    buckets[id].length > 0
+      ? [
+          {
+            type: 'submenu',
+            label: ADD_GROUP_LABEL[id],
+            icon: GROUP_ICON[id],
+            children: buckets[id]
+          } as MenuItem
+        ]
+      : []
+  return [
+    ...top,
+    ...agentEntriesToMenuItems(agents),
+    ...submenu('view'),
+    ...submenu('files'),
+    ...submenu('orchestrate')
+  ]
 }

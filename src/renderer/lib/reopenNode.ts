@@ -13,9 +13,15 @@ import {
   createStickyNode,
   createDinoNode,
   createFilesNode,
+  createRunNode,
+  createSimulatorNode,
+  createWhiteboardNode,
   isAccountLoginNode
 } from '@renderer/state/workspace'
+import { normalizeRunConfig } from '@shared/run-config'
+import { normalizeSimulatorConfig } from '@shared/simulator'
 import { absolutePosition, type FocusableNode } from './nodeFocus'
+import { normalizeNodeIcon } from '@shared/node-icon'
 
 export type RestorableNodeKind = Exclude<NodeKind, 'group' | 'subagent' | 'loop'>
 
@@ -43,6 +49,8 @@ export interface ReopenNodeSnapshot {
 }
 
 type SnapshotSource = {
+  /** The node's id — only a whiteboard reads it (its rebuilt copy reads the board by this id). */
+  id?: string
   type?: string
   position: { x: number; y: number }
   parentId?: string
@@ -82,7 +90,8 @@ export function snapshotNode(
     ...(node.parentId ? { parentId: node.parentId } : {}),
     ...(node.extent === 'parent' ? { extent: 'parent' as const } : {}),
     ...(size ? { size } : {}),
-    data: node.data
+    // A whiteboard is rebuilt under a NEW id; it reads the deleted board's file by this one.
+    data: type === 'whiteboard' ? { ...node.data, whiteboardSource: node.data.whiteboardSource ?? node.id } : node.data
   }
 }
 
@@ -108,6 +117,11 @@ function withCosmetics(node: CanvasNode, data: NodeData): CanvasNode {
     const value = data[key]
     if (value !== undefined) (cosmetics as Record<string, unknown>)[key] = value
   }
+  // The icon is a cosmetic too, but not a plain copy: a persisted snapshot comes from
+  // workspace.json, which is hand-editable, so it crosses the same validator hydration uses.
+  // Without this a reopened session came back without the icon it was closed with.
+  const icon = normalizeNodeIcon(data.icon)
+  if (icon) cosmetics.icon = icon
   return { ...node, data: { ...node.data, ...cosmetics } }
 }
 
@@ -158,6 +172,10 @@ function buildBase(snapshot: ReopenNodeSnapshot, ctx: RecreateContext): CanvasNo
           ctx.permissionModeFor(d.agentId)
         )
       }
+      // A run node reopens as a run node (same folder/configuration/device); its run is NOT
+      // restarted — the toolbar's Run is the user's call, as on first open.
+      const runConfig = normalizeRunConfig(d.runConfig)
+      if (runConfig) return createRunNode(0, runConfig)
       return createTerminalNode(0, d.cwd, undefined, undefined, ctx.project?.ssh)
     }
     case 'sticky': {
@@ -183,6 +201,16 @@ function buildBase(snapshot: ReopenNodeSnapshot, ctx: RecreateContext): CanvasNo
       return createBrowserNode(0, d.url ?? '', undefined, d.partition)
     case 'dino':
       return createDinoNode(0, undefined, d.highScore ?? 0)
+    case 'whiteboard': {
+      const wb = createWhiteboardNode(0)
+      // A reopen restores a board; it does not jump into drawing on it.
+      wb.data.autoEdit = undefined
+      if (d.whiteboardSource) wb.data.whiteboardSource = d.whiteboardSource
+      return wb
+    }
+    // A Simulator node's whole state is which device it shows.
+    case 'simulator':
+      return createSimulatorNode(0, normalizeSimulatorConfig(d.simulator))
     default:
       return null
   }

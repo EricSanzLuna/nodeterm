@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
+import { readFileSync } from 'fs'
+import path from 'path'
 import {
+  antigravityModelsFrom,
+  grokModelsFrom,
+  cursorModelsFrom,
+  normalizedAgentModel,
   MODEL_GATEWAY_ENV_KEYS,
   MODEL_GATEWAY_SECRET_REF,
   modelGatewayEnv,
@@ -32,6 +38,38 @@ describe('modelGatewayRoutes', () => {
     expect(modelGatewayRoutes('https://example.test?route=other')).toBeNull()
     expect(modelGatewayRoutes('https://example.test/#fragment')).toBeNull()
     expect(modelGatewayRoutes('not a URL')).toBeNull()
+  })
+
+  it('appends a supplied discovery path instead of the conventional /v1/models', () => {
+    expect(modelGatewayRoutes('https://bifrost.example.test', '/openai/v1/models')).toEqual({
+      discovery: 'https://bifrost.example.test/openai/v1/models',
+      openai: 'https://bifrost.example.test/openai/v1',
+      anthropic: 'https://bifrost.example.test/anthropic'
+    })
+  })
+
+  it('falls back to /v1/models when the discovery path is absent, empty, or unsafe', () => {
+    // Absent/empty = the conventional suffix. Unsafe values (full URLs — a caller-chosen host
+    // would be a credential-exfiltration oracle — query, fragment, traversal) degrade to the
+    // derived default, never to a fetch somewhere unvetted.
+    expect(modelGatewayRoutes('https://bifrost.example.test', undefined)?.discovery).toBe(
+      'https://bifrost.example.test/v1/models'
+    )
+    expect(modelGatewayRoutes('https://bifrost.example.test', '')?.discovery).toBe(
+      'https://bifrost.example.test/v1/models'
+    )
+    expect(modelGatewayRoutes('https://bifrost.example.test', 'https://evil.test/x')?.discovery).toBe(
+      'https://bifrost.example.test/v1/models'
+    )
+    expect(modelGatewayRoutes('https://bifrost.example.test', '/../etc')?.discovery).toBe(
+      'https://bifrost.example.test/v1/models'
+    )
+    expect(modelGatewayRoutes('https://bifrost.example.test', '/x?y=1')?.discovery).toBe(
+      'https://bifrost.example.test/v1/models'
+    )
+    expect(modelGatewayRoutes('https://bifrost.example.test', '/x#f')?.discovery).toBe(
+      'https://bifrost.example.test/v1/models'
+    )
   })
 })
 
@@ -149,9 +187,19 @@ describe('agent mappings', () => {
 
   it('does not activate Copilot BYOK until a model is selected', () => {
     expect(modelGatewayEnv(gateway, 'copilot')).toEqual({})
-    expect(withAgentModel('copilot --resume=abc', 'copilot', 'openai/gpt-5.5')).toBe(
+    expect(withAgentModel('copilot --resume=abc', 'copilot', undefined)).toBe(
       'copilot --resume=abc'
     )
+  })
+
+  it('selects the Copilot internal model explicitly without changing its gateway wire id', () => {
+    expect(withAgentModel('copilot --resume=abc', 'copilot', 'openai/gpt-5.5')).toBe(
+      "copilot --resume=abc --model 'gpt-5.5'"
+    )
+    expect(withAgentModel('copilot', 'copilot', 'claude-sonnet-4.6')).toBe(
+      "copilot --model 'claude-sonnet-4.6'"
+    )
+    expect(withAgentModel('copilot', 'copilot', 'bad\nmodel')).toBe('copilot')
   })
 
   it('quotes model ids and refuses unsupported/control-bearing values', () => {
@@ -214,7 +262,7 @@ describe('agent mappings', () => {
       })
       expect(
         withAgentModel('copilot-wrapper', 'custom:copilot-proxy', 'openai/gpt-5.5')
-      ).toBe('copilot-wrapper')
+      ).toBe("copilot-wrapper --model 'gpt-5.5'")
     } finally {
       setCustomAgentBaseResolver(null)
     }
@@ -240,5 +288,156 @@ describe('MODEL_GATEWAY_ENV_KEYS lockstep', () => {
     }
     expect(seen.size).toBeGreaterThan(0)
     for (const k of seen) expect(MODEL_GATEWAY_ENV_KEYS).toContain(k)
+  })
+})
+
+
+describe('grokModelsFrom — discovery without an allowlist', () => {
+  // Captured verbatim from `grok models` on 1.0.13 (2026-09-02). The CLI lists its own models, so
+  // there is no allowlist to maintain and a model shipped tomorrow appears with no code change.
+  const REAL = readFileSync(path.join(__dirname, '__fixtures__/grok-models.txt'), 'utf8')
+
+  it('reads the ids out of the real output', () => {
+    expect(grokModelsFrom(REAL)).toEqual([{ id: 'grok-4.6' }, { id: 'grok-4.5' }])
+  })
+
+  it('does not mistake the "Default model:" line for an entry', () => {
+    // That line repeats an id the bullet list already carries. Treating prose as data is how a login
+    // banner or a future footer becomes a fake model id on the menu.
+    const out = grokModelsFrom(REAL)
+    expect(out.filter((m) => m.id === 'grok-4.6')).toHaveLength(1)
+    expect(out.map((m) => m.id)).not.toContain('model:')
+  })
+
+  it('stops at the first unindented line', () => {
+    const withFooter = REAL + 'Run `grok --help` for more.\n  - not-a-model\n'
+    expect(grokModelsFrom(withFooter).map((m) => m.id)).toEqual(['grok-4.6', 'grok-4.5'])
+  })
+
+  it('rejects an id that could not safely reach a command line', () => {
+    const hostile = 'Available models:\n  - ok-model\n  - $(rm -rf /)\n  - --flag-shaped\n'
+    expect(grokModelsFrom(hostile).map((m) => m.id)).toEqual(['ok-model'])
+  })
+
+  it('is EMPTY for anything it cannot parse — never a partial list', () => {
+    // A failed probe must read as "no model switching", i.e. the pre-feature behaviour.
+    expect(grokModelsFrom('')).toEqual([])
+    expect(grokModelsFrom(null)).toEqual([])
+    expect(grokModelsFrom('command not found: grok')).toEqual([])
+    expect(grokModelsFrom('You are logged in with grok.com.')).toEqual([])
+  })
+})
+
+describe('modelsForAgent — grok is offered its OWN models, never the gateway catalogue', () => {
+  const GATEWAY = [{ id: 'anthropic/claude-x' }, { id: 'openai/gpt-x' }]
+  const GROK = [{ id: 'grok-4.6' }]
+
+  it("returns grok's list for a grok node", () => {
+    // Correctness, not preference: grok cannot be routed through the gateway at all (its custom
+    // models live in config.toml, not in env). Offering the gateway catalogue would put ids on the
+    // menu that grok rejects at launch — a picker that looks like it worked and kills the node.
+    expect(modelsForAgent(GATEWAY, 'grok', GROK)).toEqual(GROK)
+  })
+
+  it('gives grok nothing when its own probe found nothing', () => {
+    expect(modelsForAgent(GATEWAY, 'grok')).toEqual([])
+  })
+
+  it('leaves every other agent on the gateway catalogue', () => {
+    expect(modelsForAgent(GATEWAY, 'claude', GROK)).toEqual(GATEWAY)
+    expect(modelsForAgent(GATEWAY, 'codex', GROK)).toEqual(GATEWAY)
+  })
+})
+
+describe('modelsForAgent: cursor never gets the gateway catalogue either', () => {
+  it('returns nothing for cursor, whatever else is passed', () => {
+    const GATEWAY = [{ id: 'anthropic/claude-x' }]
+    expect(modelsForAgent(GATEWAY, 'cursor')).toEqual([])
+    // A grok catalogue is never handed over either; only cursor's own list is.
+    expect(modelsForAgent(GATEWAY, 'cursor', [{ id: 'grok-4.6' }])).toEqual([])
+    expect(modelsForAgent(GATEWAY, 'cursor', [], [{ id: 'auto', name: 'Auto' }])).toEqual([
+      { id: 'auto', name: 'Auto' }
+    ])
+  })
+
+  it('still emits a flag for an explicit model (canvas-control --model), and no gateway env', () => {
+    expect(withAgentModel('cursor-agent', 'cursor', 'composer-2.5')).toBe(
+      "cursor-agent --model 'composer-2.5'"
+    )
+    const settings = { baseUrl: 'https://gw.example', apiKey: 'k' }
+    expect(modelGatewayEnv(settings as never, 'cursor', 'composer-2.5', {}, 'secret')).toEqual({})
+  })
+})
+
+describe('grok takes its model as a FLAG, and needs no gateway environment', () => {
+  it('appends --model before anything else touches the line', () => {
+    expect(withAgentModel('grok', 'grok', 'grok-4.5')).toBe("grok --model 'grok-4.5'")
+  })
+
+  it('emits no environment at all', () => {
+    // grok's custom models are declared in ~/.grok/config.toml with their own base_url/api_key, and
+    // that file explicitly cannot be defaulted from the environment. Emitting the OpenAI pair anyway
+    // would point grok's built-in models at a gateway they were never configured for.
+    const settings = { baseUrl: 'https://gw.example', apiKey: 'k' }
+    expect(modelGatewayEnv(settings as never, 'grok', 'grok-4.6', {}, 'secret')).toEqual({})
+  })
+
+  it('refuses a hand-edited id at the point it would reach the command line', () => {
+    expect(normalizedAgentModel('grok', 'grok-4.6 && rm -rf /')).toBe('grok-4.6 && rm -rf /')
+    expect(withAgentModel('grok', 'grok', 'grok-4.6 && rm -rf /')).toBe(
+      "grok --model 'grok-4.6 && rm -rf /'"
+    )
+  })
+})
+
+describe('cursorModelsFrom', () => {
+  // Shape measured on cursor-agent 2026.09.28; the zero-width spaces are in the real output.
+  const OUT =
+    'Available models\n\nauto - Auto (default)\ngpt-5.3-codex-low - Codex 5.3 Low\n' +
+    'grok-4.7-low-fast - Grok 4.7  Low Fast\u200b\u200b\n\n' +
+    "Tip: use --model <id> (or /model <id> in interactive mode) to switch. e.g. --model 'claude-opus-4-8[context=1m]'.\n"
+
+  it('reads ids and labels only, stripping zero-width spaces and the header/tip prose', () => {
+    expect(cursorModelsFrom(OUT)).toEqual([
+      { id: 'auto', name: 'Auto (default)' },
+      { id: 'gpt-5.3-codex-low', name: 'Codex 5.3 Low' },
+      { id: 'grok-4.7-low-fast', name: 'Grok 4.7 Low Fast' }
+    ])
+  })
+  it('fails open to [] on nothing, junk, or an unsafe id', () => {
+    expect(cursorModelsFrom(null)).toEqual([])
+    expect(cursorModelsFrom('Error: not logged in')).toEqual([])
+    expect(cursorModelsFrom('x;rm - evil')).toEqual([])
+  })
+  it('keeps the first of a duplicated id', () => {
+    expect(cursorModelsFrom('a - One\na - Two')).toEqual([{ id: 'a', name: 'One' }])
+  })
+})
+
+describe('antigravityModelsFrom — TSV discovery from `agy models`', () => {
+  const REAL = [
+    'gemini-4-argon-high\tGemini 4 Argon (High)',
+    'gemini-4-argon-medium\tGemini 4 Argon (Medium)',
+    'gemini-3.1-pro-high\tGemini 3.1 Pro (High)',
+    'claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)'
+  ].join('\n')
+
+  it('parses tab-separated id and display name rows', () => {
+    expect(antigravityModelsFrom(REAL)).toEqual([
+      { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)' },
+      { id: 'gemini-4-argon-medium', name: 'Gemini 4 Argon (Medium)' },
+      { id: 'gemini-3.1-pro-high', name: 'Gemini 3.1 Pro (High)' },
+      { id: 'claude-opus-4-6-thinking', name: 'Claude Opus 4.6 (Thinking)' }
+    ])
+  })
+
+  it('routes antigravity to its own catalogue and appends --model', () => {
+    const GATEWAY = [{ id: 'anthropic/claude-x' }]
+    const AGY = antigravityModelsFrom(REAL)
+    expect(modelsForAgent(GATEWAY, 'antigravity', [], [], AGY)).toEqual(AGY)
+    expect(modelsForAgent(GATEWAY, 'antigravity')).toEqual([])
+    expect(withAgentModel('agy', 'antigravity', 'gemini-4-argon-medium')).toBe(
+      "agy --model 'gemini-4-argon-medium'"
+    )
   })
 })

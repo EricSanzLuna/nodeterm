@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { DRY_RUN_VERBS, dryRunRequested, dryRunRefusal } from './control-verbs'
+import { DRY_RUN_VERBS, dryRunRequested, dryRunRefusal, runNowRequested } from './control-verbs'
 
 describe('dryRunRequested', () => {
   it('absent means no dry run', () => {
@@ -25,9 +25,13 @@ describe('dryRunRequested', () => {
 })
 
 describe('DRY_RUN_VERBS', () => {
-  it('covers exactly the spawn verbs', () => {
+  it('covers the spawn verbs, plus the one verb whose mutation cannot be undone', () => {
+    // The set was "exactly the spawn verbs" until `report-issue` joined it. The rule it actually
+    // encodes is the asymmetry in the header — easy to call, expensive or impossible to reverse —
+    // and publishing an issue to a repository is the strongest case of that in the whole verb
+    // list: a spawned node can be deleted, a filed issue is already on the internet.
     expect([...DRY_RUN_VERBS].sort()).toEqual(
-      ['open-agent', 'open-claude', 'open-terminal', 'open-worktree', 'spawn-team'].sort()
+      ['open-agent', 'open-claude', 'open-terminal', 'open-worktree', 'report-issue', 'spawn-team'].sort()
     )
   })
   it('never contains a destructive or read verb', () => {
@@ -43,5 +47,17 @@ describe('dryRunRefusal', () => {
     expect(msg).toContain('close')
     for (const v of DRY_RUN_VERBS) expect(msg).toContain(v)
     expect(msg).toContain('Nothing was done')
+  })
+})
+
+describe('runNowRequested (#925)', () => {
+  it('reads presence as on, like --dry-run', () => {
+    expect(runNowRequested({})).toBe(false)
+    expect(runNowRequested({ 'run-now': '' })).toBe(true)
+    expect(runNowRequested({ 'run-now': '1' })).toBe(true)
+    expect(runNowRequested({ 'run-now': 'yes' })).toBe(true)
+  })
+  it('only an explicit false|no|0 turns it off', () => {
+    for (const v of ['false', 'NO', '0', ' 0 ']) expect(runNowRequested({ 'run-now': v })).toBe(false)
   })
 })

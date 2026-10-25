@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
+import { Tooltip } from '../components/Tooltip'
+import { IconClose } from '../components/icons'
 import { NodeResizer, useReactFlow, type NodeProps } from '@xyflow/react'
 import { NODE_MIN_SIZES } from '../lib/nodeSizing'
 import { monaco } from '../editor/monaco-setup'
@@ -133,12 +135,13 @@ export function DiffNode({ id, data, selected }: NodeProps<CanvasNode>) {
   }, [])
 
   return (
+    <>
     <div
       className={`term-node editor-node${selected ? ' selected' : ''}`}
       style={{ borderTopColor: data.color }}
     >
-      <NodeResizer minWidth={NODE_MIN_SIZES.diff.width} minHeight={NODE_MIN_SIZES.diff.height} isVisible={selected} color={data.color} />
-
+      {/* Paint only: the old resize box in its old place (see .nt-resize-ghost in styles.css). */}
+      <NodeResizer isVisible={selected} color={data.color} lineClassName="nt-resize-ghost" handleClassName="nt-resize-ghost" />
       <div className="term-node__header">
         <span className="term-node__title-text" title={`${rel} — ${commitOid ? commitOid.slice(0, 7) : staged ? 'staged' : 'working'}`}>
           {rel.split('/').pop()}
@@ -146,13 +149,11 @@ export function DiffNode({ id, data, selected }: NodeProps<CanvasNode>) {
         </span>
         <span className="term-node__spacer" />
         <MaximizeButton id={id} maximized={!!data.premaxRect} />
-        <button
-          className="term-node__close"
-          title="Close"
-          onClick={() => deleteElements({ nodes: [{ id }] })}
-        >
-          ×
-        </button>
+        <Tooltip label="Close">
+          <button className="term-node__close" aria-label="Close" onClick={() => deleteElements({ nodes: [{ id }] })}>
+            <IconClose />
+          </button>
+        </Tooltip>
       </div>
 
       {fileMissing ? (
@@ -170,8 +171,17 @@ export function DiffNode({ id, data, selected }: NodeProps<CanvasNode>) {
           </div>
         </div>
       ) : (
-        <div className="editor-node__body nodrag nowheel" ref={bodyRef} />
+        // `nokey`: keeps React Flow's key handling (arrow-key node move, key-press hooks) out of
+        // Monaco, whose EditContext input React Flow does not recognise as one (#930).
+        <div className="editor-node__body nodrag nowheel nokey" ref={bodyRef} />
       )}
     </div>
+    {/* Sibling of the root, not a child: under Liquid Glass the root has a backdrop-filter,
+        which makes it the containing block for these absolute edges, so they were clipped and
+        covered (only the top edge stayed grabbable). Out here they sit on the node wrapper.
+        AFTER the root, never before it: focus mode reparents the root out of this wrapper, and
+        React inserting a control "before the root" would then throw NotFoundError. */}
+    <NodeResizer minWidth={NODE_MIN_SIZES.diff.width} minHeight={NODE_MIN_SIZES.diff.height} isVisible={selected} color={data.color} />
+    </>
   )
 }

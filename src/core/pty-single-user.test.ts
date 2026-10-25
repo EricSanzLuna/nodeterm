@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import fs from 'fs'
-import os from 'os'
 import path from 'path'
 import { initPlatform, resetPlatformForTests } from './platform'
 import { fakePlatform, type FakePlatform } from './platform-fake'
+import { testTmpDir } from './test-tmp'
 import { IPC } from '../shared/ipc'
 import { DEFAULT_SETTINGS } from '../shared/types'
 import { MODEL_GATEWAY_SECRET_REF } from '../shared/agents/model-gateway'
@@ -26,6 +26,8 @@ import { TMUX_SOCKET, sessionName } from './tmux-naming'
 interface FakePty {
   onDataCb?: (d: string) => void
   onExitCb?: (e: { exitCode: number }) => void
+  /** Everything written into the tmux client pty (the headless write tests read it). */
+  writes: string[]
   resizes: Array<{ cols: number; rows: number }>
   paused: boolean
   killed: boolean
@@ -54,7 +56,7 @@ vi.mock('node-pty', () => ({
     args: string[],
     opts: { cols: number; rows: number; cwd: string; env: Record<string, string> }
   ) => {
-    const p: FakePty = { resizes: [], paused: false, killed: false }
+    const p: FakePty = { writes: [], resizes: [], paused: false, killed: false }
     spawned.push(p)
     spawnArgs.push({ file, args, cols: opts.cols, rows: opts.rows, cwd: opts.cwd, env: opts.env })
     return {
@@ -64,7 +66,9 @@ vi.mock('node-pty', () => ({
       onExit: (cb: (e: { exitCode: number }) => void) => {
         p.onExitCb = cb
       },
-      write: () => {},
+      write: (d: string) => {
+        p.writes.push(d)
+      },
       resize: (cols: number, rows: number) => p.resizes.push({ cols, rows }),
       pause: () => {
         p.paused = true
@@ -98,7 +102,9 @@ vi.mock('child_process', () => {
     execCalls.push({ file, args })
     const ok = (stdout: string): void => cb?.(null, { stdout, stderr: '' })
     if (args.includes('has-session')) {
-      const target = args[args.indexOf('-t') + 1]
+      // Production asks with the EXACT form (`=nt-…` / `=nt-…:`); tmux matches it against the name.
+      const raw = args[args.indexOf('-t') + 1]
+      const target = raw.startsWith('=') ? raw.slice(1).replace(/:$/, '') : raw
       if (liveTmuxSessions.has(target)) ok('')
       // Real execFile carries tmux's exit status on err.code — 1 is what probeSaysAbsent
       // reads as genuine absence (vs a spawn failure, which has a string/no code).
@@ -121,6 +127,8 @@ vi.mock('child_process', () => {
 })
 
 const SOLO = 42
+/** The real timer, captured before any test installs fake timers (see `drainRealIo`). */
+const realSetTimeout = globalThis.setTimeout
 
 /**
  * Hermetic tmux resolution (issue #160). Without this, `init()` → `ensureTmux()` → `findTmux()`
@@ -167,7 +175,7 @@ describe('SINGLE-USER REGRESSION: co-attach must not change the solo path', () =
     liveTmuxSessions.clear()
     paneProcessReply = ''
     processGroupReply = ''
-    userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nt-solo-'))
+    userDataDir = testTmpDir('nt-solo-')
     fake = fakePlatform({ userDataDir })
     initPlatform(fake)
     vi.useFakeTimers()
@@ -185,7 +193,8 @@ describe('SINGLE-USER REGRESSION: co-attach must not change the solo path', () =
     // the last retry. The catch is what actually fixes it, and it is safe precisely because this
     // line is HOUSEKEEPING: the directory is per-test (`mkdtemp`) and lives in the OS temp dir, so
     // failing to remove it cannot indicate a defect in anything under test. A cleanup that can fail
-    // the suite is worse than a leftover directory.
+    // the suite is worse than a leftover directory. It does not stay left over: the dir comes from
+    // `testTmpDir`, which removes it again when the file ends, after the late write has landed.
     try {
       fs.rmSync(userDataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 })
     } catch {
@@ -214,6 +223,8 @@ describe('SINGLE-USER REGRESSION: co-attach must not change the solo path', () =
     fake.handlers[IPC.ptyCreate](SOLO, { cols, rows, persistKey, ...extra }) as Promise<{
       sessionId: string
       fresh: boolean
+      /** Set when the node was deleted (tombstoned) and this create is refused. */
+      closed?: { by: number | null }
     }>
   const resize = (sessionId: string, cols: number | null, rows: number | null) =>
     fake.senderListeners[IPC.ptyResize](SOLO, sessionId, cols, rows)
@@ -235,7 +246,7 @@ describe('SINGLE-USER REGRESSION: co-attach must not change the solo path', () =
   // ── The spawn itself: same tmux args, same cwd, same env ──────────────────────────────────
   it('spawns ONE tmux client with the unchanged attach flags, cwd and session name', async () => {
     const m = await tmuxManager()
-    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'nt-cwd-'))
+    const cwd = testTmpDir('nt-cwd-')
     await create(80, 24, 'solo-1', { cwd })
 
     expect(spawned).toHaveLength(1)
@@ -256,13 +267,16 @@ describe('SINGLE-USER REGRESSION: co-attach must not change the solo path', () =
     expect(args[args.indexOf('-c') + 1]).toBe(cwd)
     expect(args.slice(-2)).toEqual(['-s', sessionName('solo-1')])
     // The spawned process env is the pre-co-attach env: forced TERM, no inherited TMUX nesting,
-    // and the real login-shell PATH.
-    expect(spawnArgs[0].cwd).toBe(cwd)
+    // and the real login-shell PATH. The CLIENT runs from a stable dir, never the node's: the
+    // pane's directory is the `-c` above (issue #1131 — a client in the project dir can start the
+    // shared server there, and tmux 3.7 then drops every later pane's `-c` once that dir is gone).
+    const { localTmuxClientCwd } = await import('./pty-manager')
+    expect(spawnArgs[0].cwd).toBe(localTmuxClientCwd())
+    expect(spawnArgs[0].cwd).not.toBe(cwd)
     expect(env.TERM).toBe('xterm-256color')
     expect(env.TMUX).toBeUndefined()
     expect(env.TMUX_PANE).toBeUndefined()
     expect(env.PATH).toBe('/usr/bin:/bin')
-    fs.rmSync(cwd, { recursive: true, force: true })
   })
 
   it('injects the shared gateway into both the PTY and its tmux session environment', async () => {
@@ -298,7 +312,7 @@ describe('SINGLE-USER REGRESSION: co-attach must not change the solo path', () =
     }
   })
 
-  it('maps a selected Copilot model into its BYOK environment, never a model flag', async () => {
+  it('maps Copilot provider metadata into the spawn environment without exposing credentials on argv', async () => {
     const { PtyManager } = await import('./pty-manager')
     const m = new PtyManager()
     m.init(() => ({
@@ -324,7 +338,8 @@ describe('SINGLE-USER REGRESSION: co-attach must not change the solo path', () =
     // never the argv (see the claude case above for why).
     expect(spawnArgs[0].args.join(' ')).not.toContain('vk-secret')
     expect(spawnArgs[0].args.join(' ')).not.toContain('COPILOT_PROVIDER')
-    expect(spawnArgs[0].args.join(' ')).not.toContain('--model')
+    // This is the tmux client's argv. Copilot's --model selection is delivered later by the
+    // shared launch/resume command assembler, using this provider's internal model id.
   })
 
   it('reads a stored gateway key through the shell-owned secret cache', async () => {
@@ -390,6 +405,228 @@ describe('SINGLE-USER REGRESSION: co-attach must not change the solo path', () =
       if (inheritedControl === undefined) delete process.env.NODETERM_CANVAS_CONTROL
       else process.env.NODETERM_CANVAS_CONTROL = inheritedControl
     }
+  })
+
+  it.each([
+    { vanillaLaunchDefault: true, clearEnv: undefined },
+    { vanillaLaunchDefault: false, clearEnv: true }
+  ])('preserves a plain terminal environment in subscription mode: %j', async (mode) => {
+    const inherited = {
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+      ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL
+    }
+    process.env.ANTHROPIC_API_KEY = 'plain-terminal-key'
+    process.env.ANTHROPIC_BASE_URL = 'https://plain-terminal-provider.example.test'
+    try {
+      const { PtyManager } = await import('./pty-manager')
+      const m = new PtyManager()
+      m.init(() => ({
+        ...DEFAULT_SETTINGS,
+        agentLaunchMode: mode.vanillaLaunchDefault ? 'subscription' : 'gateway',
+        vanillaLaunchDefault: mode.vanillaLaunchDefault,
+        modelGateway: { baseUrl: 'https://bifrost.example.test', apiKey: 'vk-gateway' }
+      }))
+      m.registerIpc()
+
+      await create(80, 24, 'subscription-plain-terminal', { clearEnv: mode.clearEnv })
+
+      expect(spawnArgs[0].env.ANTHROPIC_API_KEY).toBe('plain-terminal-key')
+      expect(spawnArgs[0].env.ANTHROPIC_BASE_URL).toBe(
+        'https://plain-terminal-provider.example.test'
+      )
+      expect(spawnArgs[0].args.join(' ')).not.toContain('vk-gateway')
+    } finally {
+      for (const [key, value] of Object.entries(inherited)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+
+  // "Restart on subscription": clearEnv spawns the session VANILLA — skip the gateway AND strip
+  // inherited provider vars (a LaunchAgent/zshrc export a GUI launch still inherits) so the agent
+  // falls back to its OWN default provider. Both moves are gated on the agent's vanillaEnvPattern
+  // (resolved through its base harness). The strip runs BEFORE custom-agent env, so a user who
+  // explicitly declares a provider var on a custom agent still wins.
+  it('clearEnv skips the gateway and strips inherited provider env for claude', async () => {
+    const inheritedBase = process.env.ANTHROPIC_BASE_URL
+    const inheritedKey = process.env.ANTHROPIC_API_KEY
+    const inheritedDir = process.env.CLAUDE_CONFIG_DIR
+    process.env.ANTHROPIC_BASE_URL = 'https://launchagent-gateway.example.test'
+    process.env.ANTHROPIC_API_KEY = 'sk-inherited'
+    process.env.CLAUDE_CONFIG_DIR = '/home/me/.nodeterm/claude-accounts/abc'
+    try {
+      const { PtyManager } = await import('./pty-manager')
+      const m = new PtyManager()
+      m.init(() => ({
+        ...DEFAULT_SETTINGS,
+        modelGateway: {
+          baseUrl: 'https://bifrost.example.test',
+          apiKey: 'vk-gateway'
+        }
+      }))
+      m.registerIpc()
+
+      await create(80, 24, 'vanilla-claude', { agentId: 'claude', clearEnv: true })
+
+      const env = spawnArgs[0].env
+      // (1) the gateway is NOT injected …
+      expect(env.ANTHROPIC_BASE_URL).toBeUndefined()
+      expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+      // … and (2) the INHERITED provider vars are stripped too, so the session does not fall back
+      // to the LaunchAgent-set base URL instead of the subscription.
+      expect(env.ANTHROPIC_BASE_URL).toBeUndefined()
+      expect(env.ANTHROPIC_API_KEY).toBeUndefined()
+      // CLAUDE_CONFIG_DIR is the managed-account dir, NOT a provider credential — stripping it
+      // would break account isolation, so it survives a vanilla relaunch.
+      expect(env.CLAUDE_CONFIG_DIR).toBe('/home/me/.nodeterm/claude-accounts/abc')
+    } finally {
+      for (const [k, v] of [
+        ['ANTHROPIC_BASE_URL', inheritedBase],
+        ['ANTHROPIC_API_KEY', inheritedKey],
+        ['CLAUDE_CONFIG_DIR', inheritedDir]
+      ] as const) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    }
+  })
+
+  it('clearEnv is one-directional: unset, the gateway is injected as usual', async () => {
+    const { PtyManager } = await import('./pty-manager')
+    const m = new PtyManager()
+    m.init(() => ({
+      ...DEFAULT_SETTINGS,
+      modelGateway: { baseUrl: 'https://bifrost.example.test', apiKey: 'vk-gateway' }
+    }))
+    m.registerIpc()
+
+    await create(80, 24, 'gateway-claude', { agentId: 'claude' })
+
+    expect(spawnArgs[0].env.ANTHROPIC_BASE_URL).toBe('https://bifrost.example.test/anthropic')
+    expect(spawnArgs[0].env.ANTHROPIC_AUTH_TOKEN).toBe('vk-gateway')
+  })
+
+  it('clearEnv strips COPILOT_PROVIDER_* for copilot but keeps the home dir', async () => {
+    const inheritedHome = process.env.COPILOT_HOME
+    const inheritedProviderKey = process.env.COPILOT_PROVIDER_API_KEY
+    process.env.COPILOT_HOME = '/home/me/.copilot'
+    process.env.COPILOT_PROVIDER_API_KEY = 'sk-inherited'
+    try {
+      const { PtyManager } = await import('./pty-manager')
+      const m = new PtyManager()
+      m.init(() => ({
+        ...DEFAULT_SETTINGS,
+        modelGateway: { baseUrl: 'https://bifrost.example.test', apiKey: 'vk-gateway' }
+      }))
+      m.registerIpc()
+
+      await create(80, 24, 'vanilla-copilot', { agentId: 'copilot', clearEnv: true })
+
+      const env = spawnArgs[0].env
+      // Gateway + inherited provider vars both gone.
+      expect(env.COPILOT_PROVIDER_API_KEY).toBeUndefined()
+      expect(env.COPILOT_PROVIDER_BASE_URL).toBeUndefined()
+      // Home dir is a config dir, not a credential — survives.
+      expect(env.COPILOT_HOME).toBe('/home/me/.copilot')
+    } finally {
+      for (const [k, v] of [
+        ['COPILOT_HOME', inheritedHome],
+        ['COPILOT_PROVIDER_API_KEY', inheritedProviderKey]
+      ] as const) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    }
+  })
+
+  // The global "Launch on subscription" default is the counterpart to the per-node `clearEnv`
+  // recycle: read LIVE at spawn, so a fresh launch strips the gateway + inherited provider env
+  // WITHOUT a per-node flag (and survives a reboot, since the setting is the source of truth, not
+  // a one-shot data field that is cleared after its single use).
+  it('subscription launch mode strips the gateway + inherited env on a fresh spawn', async () => {
+    const inheritedBase = process.env.ANTHROPIC_BASE_URL
+    const inheritedDir = process.env.CLAUDE_CONFIG_DIR
+    process.env.ANTHROPIC_BASE_URL = 'https://launchagent-gateway.example.test'
+    process.env.CLAUDE_CONFIG_DIR = '/home/me/.nodeterm/claude-accounts/abc'
+    try {
+      const { PtyManager } = await import('./pty-manager')
+      const m = new PtyManager()
+      m.init(() => ({
+        ...DEFAULT_SETTINGS,
+        // The three-way successor to the boolean. (`vanillaLaunchDefault` is now a mirror kept in
+        // lockstep by the settings read path; tests that build settings inline must set the mode.)
+        agentLaunchMode: 'subscription',
+        vanillaLaunchDefault: true,
+        modelGateway: { baseUrl: 'https://bifrost.example.test', apiKey: 'vk-gateway' }
+      }))
+      m.registerIpc()
+
+      // No `clearEnv` on the node — the SETTING is what strips. This is the new-session case the
+      // per-node action could not serve (it recycles, which needs a session with turns to resume).
+      await create(80, 24, 'vanilla-default-claude', { agentId: 'claude' })
+
+      const env = spawnArgs[0].env
+      expect(env.ANTHROPIC_BASE_URL).toBeUndefined()
+      expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+      // Inherited provider var stripped too — no fall-back to the LaunchAgent gateway.
+      expect(env.ANTHROPIC_BASE_URL).toBeUndefined()
+      // Account isolation survives (config dir is not a provider credential).
+      expect(env.CLAUDE_CONFIG_DIR).toBe('/home/me/.nodeterm/claude-accounts/abc')
+    } finally {
+      for (const [k, v] of [
+        ['ANTHROPIC_BASE_URL', inheritedBase],
+        ['CLAUDE_CONFIG_DIR', inheritedDir]
+      ] as const) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    }
+  })
+
+  it('subscription is a no-op without a strip pattern, while both gateway modes keep the gateway', async () => {
+    const { PtyManager } = await import('./pty-manager')
+    const m = new PtyManager()
+    m.init(() => ({
+      ...DEFAULT_SETTINGS,
+      agentLaunchMode: 'subscription',
+      vanillaLaunchDefault: true,
+      modelGateway: { baseUrl: 'https://bifrost.example.test', apiKey: 'vk-gateway' }
+    }))
+    m.registerIpc()
+
+    // gemini has no vanillaEnvPattern (and no gateway route at all) → the setting strips nothing
+    // and the spawn proceeds normally. A global toggle must not change an agent it does not cover:
+    // a non-provider env var (PATH) survives the strip pass untouched. (A provider var inherited
+    // from the host env is NOT stripped either — gemini has no pattern — which is the no-op.)
+    await create(80, 24, 'vanilla-default-gemini', { agentId: 'gemini' })
+    expect(typeof spawnArgs[0].env.PATH).toBe('string')
+
+    // And with the setting OFF (the default), a claude spawn keeps the gateway — the non-disruptive
+    // upgrade guarantee for existing users. (spawnArgs accumulates within a test: this is [1].)
+    const m2 = new PtyManager()
+    m2.init(() => ({
+      ...DEFAULT_SETTINGS,
+      agentLaunchMode: 'gateway',
+      vanillaLaunchDefault: false,
+      modelGateway: { baseUrl: 'https://bifrost.example.test', apiKey: 'vk-gateway' }
+    }))
+    m2.registerIpc()
+    await create(80, 24, 'gateway-claude-default-off', { agentId: 'claude' })
+    expect(spawnArgs[1].env.ANTHROPIC_BASE_URL).toBe('https://bifrost.example.test/anthropic')
+    expect(spawnArgs[1].env.ANTHROPIC_AUTH_TOKEN).toBe('vk-gateway')
+
+    // Gateway (default model) changes the renderer's launch command, not PTY credential injection.
+    const m3 = new PtyManager()
+    m3.init(() => ({
+      ...DEFAULT_SETTINGS,
+      agentLaunchMode: 'gateway-model',
+      modelGateway: { baseUrl: 'https://bifrost.example.test', apiKey: 'vk-gateway' }
+    }))
+    m3.registerIpc()
+    await create(80, 24, 'gateway-claude-default-model', { agentId: 'claude' })
+    expect(spawnArgs[2].env.ANTHROPIC_BASE_URL).toBe('https://bifrost.example.test/anthropic')
+    expect(spawnArgs[2].env.ANTHROPIC_AUTH_TOKEN).toBe('vk-gateway')
   })
 
   // ── `fresh` drives scrollback replay + agent resume: it must still be computed from tmux ──
@@ -561,7 +798,8 @@ describe('SINGLE-USER REGRESSION: co-attach must not change the solo path', () =
     kill(sessionId)
     const captures = tmuxCalls('capture-pane')
     expect(captures).toHaveLength(1)
-    expect(captures[0].args[captures[0].args.indexOf('-t') + 1]).toBe(sessionName('solo-1'))
+    // Exact (`=name:`): a bare target prefix-matches a longer session (tmux-naming `exactPaneTarget`).
+    expect(captures[0].args[captures[0].args.indexOf('-t') + 1]).toBe(`=${sessionName('solo-1')}:`)
   })
 
   it('killAll (app quit) detaches the client but never kills the tmux session', async () => {
@@ -664,5 +902,102 @@ describe('SINGLE-USER REGRESSION: co-attach must not change the solo path', () =
     expect(spawned).toHaveLength(2)
     expect(again.sessionId).not.toBe(sessionId)
     expect(again.fresh).toBe(true)
+  })
+
+  // ── persistentSpawnAvailable (#925) ────────────────────────────────────────────────────────
+  // Nested here, not at top level: `tmuxManager()` and the platform/userData harness it needs are
+  // scoped to this describe.
+  describe('persistentSpawnAvailable (#925)', () => {
+    it('is true with tmux found and enabled', async () => {
+      const m = await tmuxManager()
+      expect(m.persistentSpawnAvailable()).toBe(true)
+    })
+    it('is false when tmux persistence is switched off (and no session-host applies on this platform)', async () => {
+      const { PtyManager } = await import('./pty-manager')
+      const m = new PtyManager()
+      m.init(() => ({ ...DEFAULT_SETTINGS, tmuxEnabled: false }))
+      m.registerIpc()
+      expect(m.persistentSpawnAvailable()).toBe(false)
+    })
+  })
+
+  // ── Headless client 0 on a TMUX-backed session (#925) ──────────────────────────────────────
+  // The plain-shell suite (pty-headless-taps.test.ts) cannot tell "detach client 0" from "destroy
+  // the session": there, releasing the last client kills the shell either way. Here the tmux
+  // session is what must survive, and `tmuxCalls('kill-session')` is the instrument that proves it.
+  describe('headless client 0 on a tmux-backed session (#925)', () => {
+    /**
+     * Let REAL I/O settle before asserting that no kill-session went out. An end path
+     * (`destroySession` → `runEndSession`) awaits real fs work (`deleteScrollback`) before it runs
+     * kill-session, so neither a synchronous look nor advancing the fake clock would ever see it.
+     * `realSetTimeout` is captured at module load, before `vi.useFakeTimers()` replaces the global.
+     */
+    const drainRealIo = (): Promise<void> => new Promise((res) => realSetTimeout(res, 50))
+
+    it('write + output tap round-trip, then release detaches the tmux client and never kills the session', async () => {
+      const m = await tmuxManager()
+      const r = await m.createHeadless({ cols: 80, rows: 24, persistKey: 'n1' })
+      expect(r.sessionId).toBeTruthy()
+      expect(spawned).toHaveLength(1)
+      // It really is the tmux client for `nt-n1`, not a plain shell.
+      expect(spawnArgs[0].args).toContain('new-session')
+      expect(spawnArgs[0].args.slice(-2)).toEqual(['-s', sessionName('n1')])
+
+      const seen: string[] = []
+      const off = m.onOutput('n1', (c) => seen.push(c))
+      expect(m.writeHeadless('n1', 'echo hi\r')).toBe(true)
+      expect(spawned[0].writes).toEqual(['echo hi\r'])
+      spawned[0].onDataCb?.('hi')
+      vi.advanceTimersByTime(20) // past FLUSH_MS
+      expect(seen.join('')).toBe('hi')
+      off()
+
+      execCalls.length = 0
+      m.releaseHeadless('n1')
+      await drainRealIo()
+      expect(spawned[0].killed).toBe(true) // the tmux CLIENT pty is released
+      expect(tmuxCalls('kill-session')).toEqual([]) // the tmux session keeps running
+      expect(m.writeHeadless('n1', 'x')).toBe(false) // client 0 no longer holds anything
+      expect(spawned[0].writes).toEqual(['echo hi\r'])
+
+      // The node is detached, not deleted: when the user later opens its project, the renderer's
+      // create WARM-attaches to the still-running tmux session (a destroy would have tombstoned
+      // the node and refused this create with `closed`).
+      liveTmuxSessions.add(sessionName('n1'))
+      const again = await create(80, 24, 'n1')
+      expect(again.closed).toBeUndefined()
+      expect(again.fresh).toBe(false)
+      expect(spawned).toHaveLength(2) // a new tmux client for the same session
+    })
+
+    it('with a real client co-attached, release drops ONLY client 0: the viewer stays subscribed', async () => {
+      const m = await tmuxManager()
+      const headless = await m.createHeadless({ cols: 80, rows: 24, persistKey: 'n1' })
+      const viewer = await create(80, 24, 'n1') // the renderer's create joins via co-attach
+      expect(spawned).toHaveLength(1) // ONE tmux client, two subscribers
+      expect(viewer.sessionId).toBe(headless.sessionId)
+
+      execCalls.length = 0
+      m.releaseHeadless('n1')
+      await drainRealIo()
+      expect(spawned[0].killed).toBe(false) // the viewer still holds the tmux client
+      expect(tmuxCalls('kill-session')).toEqual([])
+      expect(m.writeHeadless('n1', 'x')).toBe(false) // client 0 is gone …
+      expect(spawned[0].writes).toEqual([])
+
+      // … while the viewer still gets the output,
+      fake.sent.length = 0
+      spawned[0].onDataCb?.('still here')
+      vi.advanceTimersByTime(20)
+      const data = fake.sent.filter((s) => s.channel === IPC.ptyData(viewer.sessionId))
+      expect(data.map((s) => s.to)).toEqual([SOLO])
+      expect(data.map((s) => s.args[0])).toEqual(['still here'])
+
+      // … and is the last subscriber: its own detach is what releases the client, still without
+      // touching the tmux session.
+      kill(viewer.sessionId)
+      expect(spawned[0].killed).toBe(true)
+      expect(tmuxCalls('kill-session')).toEqual([])
+    })
   })
 })

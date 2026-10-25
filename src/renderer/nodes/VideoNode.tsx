@@ -1,7 +1,10 @@
 import { useEffect, useState } from 'react'
+import { Tooltip } from '../components/Tooltip'
+import { MaximizeButton } from './MaximizeButton'
+import { IconClose } from '../components/icons'
 import { Handle, NodeResizer, Position, useReactFlow, type NodeProps } from '@xyflow/react'
 import { NODE_MIN_SIZES } from '../lib/nodeSizing'
-import type { CanvasNode } from '../state/workspace'
+import { isAudioFile, type CanvasNode } from '../state/workspace'
 import { useProjects } from '../state/projects'
 
 /**
@@ -20,15 +23,19 @@ export default function VideoNode({ id, data, selected }: NodeProps<CanvasNode>)
   const filePath = (data.filePath as string) ?? ''
   const fileName = filePath.split('/').pop() || 'video'
   const remote = !!data.sshFs
+  const audio = isAudioFile(filePath)
 
   useEffect(() => {
+    setSrc('')
+    setError('')
+    setFetching(false)
     if (!filePath) return
     let alive = true
     if (remote) {
       // Remote fetch can take a while for a large file — say what the wait is.
       const projectId = useProjects.getState().activeProjectId
       if (!projectId) {
-        setError('Couldn’t load this video.')
+        setError('Couldn’t load this media file.')
         return
       }
       setFetching(true)
@@ -43,7 +50,7 @@ export default function VideoNode({ id, data, selected }: NodeProps<CanvasNode>)
         .catch(() => {
           if (!alive) return
           setFetching(false)
-          setError('Couldn’t load this video.')
+          setError('Couldn’t load this media file.')
         })
       return () => {
         alive = false
@@ -55,7 +62,7 @@ export default function VideoNode({ id, data, selected }: NodeProps<CanvasNode>)
         if (alive) setSrc(url)
       })
       .catch(() => {
-        if (alive) setError('Couldn’t load this video.')
+        if (alive) setError('Couldn’t load this media file.')
       })
     return () => {
       alive = false
@@ -66,11 +73,13 @@ export default function VideoNode({ id, data, selected }: NodeProps<CanvasNode>)
   }, [filePath, remote])
 
   return (
+    <>
     <div
       className={`term-node video-node${selected ? ' selected' : ''}`}
       style={{ borderTopColor: data.color }}
     >
-      <NodeResizer minWidth={NODE_MIN_SIZES.video.width} minHeight={NODE_MIN_SIZES.video.height} isVisible={selected} color={data.color} />
+      {/* Paint only: the old resize box in its old place (see .nt-resize-ghost in styles.css). */}
+      <NodeResizer isVisible={selected} color={data.color} lineClassName="nt-resize-ghost" handleClassName="nt-resize-ghost" />
       {/* Invisible target handle so a rope from the agent node that opened this can attach. */}
       <Handle
         id="flow-in"
@@ -85,24 +94,27 @@ export default function VideoNode({ id, data, selected }: NodeProps<CanvasNode>)
           {fileName}
         </span>
         <span className="term-node__spacer" />
-        <button
-          className="term-node__close"
-          title="Close"
-          onClick={() => deleteElements({ nodes: [{ id }] })}
-        >
-          ×
-        </button>
+        <MaximizeButton id={id} maximized={!!data.premaxRect} />
+        <Tooltip label="Close">
+          <button className="term-node__close" aria-label="Close" onClick={() => deleteElements({ nodes: [{ id }] })}>
+            <IconClose />
+          </button>
+        </Tooltip>
       </div>
 
       <div className="editor-node__body">
-        <div className="editor-node__image nodrag nowheel">
+        <div className="editor-node__image nodrag nowheel nopan">
           {src ? (
-            <video
-              src={src}
-              controls
-              preload="metadata"
-              style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-            />
+            audio ? (
+              <audio src={src} controls preload="metadata" style={{ width: '100%' }} />
+            ) : (
+              <video
+                src={src}
+                controls
+                preload="metadata"
+                style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+              />
+            )
           ) : (
             <span className="editor-node__loading">
               {error || (fetching ? 'Fetching from the host…' : 'Loading…')}
@@ -111,5 +123,12 @@ export default function VideoNode({ id, data, selected }: NodeProps<CanvasNode>)
         </div>
       </div>
     </div>
+    {/* Sibling of the root, not a child: under Liquid Glass the root has a backdrop-filter,
+        which makes it the containing block for these absolute edges, so they were clipped and
+        covered (only the top edge stayed grabbable). Out here they sit on the node wrapper.
+        AFTER the root, never before it: focus mode reparents the root out of this wrapper, and
+        React inserting a control "before the root" would then throw NotFoundError. */}
+    <NodeResizer minWidth={NODE_MIN_SIZES.video.width} minHeight={NODE_MIN_SIZES.video.height} isVisible={selected} color={data.color} />
+    </>
   )
 }

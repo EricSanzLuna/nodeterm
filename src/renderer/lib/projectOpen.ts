@@ -3,6 +3,8 @@
 // calls and the reply — so every decision that does not need React is unit-testable here, the
 // same reasoning as controlRouting.ts / pendingLaunch.ts.
 import { oneLine } from '@shared/one-line'
+import { rootPositionWith } from '@shared/root-position'
+import { sourceIsControlCapable } from './controlRouting'
 
 /** The little these helpers need to know about a project. */
 export interface ProjectForOpen {
@@ -82,11 +84,88 @@ export function clearAttachConsentForTests(): void {
  * is red-capable (review #363 I-2) — the dispatch only relays the answer; an empty-string value
  * counts as "not passed" (the shim always sends a value for a bare flag).
  */
-export function projectTargetFlagRefusal(args: { group?: string; after?: string }): string | null {
-  if (args.group || args.after) {
-    return 'project-target-flag-unsupported: --group/--after cannot be combined with --project'
+export function projectTargetFlagRefusal(args: {
+  group?: string
+  after?: string
+  'after-success'?: string
+}): string | null {
+  // `--after-success` names station ids exactly as `--after` does, so it is excluded for the same
+  // reason (and it is folded into `after` before this runs, so either field refuses it).
+  if (args.group || args.after || args['after-success']) {
+    return 'project-target-flag-unsupported: --group/--after/--after-success cannot be combined with --project'
   }
   return null
+}
+
+/** What `resolveProjectTarget` needs to know about a project (a structural subset of `Project`). */
+export interface ProjectTargetProject {
+  id: string
+  ssh?: unknown
+  remote?: boolean
+  nodes: readonly { id: string; agentId?: unknown }[]
+}
+
+export type ProjectTargetResolution<P> =
+  /** The target IS the caller's own project: fall through to the legacy path (B3a). */
+  | { kind: 'own' }
+  | { kind: 'refused'; error: string }
+  | { kind: 'target'; project: P }
+
+/**
+ * The renderer's `--project` belt, ONE definition for every verb that takes the flag
+ * (`open-terminal`/`open-claude`/`open-agent` and `run`, #925). Main's `gateProjectTarget` already
+ * enforced own-or-granted before forwarding, so none of this is the boundary — but it is the
+ * cross-project reach's second line, and two hand-copies of it are how one of them drifts.
+ *
+ * Order matters and is the dispatch's historical one: the caller's own project first (it is not a
+ * cross-project call at all, so nothing below applies to it), then the source checks, then the
+ * target checks.
+ * - The caller's project is the ACTIVE one when the source is on the live canvas, else the one
+ *   whose serialized nodes hold it.
+ * - The unknown-target refusal is worded TRANSIENT: main refused every stranger id with one
+ *   byte-identical sentence (no existence oracle), so this only fires for a target main
+ *   authorized that the renderer's store cannot see yet (mid-hydration).
+ * - The SSH/relay refusal is belt for an invariant main already holds: grants are minted only by
+ *   local open-project, so a granted SSH id cannot exist; if that ever breaks, the target is still
+ *   refused, never acted on. A relay tab is another machine's project entirely. `sshVerbWord` is
+ *   the one word the verbs differ in; with `opening` the sentence is byte-identical to core's
+ *   `PROJECT_TARGET_SSH_UNSUPPORTED`.
+ */
+export function resolveProjectTarget<P extends ProjectTargetProject>(input: {
+  targetId: string
+  sourceNodeId: string
+  /** React Flow's nodes — the ACTIVE project's. */
+  liveNodes: readonly { id: string; data: { agentId?: unknown } }[]
+  projects: readonly P[]
+  activeProjectId: string
+  sshVerbWord: 'opening' | 'starting'
+}): ProjectTargetResolution<P> {
+  const liveSrc = input.liveNodes.find((n) => n.id === input.sourceNodeId)
+  const storedSrc = input.projects
+    .flatMap((p) => p.nodes.map((n) => ({ node: n, projectId: p.id })))
+    .find((x) => x.node.id === input.sourceNodeId)
+  const callerProjectId = liveSrc ? input.activeProjectId : storedSrc?.projectId
+  if (input.targetId === callerProjectId) return { kind: 'own' }
+  if (!liveSrc && !storedSrc) {
+    return { kind: 'refused', error: 'source node is not in any open project' }
+  }
+  if (!sourceIsControlCapable(liveSrc?.data.agentId ?? storedSrc?.node.agentId)) {
+    return { kind: 'refused', error: 'source node is not a control-capable agent' }
+  }
+  const project = input.projects.find((p) => p.id === input.targetId)
+  if (!project) {
+    return {
+      kind: 'refused',
+      error: 'project-target-refused: the target project is not available here — try again'
+    }
+  }
+  if (project.ssh || project.remote) {
+    return {
+      kind: 'refused',
+      error: `project-target-ssh-unsupported: ${input.sshVerbWord} sessions into an SSH project is not supported — do not retry`
+    }
+  }
+  return { kind: 'target', project }
 }
 
 export type OpenProjectPlan =
@@ -185,7 +264,7 @@ export function openProjectReply(
 
 /**
  * Re-arm a freshly-built node for a COLD open (spec §2.2): its composed launch command is MOVED —
- * never copied — from `initialCommand` into `pendingLaunch: { after: [], command }`.
+ * never copied — from `initialCommand` into `pendingLaunch: { after: [], command, attempted: false }`.
  * `initialCommand` is deliberately never serialized (workspace.ts), while `pendingLaunch` is: a
  * command left in `initialCommand` on the store path would be silently dropped by serialization
  * and the node would never start; a copy left behind would double-deliver if that ever changed.
@@ -199,7 +278,7 @@ export function armForColdOpen<
   if (!command) return node
   return {
     ...node,
-    data: { ...node.data, initialCommand: undefined, pendingLaunch: { after: [], command } }
+    data: { ...node.data, initialCommand: undefined, pendingLaunch: { after: [], command, attempted: false } }
   }
 }
 
@@ -216,27 +295,9 @@ export interface PlacedNode {
 const placedW = (n: PlacedNode): number => n.size?.width ?? (n.width as number) ?? 0
 const placedH = (n: PlacedNode): number => n.size?.height ?? (n.height as number) ?? 0
 
-/** A node's position in ROOT space: its own plus every ancestor frame's origin (a group child's
- *  stored position is frame-relative). Cycle-guarded like every other parent walk. */
-function rootPosition(n: PlacedNode, byId: Map<string, PlacedNode>): { x: number; y: number } {
-  let x = n.position.x
-  let y = n.position.y
-  const seen = new Set<string>(n.id ? [n.id] : [])
-  let parentId = n.parentId
-  while (parentId && !seen.has(parentId)) {
-    seen.add(parentId)
-    const parent = byId.get(parentId)
-    if (!parent) break
-    x += parent.position.x
-    y += parent.position.y
-    parentId = parent.parentId
-  }
-  return { x, y }
-}
-
 /**
- * A stored node's ROOT-space position — the public face of `rootPosition`, so the cold-open
- * planner does not need a third copy of a parent walk this repo already carries two of.
+ * A stored node's ROOT-space position (a group child's stored position is frame-relative), over
+ * the shared parent walk in `@shared/root-position`.
  */
 export function rootPositionIn(
   nodes: readonly PlacedNode[],
@@ -244,7 +305,7 @@ export function rootPositionIn(
 ): { x: number; y: number } {
   const byId = new Map<string, PlacedNode>()
   for (const n of nodes) if (n.id) byId.set(n.id, n)
-  return rootPosition(node, byId)
+  return rootPositionWith(node, (id) => byId.get(id))
 }
 
 /**
@@ -264,7 +325,7 @@ export function nextFreePosition(
   let left = Infinity
   let bottom = -Infinity
   for (const n of nodes) {
-    const at = rootPosition(n, byId)
+    const at = rootPositionWith(n, (id) => byId.get(id))
     if (Number.isFinite(at.x)) left = Math.min(left, at.x)
     const b = at.y + placedH(n)
     if (Number.isFinite(b)) bottom = Math.max(bottom, b)
@@ -297,12 +358,17 @@ export function nextFreePosition(
 export type UnavailableRecovery = 'clear' | 'rehydrate' | 'keep'
 
 export function unavailableRecovery(
-  project: { unavailable?: boolean; ssh?: unknown },
+  project: { unavailable?: boolean; ssh?: unknown; storeInAppData?: boolean },
   fileState: 'present' | 'absent' | 'unreadable'
 ): UnavailableRecovery {
   // Remote projects are not ours to judge from a local stat — their file lives on the host, and
   // their placeholder is cleared by the reconnect path instead.
   if (!project.unavailable || project.ssh) return 'keep'
+  // A project stored in app data (#1145) never had its canvas in the folder: a project.json there
+  // is a stale copy or a teammate's, never this project's to rehydrate from. Its placeholder means
+  // its app-data file and cache are both gone, so opening the folder starts it again, empty, in app
+  // data — and the store still refuses to write that empty canvas over a data file that reappears.
+  if (project.storeInAppData) return 'clear'
   if (fileState === 'absent') return 'clear'
   if (fileState === 'present') return 'rehydrate'
   return 'keep'

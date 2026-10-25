@@ -1,20 +1,22 @@
 import { useMemo, useState } from 'react'
+import { IconClose } from '../icons'
 import type { BoardLogAuthor, KanbanPriority, ProjectKanban } from '@shared/types'
-import { cardMeta, labelsForCard, setCardDue, setCardPriority, toggleAssignee } from '../../lib/kanban'
+import { cardAssignees, cardMeta, labelsForCard, setCardDue, setCardPriority, toggleAssignee } from '../../lib/kanban'
 import { LabelChips } from './LabelChips'
 import { LabelPicker } from './LabelPicker'
 import { useShallow } from 'zustand/react/shallow'
 import { loadIdentity, selectFaces, usePresence } from '../../state/presence'
 import { useBoardLog } from '../../state/boardLog'
 import { useProjects } from '../../state/projects'
+import { useOwningProjectId } from '../../session/owning-project'
 
 const initialOf = (name: string): string => (name.trim()[0] ?? '?').toUpperCase()
 
 export const PRIORITIES: Array<{ id: KanbanPriority; label: string; color: string }> = [
-  { id: 'low', label: 'Low', color: '#8e8e93' },
-  { id: 'medium', label: 'Medium', color: '#ffd60a' },
-  { id: 'high', label: 'High', color: '#ff9f0a' },
-  { id: 'urgent', label: 'Urgent', color: '#ff453a' }
+  { id: 'low', label: 'Low', color: 'var(--state-queued)' },
+  { id: 'medium', label: 'Medium', color: 'var(--caution)' },
+  { id: 'high', label: 'High', color: 'var(--priority-high)' },
+  { id: 'urgent', label: 'Urgent', color: 'var(--danger)' }
 ]
 
 /** Local-wallclock value for a datetime-local input (its value is timezone-less). */
@@ -38,7 +40,11 @@ export function CardMetaBar({ nodeId, board, onChange }: CardMetaBarProps) {
   const [labelsOpen, setLabelsOpen] = useState(false)
   const meta = cardMeta(board, nodeId)
   const labels = labelsForCard(board, nodeId)
-  const projectId = useProjects((s) => s.activeProjectId)
+  // The card's own project (the modal's ProjectSessionScope), else the active one — the same id
+  // BoardLogPanel keys the log on, so the member pool reads the log the panel shows.
+  const owningProjectId = useOwningProjectId()
+  const activeProjectId = useProjects((s) => s.activeProjectId)
+  const projectId = owningProjectId ?? activeProjectId
   const logEntries = useBoardLog((s) => s.entriesFor(projectId))
   // selectFaces + useShallow, NOT selectOthers: the pool only needs name+color, and applyDiff
   // replaces the whole PeerState on every cursor patch (~20/s per peer) — subscribing to
@@ -56,7 +62,7 @@ export function CardMetaBar({ nodeId, board, onChange }: CardMetaBarProps) {
     return [...seen.values()]
   }, [peers, logEntries])
 
-  const assignees = meta?.assignees ?? []
+  const assignees = cardAssignees(meta)
   const due = meta?.dueAt
   const overdue = due !== undefined && due < Date.now()
   const priority = meta?.priority
@@ -143,7 +149,7 @@ export function CardMetaBar({ nodeId, board, onChange }: CardMetaBarProps) {
               title="Clear due date"
               onClick={() => onChange(setCardDue(board, nodeId, null))}
             >
-              ✕
+              <IconClose />
             </button>
           )}
         </div>
@@ -155,7 +161,7 @@ export function CardMetaBar({ nodeId, board, onChange }: CardMetaBarProps) {
             <button
               key={pr.id}
               className={`kanban-prio${priority === pr.id ? ' kanban-prio--on' : ''}`}
-              style={priority === pr.id ? { background: `${pr.color}2e`, borderColor: pr.color, color: pr.color } : undefined}
+              style={priority === pr.id ? { background: `color-mix(in srgb, ${pr.color} 18%, transparent)`, borderColor: pr.color, color: pr.color } : undefined}
               title={priority === pr.id ? `${pr.label} — click to clear` : pr.label}
               onClick={() => onChange(setCardPriority(board, nodeId, priority === pr.id ? null : pr.id))}
             >

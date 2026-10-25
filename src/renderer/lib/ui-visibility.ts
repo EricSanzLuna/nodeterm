@@ -27,18 +27,32 @@ export const HIDEABLE_MENU_ITEMS: readonly HideableRow[] = [
   { id: 'snap-zone', label: 'Snap to zone' },
   { id: 'collapse', label: 'Collapse / Expand' },
   { id: 'markdown-view', label: 'Markdown view' },
-  { id: 'refresh-terminal', label: 'Refresh terminal' }
+  { id: 'refresh-terminal', label: 'Refresh terminal' },
+  // The ROW that opens the create dialog. The LIVE chip that says a terminal IS being broadcast is
+  // deliberately in neither inventory (lib/live-link.guard.test.ts).
+  { id: 'live-link', label: 'Share live link' },
+  { id: 'vanilla-restart', label: 'Restart on subscription' }
 ]
 
 /** Hideable terminal node header buttons, in header order. */
 export const HIDEABLE_HEADER_BUTTONS: readonly HideableRow[] = [
+  // Not a button but the model + context-usage pill (issue #1141). `ContextMeter` asks this id
+  // itself, so it hides on all three places the pill is drawn: node header, kanban card, card
+  // modal. Display only — usage tracking and the ⌘M composer's model label are unaffected.
+  { id: 'context-meter', label: 'Model & context meter' },
   { id: 'maximize', label: 'Maximize' },
   { id: 'refresh', label: 'Refresh' },
   { id: 'mic', label: 'Dictate' },
   { id: 'ai-name', label: 'Name with AI' },
   { id: 'comments', label: 'Comments' },
+  // The header twin of the node menu's "Share live link…" row. The button may be hidden; the LIVE
+  // chip it leads to never can (renderer/lib/live-link.guard.test.ts).
+  { id: 'share-link', label: 'Share live link' },
   { id: 'hide-fanout', label: 'Hide cards & connections' },
-  { id: 'tidy-fanout', label: 'Tidy subagent cards' }
+  { id: 'tidy-fanout', label: 'Tidy subagent cards' },
+  // Not in the header proper but the label row right under it (`lib/mdViewHint.ts`); it is the
+  // same kind of quiet per-node affordance, so it lives in the same Settings list.
+  { id: 'md-hint', label: 'Markdown / chat view hint' }
 ]
 
 /** Every id the user may hide — the guard that makes everything else unhideable. */
@@ -51,5 +65,7 @@ const HIDEABLE_IDS = new Set<string>(
  * ignored, and an id outside the inventory stays visible no matter what the list says.
  */
 export function isHidden(id: string, hidden: readonly string[]): boolean {
-  return HIDEABLE_IDS.has(id) && hidden.includes(id)
+  // settings.json is hand-editable and nothing normalizes these two lists on load: a non-array
+  // value must read as "nothing hidden", not throw inside a node header's render.
+  return HIDEABLE_IDS.has(id) && Array.isArray(hidden) && hidden.includes(id)
 }

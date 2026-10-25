@@ -17,12 +17,40 @@ export const IPC = {
   ptyGenerateName: 'pty:generate-name',
   ptyGenerateGroupName: 'pty:generate-group-name',
   ptyCapture: 'pty:capture',
+  /** Renderer → core: has the host behind this ControlMaster POSITIVELY listed the node's remote
+   *  tmux session? The strict half of the coalesced `tmux list-sessions` read behind
+   *  `PtyManager.remoteSessionConfirmed` — an unreadable host answers false, not "assume warm".
+   *  Gates the early-attach path (attach as soon as the master answers `-O check`, before the
+   *  connect's remote setup chain finishes); desktop-only, like SSH projects themselves. */
+  ptyRemoteSessionConfirmed: 'pty:remote-session-confirmed',
+  /** Renderer → core: seconds since this node's tmux session was created, measured on the machine
+   *  that holds it (`PtyApi.sessionAge`). The late cold-start check behind `freshUnverified`. */
+  ptySessionAge: 'pty:session-age',
   ptyReadScrollback: 'pty:read-scrollback',
   ptySendText: 'pty:send-text',
+  ptySendChatPrompt: 'pty:send-chat-prompt',
+  ptySendToEmptyPrompt: 'pty:send-to-empty-prompt',
   ptyTmuxStatus: 'pty:tmux-status',
   /** The foreground command of a node's tmux pane (`#{pane_current_command}`) — how the in-place
    *  agent restart sees that the CLI has exited and a shell owns the pane again. */
   ptyPaneCommand: 'pty:pane-command',
+  /** Type keys into a node's tmux pane by node id (no mounted terminal). Host-only. */
+  ptySendPaneKeys: 'pty:send-pane-keys',
+  /** The live working directory of a node's tmux pane (`#{pane_current_path}`) — where a relative
+   *  path an agent printed actually lives when it is not the node's launch cwd (file links). */
+  ptyPaneCwd: 'pty:pane-cwd',
+  /** Desktop-only (#925): start a node's session with no viewer and deliver its held launch. */
+  ptyLaunchHeadless: 'pty:launch-headless',
+  /** Renderer → core: execute a semantic agent launch (`LaunchIntentRequest`) in a node's live
+   *  local Windows session-host pane, encoded for that pane's own shell (core/launch-intent-execute.ts).
+   *  Host-only (shared/host-control.ts): a relay peer must never make the host read a prompt file. */
+  ptyExecuteLaunch: 'pty:execute-launch',
+  /** Kernel truth about a node's tmux pane: its root pid, tty, tmux pane id, and the full argv of
+   *  its FOREGROUND process group (`PaneOwner`). The name-only `ptyPaneCommand` above cannot tell
+   *  an agent from anything else — an npm-installed CLI reports as `node`, and an agent reached
+   *  over an interactive `ssh` reports as `ssh` — so the hibernation exit asks this instead before
+   *  it types `/exit` into a pane. null when the pane cannot be read. */
+  ptyPaneOwner: 'pty:pane-owner',
   /** Renderer → core: SIGTERM the non-shell foreground process group in this node's pane.
    *  Model switching uses this instead of typing an exit slash-command into an agent composer. */
   ptyTerminateForeground: 'pty:terminate-foreground',
@@ -39,11 +67,21 @@ export const IPC = {
   ptyRaiseDeviceLimit: 'pty:raise-device-limit',
   claudeReadTranscript: 'claude:read-transcript',
   chatReadTranscript: 'chat:read-transcript',
+  // The ⌘M composer's `/` catalog for a node: built-ins, custom commands, skills (core/chat-catalog.ts).
+  chatCatalog: 'chat:catalog',
+  /** Does a claude-shaped transcript exist for this session id? Tri-state
+   *  (`present | absent | unknown`) — see `TranscriptPresence`. The one caller that ACTS on a
+   *  negative is cold restore, so "we could not look" must never read as "it is gone". */
+  transcriptExists: 'transcript:exists',
+  /** "Open recent": the newest agent conversations on THIS machine's disk (core/recent-conversations.ts). */
+  recentConversationsList: 'recent-conversations:list',
   claudeAccountsAdd: 'claude-accounts:add',
   claudeAccountsWaitLogin: 'claude-accounts:wait-login',
   claudeAccountsCancelWait: 'claude-accounts:cancel-wait',
   claudeAccountsRemove: 'claude-accounts:remove',
   claudeAccountsLink: 'claude-accounts:link',
+  claudeAccountsSetSkillSharing: 'claude-accounts:set-skill-sharing',
+  claudeAccountsCopySession: 'claude-accounts:copy-session',
   // Machine-scoped managed Codex accounts (S6). Add/device-login/removal, plus the three-phase,
   // owner-authorized account switch (resume the SAME conversation id, never fork) and the
   // source-side leg of moving an idle conversation to an SSH account. See main/codex-accounts.ts.
@@ -57,12 +95,15 @@ export const IPC = {
   codexAccountsCommitSwitch: 'codex-accounts:commit-switch',
   codexAccountsFinishSwitch: 'codex-accounts:finish-switch',
   codexAccountsRollbackSwitch: 'codex-accounts:rollback-switch',
+  codexAccountsSwitchThreadRemote: 'codex-accounts:switch-thread-remote',
   codexAccountsTransferThreadToSsh: 'codex-accounts:transfer-thread-to-ssh',
   claudeCliCaps: 'claude-cli:caps',
   grokCliCaps: 'grok-cli:caps',
   grokTakenSessionIds: 'grok-cli:taken-session-ids',
+  cursorCliCaps: 'cursor-cli:caps',
   /** Can a node on this machine get a managed Codex identity? See core/codex-identity-caps.ts. */
   codexIdentityCaps: 'codex-identity:caps',
+  codexCliCaps: 'codex-cli:caps',
   /** main/server → renderer: a Codex node's identity mode changed ('shared' | 'plain'). The
    *  'plain' events are what make the launcher's fallback visible instead of silent. */
   codexIdentity: 'codex-identity:event',
@@ -127,6 +168,12 @@ export const IPC = {
    *  so the renderer should run its reclaim levers now (hidden WebGL contexts, parked terminals).
    *  Payload: `'warning' | 'critical'`. Re-fired at most once a minute — see core/memory-pressure. */
   appMemoryPressure: 'app:memory-pressure',
+  /** Main → renderer: the main window was put away (`'hidden'` — close-to-tray, macOS
+   *  hide-on-close, minimize) or brought back (`'shown'`). The renderer then treats every terminal
+   *  as offscreen so the existing reclaim levers run on their timers (see
+   *  renderer/terminal/window-backgrounded.ts). Explicit, not `visibilitychange`: an occluded window
+   *  must not release. Mapping: main/window-visibility.ts. */
+  appWindowVisibility: 'app:window-visibility',
   /** Main → renderer: a macOS trackpad gesture (two-finger scroll or pinch) opened or closed on
    *  the main window — edge transitions from main/trackpad-gesture.ts, a handful per physical
    *  gesture. Payload: `boolean` (active). The canvas wheel router uses this as ground-truth
@@ -134,6 +181,7 @@ export const IPC = {
    *  Edition's browser tab has no raw input stream and keeps the heuristics. */
   canvasTrackpadGesture: 'canvas:trackpad-gesture',
   agentStatus: 'agent:status',
+  agentSubagentSnapshot: 'agent:subagent-snapshot',
   /** Renderer → main/server: answer a held Claude permission hook (deterministic approvals).
    *  Payload: `{ nodeId, pendingId, decision: 'allow'|'deny' }`; resolves boolean. See
    *  docs/hook-reply-approvals.md. */
@@ -153,6 +201,12 @@ export const IPC = {
    *  phone can render SLEEPING, and gives main the `isHibernated` signal the delivery queue's
    *  hibernated leg was recorded as missing (agent-messaging.ts). */
   agentHibernated: 'agent:hibernated',
+  /** Renderer → main/server: seed the agent-status mirror with the node identities (agentId +
+   *  sessionId [+ observed account]) this renderer's persisted agentStatus store holds, for nodes
+   *  the mirror has no session for. Arg: `IdentitySeedEntry[]` (`@shared/agent-identity-seed`,
+   *  validated and capped there). Fire-and-forget; add-only — never overrides a hook-fed id. Feeds
+   *  the phone's chat view, which finds a transcript only by the mirror's session id. */
+  agentSeedIdentity: 'agent:seed-identity',
   /** main → renderer: ask the renderer to wake a hibernated node NOW (a phone viewer attached to
    *  its session over the relay). A nudge, never an assertion: the renderer re-reads the flag and
    *  no-ops for a non-hibernated or unmounted node — same contract as `wakeHibernatedNode`. Arg:
@@ -196,11 +250,75 @@ export const IPC = {
   agentControl: 'agent:control',
   agentControlResult: 'agent:control-result',
   agentMessageDeliver: 'agent:message-deliver',
+  /** Renderer → main: deliver ONE mentioned session's copy of a board comment the local user just
+   *  posted (`deliverBoardCommentFromUi`). Desktop-only, main-window-only, never peer-dispatchable —
+   *  see src/main/board-comment-wiring.test.ts. Arg: `BoardCommentDeliverRequest`. */
+  agentBoardCommentDeliver: 'agent:board-comment-deliver',
+  /** Station-failure notices (src/core/agents/station-notice.ts). invoke: the current list
+   *  (StationNoticeView[]) for a renderer that booted after the last push. */
+  stationNoticeList: 'station-notice:list',
+  /** renderer → core: the renderer's DROPPED verdict for one node (`nodeId, dropped`) — the one
+   *  trigger fact core cannot measure itself (it needs the renderer's hibernated/paused flags). */
+  stationNoticeDropped: 'station-notice:dropped',
+  /** renderer → core: the renderer's board-dispatch map (@shared/board-dispatch-report), replaced
+   *  whole on each change — what the `issues` control verb shows beside an issue. Display only. */
+  boardDispatchReport: 'board-dispatch:report',
+  /** core → every renderer: the FULL current notice list on each change, never a delta. */
+  stationNoticeChanged: 'station-notice:changed',
+  /** Station task outcomes (`report-outcome`, src/core/station-outcome-store.ts). invoke: every
+   *  record this process holds (StationOutcomeRecord[]), for a renderer that booted after a push. */
+  stationOutcomeList: 'station-outcome:list',
+  /** core → every renderer: the FULL current record list on each change, never a delta. */
+  stationOutcomeChanged: 'station-outcome:changed',
+  /** Stations with unfinished HANDED-OVER work (src/core/station-handover.ts): what plain `--after`
+   *  reads so a `done` from before new work arrived does not release a dependent. invoke: the
+   *  current list (StationHandoverRecord[]), for a renderer that booted after a push. */
+  stationHandoverList: 'station-handover:list',
+  /** core → every renderer: the FULL current list on each change, never a delta. */
+  stationHandoverChanged: 'station-handover:changed',
+  /** Live links (docs/live-links.md, src/core/watch-link/service.ts). OWNER-ONLY: every `watchLink:`
+   *  channel is host-only (host-control.ts), so no relay peer — hosted owners and editors included —
+   *  can create a link, which would publish a host terminal with the host's Pro. The viewer's own
+   *  tunnel protocol is `watch:*` (src/shared/watch-link/protocol.ts), deliberately NOT this
+   *  namespace. invoke: `create(CreateWatchLinkRequest)` → CreateWatchLinkResult. */
+  watchLinkCreate: 'watchLink:create',
+  /** invoke: the current links (WatchLinkView[]), for a renderer that booted after a push. */
+  watchLinkList: 'watchLink:list',
+  /** invoke: `(linkId)` — stop one link now (local first, then a best-effort server revoke). */
+  watchLinkRevoke: 'watchLink:revoke',
+  /** invoke: stop every link on this machine, then one server revoke-all. */
+  watchLinkRevokeAll: 'watchLink:revoke-all',
+  /** invoke: `(linkId, viewerId)` → boolean — end ONE viewer's connection (the link stays). */
+  watchLinkKick: 'watchLink:kick',
+  /** invoke: `(linkId, text)` → WatchChatMessage | null — the owner's reply on a Commenter link. */
+  watchLinkChatSend: 'watchLink:chat-send',
+  /** invoke: `(linkId)` → WatchChatMessage[] — this run's last messages (memory only). */
+  watchLinkChatHistory: 'watchLink:chat-history',
+  /** invoke: `(linkId, enabled)` → boolean — a Control link: turn typing on or off. */
+  watchLinkSetControl: 'watchLink:set-control',
+  /** invoke: `(linkId, password)` → boolean — a Control link: replace its password. */
+  watchLinkSetPassword: 'watchLink:set-password',
+  /** invoke: `(linkId)` → boolean — a Control link locked by wrong passwords: allow unlocking again. */
+  watchLinkAllowControl: 'watchLink:allow-control',
+  /** invoke: `(nodeId)` → ControlSupport — whether the node's terminal can take a Control link's input. */
+  watchLinkControlSupport: 'watchLink:control-support',
+  /** core → owner clients only: the full list on every change, never a delta. */
+  watchLinkState: 'watchLink:state',
+  /** core → owner clients only: `(linkId, WatchChatMessage)`. */
+  watchLinkChat: 'watchLink:chat',
+  /** core → owner clients only: a `WatchLinkNotice`. */
+  watchLinkNotice: 'watchLink:notice',
   /** Canvas sync: a client casts its local node mutations here; the core reflector
    *  (src/core/canvas-sync.ts) stamps each with the total order (`seq`) and sends it back out on the
    *  SAME channel to EVERY attached client — the sender included, whose copy is its ack (see
    *  src/shared/canvas-order.ts). Args (both directions): [projectId: string, CanvasMutation]. */
   canvasMut: 'canvas:mut',
+  /** Which projects this core's canvas authority governs (request → `string[]`): a client publishes
+   *  its canvas ops for them even when nobody else is attached, because the authority writes only
+   *  what it hears as ops (docs/hosted-team-relay.md). Server Edition only; the desktop answers none. */
+  canvasAuthority: 'canvas:authority',
+  /** Event: the governed set changed (`string[]`, the new set). Server Edition only. */
+  canvasAuthorityChanged: 'canvas:authority-changed',
   contextLinkSetLinks: 'context-link:set-links',
   contextLinkInfo: 'context-link:info',
   /** Board-log (`.nodeterm/board-log.jsonl`): request/response append + read, routed per project
@@ -228,10 +346,24 @@ export const IPC = {
   appUpdateProgress: 'app:update-progress',
   appUpdateError: 'app:update-error',
   appUpdateNotAvailable: 'app:update-not-available',
+  /** This build has no update channel at all (issue #814) — distinct from "up to date". */
+  appUpdateNoChannel: 'app:update-no-channel',
   appCheckForUpdates: 'app:check-for-updates',
   appGetVersion: 'app:get-version',
   appUserDataDir: 'app:user-data-dir',
   appUpdatePolicy: 'app:update-policy',
+  // Prepare-for-update (Windows, issue #829). Raw ipcMain handlers, main-window senders only.
+  appUpdatePrepInspect: 'app:update-prep-inspect',
+  appUpdatePrepShutdown: 'app:update-prep-shutdown',
+  appUpdatePrepQuit: 'app:update-prep-quit',
+  /** main → renderer: restart-to-update was accepted; `{phase:'preparing'|'restarting', version}`. */
+  appUpdateInstalling: 'app:update-installing',
+  /** renderer → main (invoke): the update already staged this run, `{version, notes}` or null. */
+  appGetStagedUpdate: 'app:get-staged-update',
+  /** main → renderer: write any pending canvas edits now (payload: request id). Quit / restart. */
+  appFlushRequest: 'app:flush-request',
+  /** renderer → main: the flush for that request id settled. */
+  appFlushDone: 'app:flush-done',
   licenseActivate: 'license:activate',
   licenseDeactivate: 'license:deactivate',
   licenseStatus: 'license:status',
@@ -261,6 +393,41 @@ export const IPC = {
   /** The scoped machine's RAM (available/total) — the cheap read behind the system-resource
    *  pill. Safe to poll locally; NOT polled for an SSH scope. */
   sessionMemoryHost: 'session-memory:host',
+  /** Dev-server ports (core/dev-ports-service.ts): which TCP ports each node's session listens on
+   *  (ownership by process tree, one round trip per host), and the same-port SSH forward that makes
+   *  `http://localhost:<port>` reach an SSH project's host. Desktop only; host-only for relay peers. */
+  devPortsScan: 'dev-ports:scan',
+  devPortsForward: 'dev-ports:forward',
+  devPortsUnforward: 'dev-ports:unforward',
+  // Canvas wallpaper (core/wallpaper.ts): macOS stills, cached image reads, image import.
+  wallpaperListStills: 'wallpaper:list-stills',
+  wallpaperLoad: 'wallpaper:load',
+  wallpaperImport: 'wallpaper:import',
+  wallpaperListAerials: 'wallpaper:list-aerials',
+  wallpaperAerialClips: 'wallpaper:aerial-clips',
+  // Run node (core/run-service.ts): launch.json entries, devices, launcher, status, stop, signals.
+  runEntries: 'run:entries',
+  runDevices: 'run:devices',
+  runBootDevice: 'run:boot-device',
+  runDiscover: 'run:discover',
+  runStart: 'run:start',
+  runStatus: 'run:status',
+  runStop: 'run:stop',
+  runSignal: 'run:signal',
+  runWatch: 'run:watch',
+  // Simulator node (core/simulator/simulator-service.ts): live screen + touch/keys/buttons.
+  simulatorDevices: 'simulator:devices',
+  simulatorBoot: 'simulator:boot',
+  simulatorStart: 'simulator:start',
+  simulatorStop: 'simulator:stop',
+  simulatorInput: 'simulator:input',
+  simulatorShutdown: 'simulator:shutdown',
+  simulatorAction: 'simulator:action',
+  simulatorState: 'simulator:state',
+  simulatorScreenshot: 'simulator:screenshot',
+  simulatorRecordStart: 'simulator:record-start',
+  simulatorRecordStop: 'simulator:record-stop',
+  simulatorRecording: 'simulator:recording',
   // Trigger nodes (issue #493): machine-local arm/disarm + the card's status/run-now.
   triggersArm: 'triggers:arm',
   triggersDisarm: 'triggers:disarm',
@@ -285,6 +452,9 @@ export const IPC = {
   presencePeer: 'presence:peer',
   // Events broadcast from main to the renderer (sessionId is appended to the channel name).
   ptyData: (sessionId: string) => `pty:data:${sessionId}`,
+  /** Per-node simulator frames / status (Simulator node). */
+  simulatorFrame: (nodeId: string) => `simulator:frame:${nodeId}`,
+  simulatorStatus: (nodeId: string) => `simulator:status:${nodeId}`,
   ptyExit: (sessionId: string) => `pty:exit:${sessionId}`,
   /** Authoritative size of a co-attached session: min(cols) × min(rows) over all subscribers.
    *  Broadcast to every subscriber whenever the subscriber set or any reported size changes. */
@@ -311,10 +481,19 @@ export const IPC = {
   ptyResync: (sessionId: string) => `pty:resync:${sessionId}`,
   workspaceLoad: 'workspace:load',
   workspaceSave: 'workspace:save',
+  /** Exactly-once claim of a renderer-delivered held launch across every viewer of a project
+   *  (core/launch-claim-ledger.ts, issue #1173). Host-only. */
+  workspaceClaimLaunch: 'workspace:claim-launch',
   workspaceProbeFolder: 'workspace:probe-folder',
   /** Is a folder's .nodeterm/project.json present / absent / unreadable — the distinction
    *  `probeFolder`'s null collapses. Recovery of an `unavailable` project needs it (issue #385). */
   workspaceProjectFileState: 'workspace:project-file-state',
+  /** "Store in app data", second half (issue #1145): carry settings over, remove the folder files. */
+  workspaceReleaseFolderFiles: 'workspace:release-folder-files',
+  /** "Store in folder", first half (issue #1145): refuse an occupied folder, carry settings in. */
+  workspacePrepareFolderStorage: 'workspace:prepare-folder-storage',
+  /** Where the store has a project's canvas after a move's save: folder / app data (issue #1145). */
+  workspaceProjectStorage: 'workspace:project-storage',
   projectSettingsRead: 'project-settings:read',
   projectSettingsWriteShared: 'project-settings:write-shared',
   projectSettingsUpdateLocal: 'project-settings:update-local',
@@ -365,6 +544,10 @@ export const IPC = {
   /** Payload: the `workspace.json.corrupt-<ts>` filename the unreadable index was preserved as. */
   workspaceCorruptRecovered: 'workspace:corrupt-recovered',
   workspaceExternalChange: 'workspace:external-change',
+  /** Server-originated project writes (Server Edition headless canvas control: an agent opened,
+   *  renamed, moved or closed a node and this core saved the file itself). NOT an outside edit —
+   *  the renderer three-way merges it instead of raising the conflict bar. */
+  workspaceServerChange: 'workspace:server-change',
   githubIssuesSubscribe: 'githubIssues:subscribe',
   githubIssuesUnsubscribe: 'githubIssues:unsubscribe',
   githubIssuesQuery: 'githubIssues:query',
@@ -372,6 +555,11 @@ export const IPC = {
   githubIssuesMove: 'githubIssues:move',
   githubIssuesCreateLabels: 'githubIssues:create-labels',
   githubIssuesClearCache: 'githubIssues:clear-cache',
+  githubIssuesPullStatus: 'githubIssues:pull-status',
+  githubIssuesChasePulls: 'githubIssues:chase-pulls',
+  githubIssuesPullChecks: 'githubIssues:pull-checks',
+  githubIssuesClaimPullAutoMove: 'githubIssues:claim-pull-auto-move',
+  githubIssuesNotePullWaits: 'githubIssues:note-pull-waits',
   githubIssuesChanged: (projectId: string) => `githubIssues:changed:${projectId}`,
   githubProjectAvatar: 'github:projectAvatar',
   githubControlStatus: 'githubControl:status',
@@ -398,6 +586,17 @@ export const IPC = {
   filesSaveUpload: 'files:save-upload',
   /** Write a canvas image into the project's own `.nodeterm/images/` (see core/canvas-images.ts). */
   filesSaveCanvasImage: 'files:save-canvas-image',
+  /** A whiteboard node's side file (core/whiteboards.ts). Addressed by (projectId, nodeId); the
+   *  receiving core derives the path, so a caller can never name one. */
+  filesSaveWhiteboard: 'files:save-whiteboard',
+  filesReadWhiteboard: 'files:read-whiteboard',
+  /** Custom agent-alert sounds (issue #289) — stored under the core's data dir, addressed by kind. */
+  filesSaveAlertSound: 'files:save-alert-sound',
+  filesReadAlertSound: 'files:read-alert-sound',
+  filesClearAlertSound: 'files:clear-alert-sound',
+  /** Agent-integration consent (issue #744): the last reconcile's report (what is enabled,
+   *  declined, and which user-edited files were kept). Host-only. */
+  integrationsStatus: 'integrations:status',
   settingsLoad: 'settings:load',
   settingsSave: 'settings:save',
   sshList: 'ssh:list',
@@ -495,6 +694,11 @@ export const IPC = {
   // does the CDP work itself; the renderer never runs a CDP command.
   browserControlResolve: 'browser:control-resolve',
   browserControlResolveResult: 'browser:control-resolve-result',
+  // The phone Chat verbs' renderer round-trip (main/remote/host-chat.ts): main asks the renderer —
+  // which owns the agent-status store and the ⌘M send gate — for a node's chat status, or to send
+  // a phone message through that gate; the renderer answers on the reply channel.
+  hostChatQuery: 'host:chat-query',
+  hostChatReply: 'host:chat-reply',
   remoteHostStart: 'remote:host:start',
   remoteHostStop: 'remote:host:stop',
   // Connection approval gate: main → renderer when a client finishes the handshake (carries the
@@ -503,6 +707,16 @@ export const IPC = {
   remoteHostPeerPending: 'remote:host:peer-pending',
   remoteHostPeerPendingCleared: 'remote:host:peer-pending-cleared',
   remoteHostApprove: 'remote:host:approve',
+  remotePhoneApprove: 'remote:phone:approve',
+  // `nodeterm://` links (desktop only, raw ipcMain, main-window sender only — see main/open-link.ts).
+  // main → renderer: an `open` link to confirm, a pair/join link to route, a refusal to toast.
+  openLinkRequest: 'open-link:request',
+  openLinkPair: 'open-link:pair',
+  openLinkNotice: 'open-link:notice',
+  // renderer → main: listening (deliver held links), the human's choice, a dismissal.
+  openLinkReady: 'open-link:ready',
+  openLinkAccept: 'open-link:accept',
+  openLinkCancel: 'open-link:cancel',
   remoteHostReject: 'remote:host:reject',
   // Host canvas mirror: renderer pushes its serialized active-project canvas to main;
   // main pushes a client's mutation back to the host renderer to apply.
@@ -536,6 +750,9 @@ export const IPC = {
   relayHostInvite: 'relay:host:invite',
   relayHostRevoke: 'relay:host:revoke',
   relayHostStop: 'relay:host:stop',
+  // Which projects may not be the scope of an invite, and why (core/relay/share-root.ts): invoke,
+  // `projectIds: string[]` → `{ [projectId]: reason }`. The invite UI disables those options.
+  relayHostScopeProblems: 'relay:host:scope-problems',
   relayHostPeerPending: 'relay:host:peer-pending',
   relayHostConfirm: 'relay:host:confirm',
   relayHostOpen: 'relay:host:open',
@@ -554,6 +771,43 @@ export const IPC = {
   relayClientApproved: (connectionId: string) => `relay:client:approved:${connectionId}`,
   relayClientFrame: (connectionId: string) => `relay:client:frame:${connectionId}`,
   relayClientClosed: (connectionId: string) => `relay:client:closed:${connectionId}`,
+  // HOSTED team relay (Server Edition, src/core/relay/hosted-service.ts). These ride the relay
+  // tunnel only: the core relay host INTERCEPTS them per session and they are never registered on
+  // the platform, so a browser client (gated by the server password, not a team role) cannot reach
+  // them. `relayHostedPeerPending` / `relayHostedPendingClosed` are events sent to connected OWNERS
+  // only; `relayHostedApprove` (pendingId, role), `relayHostedDeny` (pendingId),
+  // `relayHostedInviteCode` () and `relayHostedPending` () (the open requests, pulled) are
+  // owner-only requests; `relayHostedSelf` () is open to any approved peer and answers its own role.
+  relayHostedPeerPending: 'relay:hosted:peer-pending',
+  relayHostedPendingClosed: 'relay:hosted:pending-closed',
+  relayHostedPending: 'relay:hosted:pending',
+  relayHostedApprove: 'relay:hosted:approve',
+  relayHostedDeny: 'relay:hosted:deny',
+  relayHostedInviteCode: 'relay:hosted:invite-code',
+  relayHostedSelf: 'relay:hosted:self',
+  // Sent to EVERY connected member (viewers too) after `team share`/`unshare` lands: the team's
+  // whole shared set, so a joiner opens a tab for a newly shared project and closes the tab of one
+  // that stopped being shared — with no new code and no new approval.
+  relayHostedSharedChanged: 'relay:hosted:shared-changed',
+  // The hosted teams THIS desktop has joined (src/main/remote/relay-bookmarks.ts). Unlike the
+  // hosted verbs above, these two never ride the relay: they are raw `ipcMain` handlers in the
+  // desktop main process, invisible to any relay peer. `relayHostedBookmarks` () lists them without
+  // their device tokens; `relayHostedBookmarkRemove` (hostId) forgets one.
+  relayHostedBookmarks: 'relay:hosted:bookmarks',
+  relayHostedBookmarkRemove: 'relay:hosted:bookmark-remove',
+  // "Share with team" for an SSH project (src/main/remote-ssh/share-team.ts): each verb runs one
+  // generated command over the project's ControlMaster. These are raw `ipcMain` handlers, never on
+  // the platform, so a relay peer can never reach them. `shareTeamInstallOutput` is main → renderer,
+  // payload `{ projectId, text }`.
+  shareTeamProbe: 'share-team:probe',
+  shareTeamInstall: 'share-team:install',
+  shareTeamCancelInstall: 'share-team:cancel-install',
+  shareTeamInstallOutput: 'share-team:install-output',
+  shareTeamFlushMirror: 'share-team:flush-mirror',
+  shareTeamBootstrap: 'share-team:bootstrap',
+  shareTeamKillSessions: 'share-team:kill-sessions',
+  shareTeamResume: 'share-team:resume',
+  shareTeamSeedBookmark: 'share-team:seed-bookmark',
   handoffBuild: 'handoff:build',
   // Phone pairing (nodeterm iOS "scan a QR" flow): renderer starts/stops the one-shot LAN
   // listener; main pushes the completion result back over `pairing:done`. The per-device
@@ -564,6 +818,12 @@ export const IPC = {
   pairingProbeSsh: 'pairing:probe-ssh',
   pairingOpenRemoteLoginSettings: 'pairing:open-remote-login-settings',
   pairingListDevices: 'pairing:listDevices',
+  // Push webhook management (core/push-webhook.ts). Under `pairing:` so HOST_ONLY_CHANNEL_PREFIXES
+  // keeps them off the relay: minting a token that pushes to the host's phones is the host's call.
+  pairingWebhookStatus: 'pairing:webhook-status',
+  pairingWebhookMint: 'pairing:webhook-mint',
+  pairingWebhookRevoke: 'pairing:webhook-revoke',
+  pairingWebhookEndpoint: 'pairing:webhook-endpoint',
   pairingRevokeDevice: 'pairing:revokeDevice',
   // Dictation (desktop/server). speechProgress is a main/server → renderer broadcast of
   // { id, pct } while a whisper model downloads (WhisperModelStore.onProgress).
@@ -575,5 +835,8 @@ export const IPC = {
   // Electron-only: registered in src/main/index.ts (systemPreferences.askForMediaAccess) and
   // stubbed `async () => true` in src/server/index.ts (browser mic permission is the browser's
   // own prompt, not ours to gate).
-  speechMicConsent: 'speech:mic-consent'
+  speechMicConsent: 'speech:mic-consent',
+  // Electron-only, NOT registered by the server: opens the OS mic-privacy page from a fixed
+  // allowlist (src/main/mic-consent.ts). The browser bridge leaves `openMicSettings` absent.
+  speechOpenMicSettings: 'speech:open-mic-settings'
 } as const

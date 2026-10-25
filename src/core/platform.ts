@@ -13,6 +13,12 @@ export interface CorePlatform {
    *  because it is an Electron notion: the Server Edition has no such directory and simply omits
    *  it, which is also how src/core stays Electron-free (no-electron.test.ts). */
   readonly resourcesPath?: string
+  /** Electron's `app.getAppPath()` — `<resourcesPath>/app.asar` when packaged, the repo root in
+   *  dev. This is where `build.files` carries `out/**`, so it is where the session-host bundle
+   *  lands; see session-host-launcher.ts for why it must be resolved from INSIDE the asar rather
+   *  than copied beside it. OPTIONAL for the same reason as `resourcesPath`: an Electron notion
+   *  the Server Edition omits. */
+  readonly appPath?: string
   /** Seal / unseal a secret at rest, byte-in byte-out. Present together on a shell that can
    *  encrypt (Desktop: Electron safeStorage). Their ABSENCE is a supported configuration, not a
    *  degradation: the Server Edition runs headless with no OS keychain and deliberately stores
@@ -37,6 +43,18 @@ export interface CorePlatform {
    *  Electron: the main window, or none while it is closed). Lets a service address "everyone
    *  EXCEPT the sender", which broadcast() cannot express — see src/core/canvas-sync.ts. */
   clientIds(): number[]
+  /** Clients that receive NO broadcast and are absent from `clientIds()` (a live link's viewer),
+   *  but still count as watching a session they subscribe to. Only the pty reaper reads it
+   *  (pty-reap.ts `liveClientIds`). Absent = there are none. */
+  quietClientIds?(): number[]
+  /**
+   * Is this attached UI the machine's OWNER — this app's own window (Electron), or a browser tab the
+   * Server Edition authenticated with its session cookie — as opposed to a relay peer (a teammate, a
+   * hosted-team guest)? The canvas reflector lets a node's machine-local held launch
+   * (`pendingLaunch`) travel only owner→owner (@shared/node-exec). Absent, or `false` for an id it
+   * does not know, is the safe answer: the launch is stripped.
+   */
+  isOwnerClient?(uiId: number): boolean
   /** Open a URL in the user's default browser. */
   openExternal(url: string): Promise<void>
 }

@@ -1,4 +1,4 @@
-import type { LicenseDetail } from '@shared/types'
+import type { LicenseDetail, LicenseStatus } from '@shared/types'
 import { machineNoun, thisMachine, thisMachineCap } from './machineName'
 
 /**
@@ -76,7 +76,14 @@ export function licenseSentence(detail: LicenseDetail | null): string {
   if (detail.source === 'apple') {
     // No keygen call was made for this license, so `used`/`seats` are zeros meaning "not
     // applicable". Printing them would read as a cap that is somehow both empty and full.
-    return `Pro on ${thisMachine()} comes from the App Store subscription on your paired phone, so there is no license key or device count to show here.`
+    // Say where the term actually lives. We can neither renew, extend nor cancel an App Store
+    // subscription, and a user who wants to know when it renews has only one place to look.
+    return `Pro on ${thisMachine()} comes from the App Store subscription on your paired phone, so there is no license key or device count to show here. That subscription is managed by Apple, not by nodeterm: to see when it renews or to cancel it, open the App Store on that phone and go to Subscriptions in your account.`
+  }
+  if (detail.source === 'google') {
+    // The Play twin of the App Store branch above, for the same reasons: the zeros are "not
+    // applicable", and the term is managed by Google — we cannot renew, extend or cancel it.
+    return `Pro on ${thisMachine()} comes from the Google Play subscription on your paired phone, so there is no license key or device count to show here. That subscription is managed by Google, not by nodeterm: to see when it renews or to cancel it, open the Play Store on that phone and go to Payments & subscriptions → Subscriptions.`
   }
   if (detail.source === 'free') {
     // A defensive value. Say only what is certain — where it came from is not.
@@ -104,6 +111,27 @@ export function licenseSentence(detail: LicenseDetail | null): string {
 }
 
 /**
+ * The one-line Pro status at the top of Settings → License.
+ *
+ * It prints a date ONLY from `termEndsAt` — the subscription term the server stated — and never from
+ * `expiresAt`. That field is the entitlement token's expiry: a 7-day offline grace window re-minted
+ * every 6 h. Rendered as "active until", it told a customer on a yearly App Store subscription that
+ * Pro ended a week later (issue #800). No other date may stand in for a missing term: not the token's,
+ * not one computed from the tier, not the grace window under another label.
+ *
+ * No term ⇒ no date. That covers null (a lifetime entitlement, a license without an expiry, a server
+ * that predates the field) and a term already in the past (a stored term from before an offline
+ * stretch; the renewal it missed is real, the date it would print is not).
+ */
+export function proStatusLine(status: LicenseStatus, now: number = Date.now()): string {
+  const term = status.termEndsAt
+  if (typeof term !== 'number' || !Number.isFinite(term) || term <= 0 || term * 1000 <= now) {
+    return 'Pro — active.'
+  }
+  return `Pro — active. Current term runs through ${new Date(term * 1000).toLocaleDateString()}.`
+}
+
+/**
  * Whether to offer "Release other devices".
  *
  * Gated on a STATED `'keygen'` — never on `!== 'apple'`. A null source is what every error reply
@@ -113,6 +141,19 @@ export function licenseSentence(detail: LicenseDetail | null): string {
  */
 export function canReleaseDevices(detail: LicenseDetail | null): boolean {
   return detail?.source === 'keygen'
+}
+
+/**
+ * Whether to offer the Stripe billing page (invoices, payment method, cancel) beside an active Pro.
+ *
+ * Deliberately the INVERSE of `canReleaseDevices`: hidden only for a STATED store source, shown for
+ * a null one. The release gate hides on doubt because the server can only refuse that action; this
+ * link can only open a sign-in page, and the users who need it most carry a null source — a renewal
+ * whose card failed reads back as `inactive`, and every error reply states no source. An App Store
+ * or Play subscriber has nothing on Stripe, and their sentence already says where the term lives.
+ */
+export function offersBillingPortal(detail: LicenseDetail | null): boolean {
+  return detail?.source !== 'apple' && detail?.source !== 'google'
 }
 
 /**

@@ -14,12 +14,16 @@ import {
   TMUX_SOCKET,
   assertPasteTarget,
   assertPasteBuffer,
+  exactPaneTarget,
   pasteBufferName,
   type PasteDelivery
 } from '../tmux-naming'
 import { sanitizePasteText } from '../paste-injection'
+import { typedInputScript } from '../typed-input'
 import { canControlCanvas } from '../../shared/agents/config'
 import { COMBINED_PANE_MARKER, PANE_OWNER_FMT, PS_FOREGROUND_FLAGS } from '../agents/pane-owner'
+import { VISIBLE_CAPTURE_FORMAT, capturePaneTarget } from '../watch-link/capture-route'
+import { WATCHER_CLIENT_FLAGS, WINDOW_SIZE_FORMAT } from '../watch-link/watcher-client'
 // Dependency-free (no node-pty): safe to import from these pure builders.
 
 /** Dedicated remote tmux socket so an SSH project never collides with the user's own tmux. */
@@ -31,8 +35,10 @@ export const RMT_TMUX_SOCKET = 'nodeterm-rmt'
  * `command not found` on any host whose ssh exec-channel PATH misses the install dir — most
  * visibly macOS with Homebrew's tmux in `/opt/homebrew/bin`. The prologue is one assignment, so
  * the command's own exit code (what `probeSaysAbsent` and every caller reads) is unchanged.
+ * Exported for the live link's pane-input builders (`watch-link/pane-input.ts`), which build their
+ * remote commands beside their local twins rather than here.
  */
-function tmuxCmd(body: string): string {
+export function tmuxCmd(body: string): string {
   return `${remoteTmuxPathPrologue()}${body}`
 }
 
@@ -50,8 +56,25 @@ export function controlPathFor(projectId: string): string {
   return path.join(os.homedir(), '.nodeterm', 'ssh-cm', `${id}.sock`)
 }
 
-function target(conn: SshConnection): string {
+/**
+ * One `user@host` destination argv element, refused when it could be anything else. A leading `-`
+ * makes ssh parse the whole element as an OPTION (`-oProxyCommand=…@host` runs a local command), and
+ * whitespace or a control character is never part of a real user or host name. Every argv this module
+ * builds passes through here, so no caller — a hand-edited project file, a relay peer, a future
+ * dialog — can turn an endpoint into ssh options.
+ */
+export function sshDestination(conn: Pick<SshConnection, 'user' | 'host'>): string {
+  for (const [field, v] of [['user', conn.user], ['host', conn.host]] as const) {
+    // eslint-disable-next-line no-control-regex
+    if (typeof v !== 'string' || (field === 'host' && v === '') || v.startsWith('-') || /[\s\u0000-\u001f\u007f]/.test(v)) {
+      throw new Error(`refusing ssh ${field} ${JSON.stringify(String(v)).slice(0, 80)}: not a valid ${field}`)
+    }
+  }
   return `${conn.user}@${conn.host}`
+}
+
+function target(conn: SshConnection): string {
+  return sshDestination(conn)
 }
 
 function portArgs(conn: SshConnection): string[] {
@@ -223,11 +246,34 @@ export function childArgs(conn: SshConnection, controlPath: string, remote?: str
 export function checkMasterArgs(conn: SshConnection, controlPath: string): string[] {
   return ['-O', 'check', '-o', `ControlPath=${controlPath}`, ...portArgs(conn), target(conn)]
 }
+/**
+ * A real round trip over the master: open one session channel and run `true`. This is the
+ * liveness question `-O check` cannot answer. `-O check` is served by the master PROCESS over the
+ * local control socket, so it says "Master running" for a master whose TCP died under a sleep:
+ * measured against a black-holed connection, `-O check` exited 0 while a mux'd command hung until
+ * ServerAlive gave up ~74 s later. A channel open has to reach sshd and come back, so a
+ * half-dead master cannot answer it. The caller bounds it with a timeout; a TIMEOUT is the only
+ * verdict that means dead (see `SshProjectManager.revalidateAll`).
+ *
+ * `ControlMaster=no`: if the socket is gone this must not become a fresh master (which would
+ * answer on the new connection and say nothing about the old one). `BatchMode=yes`: if ssh falls
+ * back to a direct connection it must never park on a prompt with no one to answer it.
+ */
+export function masterRoundTripArgs(conn: SshConnection, controlPath: string): string[] {
+  return [
+    '-o',
+    'ControlMaster=no',
+    '-o',
+    `ControlPath=${controlPath}`,
+    '-o',
+    'BatchMode=yes',
+    ...portArgs(conn),
+    target(conn),
+    'true'
+  ]
+}
 export function exitMasterArgs(conn: SshConnection, controlPath: string): string[] {
   return ['-O', 'exit', '-o', `ControlPath=${controlPath}`, ...portArgs(conn), target(conn)]
-}
-export function remoteTmuxHasSessionArgs(conn: SshConnection, controlPath: string, sessionId: string): string[] {
-  return childArgs(conn, controlPath, tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} has-session -t ${sessionId}`))
 }
 /**
  * Every nodeterm tmux session on the host, by name.
@@ -297,11 +343,16 @@ export function remoteTmuxPasteArgs(
 ): string[] {
   assertPasteTarget(sessionId, buffer)
   const tmux = `tmux -L ${RMT_TMUX_SOCKET}`
+  // EXACT target (`exactPaneTarget`): a bare name prefix-matches a longer session on a miss.
+  // Quoted for the remote shell where it is a word of its own (zsh expands a leading `=`); inside
+  // the single-quoted `if-shell` body tmux's own lexer reads it.
+  const pane = exactPaneTarget(sessionId)
+  const t = posixQuote(pane)
   let cmd =
     `${tmux} load-buffer -b ${buffer} - ';' ` +
-    `if-shell -F -t ${sessionId} '#{pane_in_mode}' 'send-keys -t ${sessionId} -X cancel' ';' ` +
-    `paste-buffer -d -p -r -b ${buffer} -t ${sessionId}`
-  if (enter) cmd += ` ';' send-keys -t ${sessionId} Enter`
+    `if-shell -F -t ${t} '#{pane_in_mode}' 'send-keys -t ${pane} -X cancel' ';' ` +
+    `paste-buffer -d -p -r -b ${buffer} -t ${t}`
+  if (enter) cmd += ` ';' send-keys -t ${t} Enter`
   return childArgs(conn, controlPath, tmuxCmd(cmd))
 }
 
@@ -315,6 +366,24 @@ export function remoteTmuxPasteArgs(
  * disappeared per host. The envelope now rides `remotePasteDelivery` above (`-p` + a separate
  * Enter, `PtyManager.sendEnvelope`), exactly like every other remote write.
  */
+
+/**
+ * The TYPED delivery on the REMOTE server (see core/typed-input.ts): the same fixed script, run
+ * under `sh -c` so it does not depend on the user's login shell, with the text on stdin — never on
+ * the remote command line, where it would sit in the host's process list.
+ */
+export function remoteTypedArgs(
+  conn: SshConnection,
+  controlPath: string,
+  sessionId: string,
+  buffer: string
+): string[] {
+  return childArgs(
+    conn,
+    controlPath,
+    tmuxCmd(`sh -c ${posixQuote(typedInputScript('tmux', RMT_TMUX_SOCKET, sessionId, buffer))}`)
+  )
+}
 
 /**
  * A bare Enter into the remote pane — the remote half of `sendText`'s empty-payload case.
@@ -337,7 +406,11 @@ export function remoteTmuxEnterArgs(
   sessionId: string
 ): string[] {
   assertPasteTarget(sessionId)
-  return childArgs(conn, controlPath, tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} send-keys -t ${sessionId} Enter`))
+  return childArgs(
+    conn,
+    controlPath,
+    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} send-keys -t ${posixQuote(exactPaneTarget(sessionId))} Enter`)
+  )
 }
 
 /** `delete-buffer` on the REMOTE server — the sweep for a remote paste that never ran. */
@@ -451,7 +524,8 @@ export function remoteTmuxKillArgs(
   sessionId: string,
   socket: string = RMT_TMUX_SOCKET
 ): string[] {
-  return childArgs(conn, controlPath, tmuxCmd(`tmux -L ${socket} kill-session -t ${exactTarget(sessionId)}`))
+  // Quoted: on a zsh login shell an unquoted word starting with `=` is a command-path lookup.
+  return childArgs(conn, controlPath, tmuxCmd(`tmux -L ${socket} kill-session -t ${posixQuote(exactTarget(sessionId))}`))
 }
 
 /**
@@ -475,9 +549,107 @@ export function remoteCapturePaneArgs(conn: SshConnection, controlPath: string, 
   return childArgs(
     conn,
     controlPath,
-    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} capture-pane -p -e -t ${sessionId} -S ${full ? '-' : '-200'}`)
+    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} capture-pane -p -e -t ${posixQuote(exactPaneTarget(sessionId))} -S ${full ? '-' : '-200'}`)
   )
 }
+/**
+ * The VISIBLE screen of a remote session, with SGR, and nothing above it — a live link's keyframe
+ * must never carry history, and `remoteCapturePaneArgs` always adds `-S`. The cursor line rides the
+ * SAME tmux invocation (see `watch-link/capture-route.ts` for why, and for the measured exact-target
+ * spelling). Every piece that the REMOTE shell would otherwise read is single-quoted: tmux's `;`
+ * separator (bare, it would end the tmux command and run `display-message` as a shell command), the
+ * `=name:` target and the `#{…}` format. Proven under a real /bin/sh in capture-visible.realsh.test.ts.
+ */
+export function remoteCaptureVisibleArgs(conn: SshConnection, controlPath: string, sessionId: string): string[] {
+  const target = posixQuote(capturePaneTarget(sessionId))
+  return childArgs(
+    conn,
+    controlPath,
+    tmuxCmd(
+      `tmux -L ${RMT_TMUX_SOCKET} capture-pane -p -e -t ${target} ';' ` +
+        `display-message -p -t ${target} ${posixQuote(VISIBLE_CAPTURE_FORMAT)}`
+    )
+  )
+}
+/**
+ * A live link watcher's OWN client on the host, for a node no Session is held for: a tty-allocating
+ * ssh child (`-t`, like `remoteTmuxPtyArgs`) running `attach-session -E -f ignore-size,read-only` on
+ * the exact target — never creating, never touching the session env, and out of the window's sizing
+ * while an unflagged client is attached anywhere on the server (tmux honours `ignore-size` only then;
+ * the caller spawns it at the window's current size and keeps it synced — `watch-link/watcher-client.ts`). Deliberately NOT wrapped like the owner's
+ * interactive command: a host without tmux gets a failed command, never a plain login shell — a
+ * watcher must not get a shell. An old remote tmux (< 3.2) rejects `-f` with a usage error: the
+ * command fails and nothing attaches. Proven under a real /bin/sh in watcher-attach.realsh.test.ts
+ * and on a real tty in watcher-client.realtty.test.ts.
+ */
+export function remoteTmuxWatcherArgs(conn: SshConnection, controlPath: string, sessionId: string): string[] {
+  return [
+    '-t',
+    ...childArgs(
+      conn,
+      controlPath,
+      tmuxCmd(
+        `tmux -L ${RMT_TMUX_SOCKET} attach-session -E -f ${posixQuote(WATCHER_CLIENT_FLAGS)} ` +
+          `-t ${posixQuote(capturePaneTarget(sessionId))}`
+      )
+    )
+  ]
+}
+
+/** The REMOTE window size of exactly this session, so a watcher's client is spawned at it. */
+export function remoteWindowSizeArgs(conn: SshConnection, controlPath: string, sessionId: string): string[] {
+  return childArgs(
+    conn,
+    controlPath,
+    tmuxCmd(
+      `tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${posixQuote(capturePaneTarget(sessionId))} ` +
+        posixQuote(WINDOW_SIZE_FORMAT)
+    )
+  )
+}
+/**
+ * Ask the REMOTE tmux when a node's session was created, AND what the host's clock says now — in
+ * one round trip, because the caller wants an AGE and the two clocks are not the same clock.
+ *
+ * `#{session_created}` is an epoch stamp taken on the HOST, so subtracting our own `Date.now()`
+ * would fold that host's clock skew (and every NTP correction) into the answer. Computing the
+ * difference from two numbers the host produced in the same shell removes the question entirely.
+ *
+ * Verified on tmux 3.3a and 3.4: `session_created` has been a format variable since long before
+ * either (unlike `#{bracket_paste_flag}`, the version trap this file's neighbours document), and
+ * `new-session -A` on an EXISTING session preserves the original creation time — which is the whole
+ * reason the answer can distinguish "this session was already here" from "our attach made it".
+ * Targeted `-t '=<name>:'` — the same exact-match form `PtyManager.paneCwdStale` documents, and
+ * for the same measured reason: without `=` tmux falls back to fnmatch then PREFIX matching, so
+ * `nt-abc` could answer about `nt-abcdef`, and a bare `=name` (no trailing colon) resolves NOTHING
+ * for a target-PANE query — exit 0, every format empty. Re-measured here on tmux 3.3a and 3.4.
+ */
+export function remoteSessionAgeArgs(conn: SshConnection, controlPath: string, sessionId: string): string[] {
+  return childArgs(
+    conn,
+    controlPath,
+    tmuxCmd(
+      `printf '%s %s\n' "$(tmux -L ${RMT_TMUX_SOCKET} display-message -p -t '=${sessionId}:' '#{session_created}')" "$(date +%s)"`
+    )
+  )
+}
+
+/**
+ * Seconds since a tmux session was created, from the `"<created> <now>"` line
+ * `remoteSessionAgeArgs` (and its local twin) produce. `null` for anything we cannot read as two
+ * epoch numbers — a missing session, an empty format, a shell that printed something else. Never
+ * negative: a host whose clock stepped backwards between the two `$( )` is unknowable, not brand
+ * new, and the caller ACTS on a small age.
+ */
+export function parseSessionAge(stdout: string): number | null {
+  const [created, now] = stdout.trim().split(/\s+/)
+  const a = Number(created)
+  const b = Number(now)
+  if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b <= 0) return null
+  const age = b - a
+  return age < 0 ? null : age
+}
+
 /**
  * Ask the REMOTE tmux which command is in the foreground of a node's pane — the remote
  * counterpart of `PtyManager.paneCommand`'s local `display-message` path. The format is
@@ -488,7 +660,36 @@ export function remotePaneCommandArgs(conn: SshConnection, controlPath: string, 
   return childArgs(
     conn,
     controlPath,
-    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${sessionId} '#{pane_current_command}'`)
+    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${posixQuote(exactPaneTarget(sessionId))} '#{pane_current_command}'`)
+  )
+}
+
+/**
+ * One closed-set key into a remote pane (`PtyManager.sendKeys`, the phone's relay `agent.key`).
+ * `keyArgs` comes from `relay-keys.tmuxKeyArgs` — a digit 1–9 after `-l`, or a fixed key name —
+ * and is re-checked here before it lands on a remote command line.
+ */
+export function remoteSendKeyArgs(
+  conn: SshConnection,
+  controlPath: string,
+  sessionId: string,
+  keyArgs: readonly string[]
+): string[] {
+  const safe = keyArgs.every((a) => /^(-l|[1-9]|Escape|Enter|Right)$/.test(a))
+  if (!safe || !/^[A-Za-z0-9._-]+$/.test(sessionId)) throw new Error('unsafe remote send-keys')
+  return childArgs(
+    conn,
+    controlPath,
+    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} send-keys -t ${posixQuote(exactPaneTarget(sessionId))} ${keyArgs.join(' ')}`)
+  )
+}
+
+/** The remote counterpart of `PtyManager.paneCwd`'s local `display-message` path. */
+export function remotePaneCwdArgs(conn: SshConnection, controlPath: string, sessionId: string): string[] {
+  return childArgs(
+    conn,
+    controlPath,
+    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${posixQuote(exactPaneTarget(sessionId))} '#{pane_current_path}'`)
   )
 }
 
@@ -501,7 +702,7 @@ export function remotePaneProcessArgs(
   return childArgs(
     conn,
     controlPath,
-    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${sessionId} '#{pane_pid}|#{pane_current_command}'`)
+    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${posixQuote(exactPaneTarget(sessionId))} '#{pane_pid}|#{pane_current_command}'`)
   )
 }
 
@@ -568,7 +769,7 @@ export function remotePaneOwnerCombinedArgs(
   assertPasteTarget(sessionId)
   const ps = PS_FOREGROUND_FLAGS.join(' ')
   const script =
-    `o=$(${tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${sessionId} '${PANE_OWNER_FMT}'`)}) || exit 9; ` +
+    `o=$(${tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${posixQuote(exactPaneTarget(sessionId))} '${PANE_OWNER_FMT}'`)}) || exit 9; ` +
     `printf '%s\\n' "${COMBINED_PANE_MARKER.trimEnd()} $o"; ` +
     'tty=${o#*|}; tty=${tty%%|*}; ' +
     `case "$tty" in /dev/*) ps ${ps} -t "$tty" 2>/dev/null || : ;; esac`
@@ -599,7 +800,7 @@ export function remotePaneCursorArgs(
   return childArgs(
     conn,
     controlPath,
-    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${sessionId} '#{cursor_x} #{cursor_y} #{cursor_flag}'`)
+    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${posixQuote(exactPaneTarget(sessionId))} '#{cursor_x} #{cursor_y} #{cursor_flag}'`)
   )
 }
 export function tmuxProbeArgs(conn: SshConnection, controlPath: string): string[] {
@@ -679,6 +880,63 @@ export function hookForwardCancelArgs(conn: SshConnection, controlPath: string, 
   return ['-O', 'cancel', '-R', fwdSpec(remoteSock, hookPort), '-o', `ControlPath=${controlPath}`, ...portArgs(conn), target(conn)]
 }
 /**
+ * The loopback-TCP twin of `hookForwardArgs`: `-R 127.0.0.1:<remotePort>:127.0.0.1:<hookPort>`.
+ *
+ * Used ONLY as a fallback when the unix-socket forward binds but fails verification. Field case:
+ * Tailscale SSH. `tailscaled` serves the session as root and creates the `-R` stream-local socket
+ * owned by root with mode 0600, so the login user's `curl --unix-socket` can never connect and the
+ * project silently runs without hooks (no status badges, no session names, no canvas control). A
+ * loopback TCP listener carries no file ownership, and every generated client already speaks the
+ * `NODETERM_HOOK_PORT` transport. Bound to 127.0.0.1 explicitly so it is never exposed off-host.
+ */
+function tcpFwdSpec(remotePort: number, hookPort: number): string {
+  const okPort = (n: number): boolean => Number.isInteger(n) && n >= 1 && n <= 65535
+  if (!okPort(remotePort) || !okPort(hookPort)) throw new Error('invalid forward spec')
+  return `127.0.0.1:${remotePort}:127.0.0.1:${hookPort}`
+}
+export function hookTcpForwardArgs(conn: SshConnection, controlPath: string, remotePort: number, hookPort: number): string[] {
+  return ['-O', 'forward', '-R', tcpFwdSpec(remotePort, hookPort), '-o', `ControlPath=${controlPath}`, ...portArgs(conn), target(conn)]
+}
+export function hookTcpForwardCancelArgs(conn: SshConnection, controlPath: string, remotePort: number, hookPort: number): string[] {
+  return ['-O', 'cancel', '-R', tcpFwdSpec(remotePort, hookPort), '-o', `ControlPath=${controlPath}`, ...portArgs(conn), target(conn)]
+}
+/**
+ * A dev-server LOCAL forward over the existing master (`ssh -O forward -L`): this machine's
+ * `127.0.0.1:<localPort>` → the host's `<target>:<remotePort>`. The local side binds loopback ONLY
+ * — never `*` or a LAN address, which would publish someone's unfinished app to the network the
+ * laptop is on. An IPv6 target is bracketed, which is how ssh's `-L` grammar takes it.
+ * `toAddr` must already be a validated IP literal (core/dev-ports.ts `forwardTarget`).
+ */
+function localFwdSpec(localPort: number, toAddr: string, remotePort: number): string {
+  // Re-validated HERE, at the argv site (CLAUDE.md rule 13), not only by the caller: the address
+  // came off another machine's command output. A throw is caught by the registry as a failed
+  // forward, never an ssh argument.
+  const okPort = (n: number): boolean => Number.isInteger(n) && n >= 1 && n <= 65535
+  const okAddr = /^\d{1,3}(\.\d{1,3}){3}$/.test(toAddr) || (/^[0-9A-Fa-f:]+$/.test(toAddr) && toAddr.includes(':'))
+  if (!okPort(localPort) || !okPort(remotePort) || !okAddr) throw new Error('invalid forward spec')
+  const host = toAddr.includes(':') ? `[${toAddr}]` : toAddr
+  return `127.0.0.1:${localPort}:${host}:${remotePort}`
+}
+export function localForwardArgs(
+  conn: SshConnection,
+  controlPath: string,
+  localPort: number,
+  toAddr: string,
+  remotePort: number
+): string[] {
+  return ['-O', 'forward', '-L', localFwdSpec(localPort, toAddr, remotePort), '-o', `ControlPath=${controlPath}`, ...portArgs(conn), target(conn)]
+}
+/** The exact spec `localForwardArgs` opened — ssh matches a cancel against it verbatim. */
+export function localForwardCancelArgs(
+  conn: SshConnection,
+  controlPath: string,
+  localPort: number,
+  toAddr: string,
+  remotePort: number
+): string[] {
+  return ['-O', 'cancel', '-L', localFwdSpec(localPort, toAddr, remotePort), '-o', `ControlPath=${controlPath}`, ...portArgs(conn), target(conn)]
+}
+/**
  * tmux `-e KEY=VALUE` pairs injecting the remote hook endpoint file + node id + protocol version,
  * plus the agent identity. The identity pair matters: the local path's `hookServer.buildPtyEnv`
  * sets NODETERM_AGENT_ID and gates NODETERM_CANVAS_CONTROL on `canControlCanvas`, and a remote
@@ -723,6 +981,25 @@ export function remoteEndpointFileContents(
     `NODETERM_HOOK_VERSION=${posixQuote(version)}\n` +
     // The REMOTE token dir ($HOME/.nodeterm/node-tokens on the host), not ours. The host stores
     // per-node tokens only; it never holds a secret and can never mint.
+    `NODETERM_NODE_TOKEN_DIR=${posixQuote(tokenDir)}\n`
+  )
+}
+/**
+ * Endpoint file for the loopback-TCP fallback tunnel (`hookTcpForwardArgs`). `NODETERM_HOOK_SOCK` is
+ * written EMPTY on purpose: every client tries the socket first (`[ -n "$NODETERM_HOOK_SOCK" ]`), so
+ * a socket path inherited from a session env or an earlier endpoint must not shadow the port.
+ */
+export function remoteTcpEndpointFileContents(
+  remotePort: number,
+  token: string,
+  version: string,
+  tokenDir: string
+): string {
+  return (
+    `NODETERM_HOOK_SOCK=''\n` +
+    `NODETERM_HOOK_PORT=${posixQuote(String(remotePort))}\n` +
+    `NODETERM_HOOK_TOKEN=${posixQuote(token)}\n` +
+    `NODETERM_HOOK_VERSION=${posixQuote(version)}\n` +
     `NODETERM_NODE_TOKEN_DIR=${posixQuote(tokenDir)}\n`
   )
 }

@@ -1,9 +1,19 @@
+import { allRemote, ALL_REMOTE_INTEGRATION } from './remote-hooks.test-plan'
+import { createHash } from 'crypto'
 import { execFileSync } from 'child_process'
 import { describe, expect, it, vi } from 'vitest'
-import { RemoteHooks, openCodeInstructionsTarget } from './remote-hooks'
+import {
+  RemoteHooks,
+  type RemoteIntegrationPlan,
+  openCodeInstructionsTarget,
+  TCP_FALLBACK_PORT_MAX,
+  TCP_FALLBACK_PORT_MIN
+} from './remote-hooks'
 import { isSafeRemoteHome } from '../../core/remote-safety'
 import { hookServer } from '../../core/agents/hook-server'
 
+const ownerT = createHash('sha256').update('t').digest('hex').slice(0, 16)
+const owner = createHash('sha256').update('tok').digest('hex').slice(0, 16)
 const conn = { host: 'h', user: 'u' }
 
 function harness(
@@ -17,6 +27,8 @@ function harness(
     failOn?: string
     /** Command substring whose runner result is non-zero (the runner itself still resolves). */
     failCodeOn?: string
+    /** The host's consent plan (issue #744). Default: every agent enabled. */
+    plan?: RemoteIntegrationPlan
   } = {}
 ) {
   // One record per ssh child command. `args` is what the runner was handed; `cmd` is the joined
@@ -29,20 +41,55 @@ function harness(
     calls.push({ args, stdin, cmd: joined })
     if (opts.failOn && joined.includes(opts.failOn)) throw new Error(`fake ssh failed: ${opts.failOn}`)
     if (opts.failCodeOn && joined.includes(opts.failCodeOn)) return { code: 1, stdout: '' }
+    const resolved = joined.match(/nt_resolve '([^']+)' \|\| exit 1/)?.[1]
     for (const [needle, stdout] of Object.entries(opts.responses ?? {})) {
-      if (joined.includes(needle)) return { code: 0, stdout }
+      if (joined.includes(needle)) return { code: 0, stdout: resolved ? `${resolved}\n${stdout}` : stdout }
     }
     // resolve the remote $HOME probe → absolute remote paths build from this.
     if (joined.includes('$HOME')) return { code: 0, stdout: '/home/u' }
-    if (joined.includes('cat /home/u/.claude/settings.json')) return { code: 0, stdout: '{}' }
+    if (joined.includes("cat '/home/u/.claude/settings.json'")) return { code: 0, stdout: '{}' }
+    if (resolved) return { code: 44, stdout: `${resolved}\n` }
     // the end-to-end tunnel verification curl (runs in ARGS, unlike the script's stdin curl).
     if (joined.includes('%{http_code}')) return { code: 0, stdout: verifyAnswers.shift() ?? '204' }
     return { code: 0, stdout: '' }
   })
-  return { rh: new RemoteHooks({ run }), calls, runs: calls, run, conn }
+  return { rh: new RemoteHooks({ run }, () => opts.plan ?? ALL_REMOTE_INTEGRATION), calls, runs: calls, run, conn }
 }
 
+/** A remote command that PUBLISHES `p`: every write now ends in a rename onto the quoted path —
+ *  our own files from a size-checked temp, the user's files from the guarded transaction. */
+const writesTo = (cmd: string, p: string) => cmd.includes('mv -f -- ') && cmd.includes(`'${p}'`)
+/** The temp an owned-file write stages into, when `cmd` publishes `p` (see remoteAtomicWrite). */
+const tempFor = (cmd: string, p: string) =>
+  writesTo(cmd, p) ? cmd.match(/cat > ('[^']*\.nodeterm-[0-9a-f-]{36}\.tmp')/)?.[1] : undefined
+
 describe('RemoteHooks.setup', () => {
+  it('migrates a legacy file using this installation’s previous qualified bearer', async () => {
+    const legacy = "NODETERM_HOOK_TOKEN='previous-secret'\nNODETERM_HOOK_SOCK='/stale'\n"
+    const { rh, calls } = harness({ responses: {
+      [`cat '/home/u/.nodeterm/hook-endpoint-p1-${owner}.env'`]: legacy,
+      ["cat '/home/u/.nodeterm/hook-endpoint-p1.env'"]: legacy
+    } })
+    expect(await rh.setup('p1', conn, '/s.sock', { port: 51234, token: 'tok', version: '1' })).not.toBeNull()
+    const migration = calls.find((c) => c.cmd.includes('.migration-lock'))
+    expect(migration).toBeDefined()
+    expect(migration!.stdin).toContain("NODETERM_HOOK_TOKEN='tok'")
+    expect(migration!.cmd).not.toContain('previous-secret')
+    expect(migration!.cmd).not.toContain("'tok'")
+  })
+
+  it('preserves a legacy file owned by another installation and still connects', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { rh, calls } = harness({ responses: {
+        ["cat '/home/u/.nodeterm/hook-endpoint-p1.env'"]: "NODETERM_HOOK_TOKEN='foreign-secret'\n"
+      } })
+      expect(await rh.setup('p1', conn, '/s.sock', { port: 51234, token: 'tok', version: '1' })).not.toBeNull()
+      expect(calls.some((c) => c.cmd.includes('.migration-lock'))).toBe(false)
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('restart affected agent sessions'))
+    } finally { warn.mockRestore() }
+  })
+
   it('opens a reverse forward, writes the endpoint file, and installs the managed hook for claude', async () => {
     const { rh, calls } = harness()
     const res = await rh.setup('p1', conn, '/s.sock', { port: 51234, token: 'tok', version: '1' })
@@ -50,19 +97,19 @@ describe('RemoteHooks.setup', () => {
     // real project OR a transient folder-picker browse — has its own reverse-tunnel socket, so a
     // shared file let the last writer (often a short-lived browse whose tunnel then died) point
     // every session at a dead socket, silently killing hook delivery for all real projects.
-    expect(res?.endpointPath).toBe('/home/u/.nodeterm/hook-endpoint-p1.env')
+    expect(res?.endpointPath).toBe(`/home/u/.nodeterm/hook-endpoint-p1-${owner}.env`)
     const joined = calls.map((c) => c.args.join(' '))
     // reverse forward binds the ABSOLUTE remote socket (no unexpanded ~).
-    expect(joined.some((j) => j.includes('-O forward') && j.includes('/home/u/.nodeterm/hook-p1.sock:127.0.0.1:51234'))).toBe(true)
+    expect(joined.some((j) => j.includes('-O forward') && /\/home\/u\/.nodeterm\/hook-[a-f0-9]{20}\.sock:127.0.0.1:51234/.test(j))).toBe(true)
     // Endpoint bearer goes to a private, invocation-owned temp and is then published atomically.
     const endpointWrite = calls.find((c) => (c.stdin ?? '').includes("NODETERM_HOOK_TOKEN='tok'"))
     const endpointTemp = endpointWrite?.cmd.match(
       /cat > ('\/home\/u\/\.nodeterm\/\.nodeterm-[0-9a-f-]{36}\.tmp')/
     )?.[1]
     expect(endpointTemp).toBeTruthy()
-    expect(endpointWrite?.cmd).toContain(`chmod 600 -- ${endpointTemp}`)
+    expect(endpointWrite?.cmd).toContain(`chmod 600 ${endpointTemp}`)
     expect(endpointWrite?.cmd).toContain(
-      `mv -f -- ${endpointTemp} '/home/u/.nodeterm/hook-endpoint-p1.env'`
+      `mv -f -- ${endpointTemp} '/home/u/.nodeterm/hook-endpoint-p1-${owner}.env'`
     )
     expect(endpointWrite?.cmd).toContain(`rm -f -- ${endpointTemp}`)
     expect(
@@ -70,12 +117,17 @@ describe('RemoteHooks.setup', () => {
         (c) =>
           // Values are single-quoted (issue #351) so a spaced remote path sources cleanly.
           (c.stdin ?? '').includes("NODETERM_HOOK_TOKEN='tok'") &&
-          (c.stdin ?? '').includes("NODETERM_HOOK_SOCK='/home/u/.nodeterm/hook-p1.sock'")
+          /NODETERM_HOOK_SOCK='\/home\/u\/.nodeterm\/hook-[a-f0-9]{20}\.sock'/.test(c.stdin ?? '')
       )
     ).toBe(true)
-    // managed script written to the absolute path + config merged with the guarded command.
-    expect(joined.some((j) => j.includes(`cat > '/home/u/.nodeterm/agent-hooks/claude.sh'`))).toBe(true)
-    expect(joined.some((j) => j.includes(`cat > '/home/u/.claude/settings.json'`))).toBe(true)
+    // managed script written to the absolute path (size-checked temp, 755, renamed) + config
+    // merged with the guarded command.
+    const scriptWrite = joined.find((j) => writesTo(j, '/home/u/.nodeterm/agent-hooks/claude.sh'))
+    const scriptTemp = tempFor(scriptWrite ?? '', '/home/u/.nodeterm/agent-hooks/claude.sh')
+    expect(scriptTemp).toBeTruthy()
+    expect(scriptWrite).toContain(`chmod 755 ${scriptTemp}`)
+    expect(scriptWrite).toContain(`[ "$(wc -c < ${scriptTemp})" -eq `)
+    expect(joined.some((j) => j.includes(`mv -f -- "$nt_stage/publish" '/home/u/.claude/settings.json'`))).toBe(true)
     expect(calls.some((c) => (c.stdin ?? '').includes('--unix-socket'))).toBe(true)
     // The merged command guards on the script still existing — a removed ~/.nodeterm must not
     // make every prompt fail the hook (a non-zero UserPromptSubmit hook blocks the prompt).
@@ -89,30 +141,53 @@ describe('RemoteHooks.setup', () => {
     expect(joined.some((j) => j.includes('~/'))).toBe(false)
   })
 
+  it('isolates installations with the same project id and allocates a fresh bind on reconnect', async () => {
+    const a = harness()
+    const b = harness()
+    try {
+      hookServer.setNodeAuthSecret(Buffer.alloc(32, 1))
+      const first = await a.rh.setup('p1', conn, '/s', { port: 1, token: 'a', version: '2' })
+      const again = await a.rh.setup('p1', conn, '/s', { port: 1, token: 'a', version: '2' })
+      hookServer.setNodeAuthSecret(Buffer.alloc(32, 2))
+      const other = await b.rh.setup('p1', conn, '/s', { port: 2, token: 'b', version: '2' })
+      expect(first).toEqual(again) // stable discovery within one installation
+      expect(first?.endpointPath).not.toBe(other?.endpointPath)
+      const binds = [...a.calls, ...b.calls].filter((c) => c.args.includes('forward'))
+      expect(new Set(binds.map((c) => c.args[c.args.indexOf('-R') + 1].split(':')[0])).size).toBe(3)
+      const firstSpec = binds[0].args[binds[0].args.indexOf('-R') + 1]
+      expect(a.calls.some((c) => c.args.includes('cancel') && c.args.includes(firstSpec))).toBe(true)
+    } finally { hookServer.clearNodeAuthSecretForTests() }
+  })
+
   it('installs codex too — hooks.json merge PLUS the config.toml trust write', async () => {
     const { rh, calls } = harness()
     const res = await rh.setup('p1', conn, '/s.sock', { port: 51234, token: 'tok', version: '1' })
     expect(res).not.toBeNull()
     const joined = calls.map((c) => c.args.join(' '))
     // codex managed script written to the absolute agent-hooks path (paths are posix-quoted).
-    expect(joined.some((j) => j.includes("cat > '/home/u/.nodeterm/agent-hooks/codex.sh'"))).toBe(true)
-    // hooks.json merged with the [ -x ] guarded command (embedded as JSON in stdin).
+    expect(joined.some((j) => writesTo(j, '/home/u/.nodeterm/agent-hooks/codex.sh'))).toBe(true)
+    // hooks.json merged with the [ -x ] guarded command (embedded as JSON in stdin) — through the
+    // guarded transaction, because hooks.json is the USER's file.
     expect(
       calls.some(
         (c) =>
-          c.args.join(' ').includes("cat > '/home/u/.codex/hooks.json'") &&
+          writesTo(c.cmd, '/home/u/.codex/hooks.json') &&
+          c.cmd.includes('.nodeterm-lock') &&
           (c.stdin ?? '').includes("if [ -x '/home/u/.nodeterm/agent-hooks/codex.sh' ]")
       )
     ).toBe(true)
-    // the part claude/gemini don't need: a config.toml trust block with a trusted_hash.
+    // the part claude/gemini don't need: a config.toml trust block with a trusted_hash — the
+    // user's file too, so the same transaction (never `cat > config.toml`).
     expect(
       calls.some(
         (c) =>
-          c.args.join(' ').includes("cat > '/home/u/.codex/config.toml'") &&
+          writesTo(c.cmd, '/home/u/.codex/config.toml') &&
+          c.cmd.includes('.nodeterm-lock') &&
           (c.stdin ?? '').includes('[hooks.state.') &&
           (c.stdin ?? '').includes('trusted_hash = "sha256:')
       )
     ).toBe(true)
+    expect(joined.some((j) => j.includes("cat > '/home/u/.codex/"))).toBe(false)
     // no unexpanded tilde anywhere in the codex path work either.
     expect(joined.some((j) => j.includes('~/'))).toBe(false)
   })
@@ -124,16 +199,18 @@ describe('RemoteHooks.setup', () => {
       const joined = args.join(' ')
       if (joined.includes('$HOME')) return { code: 0, stdout: '/home/u' }
       if (joined.includes('%{http_code}')) return { code: 0, stdout: '204' }
-      // present-but-broken hooks.json (the `|| echo '{}'` only fires when the file is MISSING).
-      if (joined.includes("cat '/home/u/.codex/hooks.json'")) return { code: 0, stdout: '{ not json' }
+      // present-but-broken hooks.json, as the guarded read reports it (resolved path, then bytes).
+      if (joined.includes("nt_resolve '/home/u/.codex/hooks.json' || exit 1")) {
+        return { code: 0, stdout: '/home/u/.codex/hooks.json\n{ not json' }
+      }
       return { code: 0, stdout: '' }
     })
-    await new RemoteHooks({ run }).setup('p1', conn, '/s.sock', { port: 1, token: 't', version: '1' })
+    await new RemoteHooks({ run }, allRemote).setup('p1', conn, '/s.sock', { port: 1, token: 't', version: '1' })
     const joined = calls.map((c) => c.args.join(' '))
     // the script is still (idempotently) written, but neither hooks.json nor config.toml is rewritten.
-    expect(joined.some((j) => j.includes("cat > '/home/u/.nodeterm/agent-hooks/codex.sh'"))).toBe(true)
-    expect(joined.some((j) => j.includes("cat > '/home/u/.codex/hooks.json'"))).toBe(false)
-    expect(joined.some((j) => j.includes("cat > '/home/u/.codex/config.toml'"))).toBe(false)
+    expect(joined.some((j) => writesTo(j, '/home/u/.nodeterm/agent-hooks/codex.sh'))).toBe(true)
+    expect(joined.some((j) => writesTo(j, '/home/u/.codex/hooks.json'))).toBe(false)
+    expect(joined.some((j) => j.includes('/home/u/.codex/config.toml'))).toBe(false)
   })
 
   it('verifies the tunnel end-to-end and heals a stale forward with one rebind', async () => {
@@ -141,7 +218,7 @@ describe('RemoteHooks.setup', () => {
     // forward — the field case that killed remote statuses for hours); the rebind fixes it.
     const { rh, calls } = harness({ verifyAnswers: ['000', '204'] })
     const res = await rh.setup('p1', conn, '/s.sock', { port: 51234, token: 'tok', version: '1' })
-    expect(res?.endpointPath).toBe('/home/u/.nodeterm/hook-endpoint-p1.env')
+    expect(res?.endpointPath).toBe(`/home/u/.nodeterm/hook-endpoint-p1-${owner}.env`)
     const joined = calls.map((c) => c.args.join(' '))
     expect(joined.filter((j) => j.includes('-O forward')).length).toBe(2)
     // The retry clears our own possibly-registered spec before rebinding.
@@ -169,15 +246,56 @@ describe('RemoteHooks.setup', () => {
   })
 
   it('refuses to advertise a tunnel that never verifies — no endpoint file, null result', async () => {
-    const { rh, calls } = harness({ verifyAnswers: ['000', '000'] })
+    // 2 unix-socket attempts + 3 loopback-TCP fallback attempts, all dead.
+    const { rh, calls } = harness({ verifyAnswers: ['000', '000', '000', '000', '000'] })
     const res = await rh.setup('p1', conn, '/s.sock', { port: 51234, token: 'tok', version: '1' })
     expect(res).toBeNull()
     // The endpoint file must NOT be written: sessions would source a socket that answers nothing.
-    expect(calls.map((c) => c.args.join(' ')).some((j) => j.includes('hook-endpoint-p1.env'))).toBe(false)
+    expect(calls.map((c) => c.args.join(' ')).some((j) => j.includes('hook-endpoint-p1-'))).toBe(false)
+    // Every TCP spec the fallback opened was cancelled again.
+    const opened = calls.filter((c) => c.cmd.includes('-O forward -R 127.0.0.1:')).length
+    const cancelled = calls.filter((c) => c.cmd.includes('-O cancel -R 127.0.0.1:')).length
+    expect(opened).toBe(3)
+    expect(cancelled).toBe(3)
+  })
+
+  // Tailscale SSH creates the `-R` stream-local socket as root, mode 0600: it binds, but the login
+  // user can never connect, so the socket probe answers 000 on every attempt.
+  it('falls back to a loopback TCP forward when the unix socket binds but never answers', async () => {
+    const { rh, calls } = harness({ verifyAnswers: ['000', '000', '204'] })
+    const res = await rh.setup('p1', conn, '/s.sock', { port: 51234, token: 'tok', version: '1' })
+    expect(res).not.toBeNull()
+    const tcpForward = calls.find((c) => c.cmd.includes('-O forward -R 127.0.0.1:'))
+    const remotePort = Number(tcpForward?.cmd.match(/-R 127\.0\.0\.1:(\d+):127\.0\.0\.1:51234/)?.[1])
+    expect(remotePort).toBeGreaterThanOrEqual(TCP_FALLBACK_PORT_MIN)
+    expect(remotePort).toBeLessThanOrEqual(TCP_FALLBACK_PORT_MAX)
+    // The TCP probe hits loopback on the host, bearer still on stdin only.
+    const tcpProbe = calls.filter((c) => c.cmd.includes('%{http_code}')).at(-1)
+    expect(tcpProbe?.cmd).toContain(`http://127.0.0.1:${remotePort}/verify`)
+    expect(tcpProbe?.cmd).not.toContain('--unix-socket')
+    expect(tcpProbe?.cmd).not.toContain('tok')
+    // The endpoint advertises the port and explicitly empties the socket (clients try SOCK first).
+    const endpoint = calls.find((c) => c.cmd.includes('hook-endpoint-p1-') && c.stdin?.includes('NODETERM_HOOK_PORT'))
+    expect(endpoint?.stdin).toContain(`NODETERM_HOOK_PORT='${remotePort}'`)
+    expect(endpoint?.stdin).toContain("NODETERM_HOOK_SOCK=''")
+    // Liveness and teardown follow the TCP spec, not a socket path.
+    const alive = await rh.tunnelAlive('p1', conn, '/s.sock', 'tok')
+    expect(alive.alive).toBe(true)
+    expect(calls.filter((c) => c.cmd.includes('%{http_code}')).at(-1)?.cmd).toContain(`127.0.0.1:${remotePort}/verify`)
+    await rh.teardown('p1', conn, '/s.sock')
+    expect(calls.at(-1)?.cmd).toContain(`-O cancel -R 127.0.0.1:${remotePort}:127.0.0.1:51234`)
+  })
+
+  it('keeps the unix socket when it verifies — no TCP forward is opened', async () => {
+    const { rh, calls } = harness()
+    expect(await rh.setup('p1', conn, '/s.sock', { port: 51234, token: 'tok', version: '1' })).not.toBeNull()
+    expect(calls.some((c) => c.cmd.includes('-R 127.0.0.1:'))).toBe(false)
+    const endpoint = calls.find((c) => c.cmd.includes('hook-endpoint-p1-') && c.stdin?.includes('NODETERM_HOOK_SOCK'))
+    expect(endpoint?.stdin).not.toContain('NODETERM_HOOK_PORT')
   })
 
   it('does not advertise an endpoint whose atomic credential publish returns non-zero', async () => {
-    const { rh, calls } = harness({ failCodeOn: 'hook-endpoint-p1.env' })
+    const { rh, calls } = harness({ failCodeOn: 'hook-endpoint-p1-' })
     const res = await rh.setup('p1', conn, '/s.sock', {
       port: 51234,
       token: 'tok',
@@ -197,12 +315,12 @@ describe('RemoteHooks.setup', () => {
       if (joined.includes('$HOME')) return { code: 0, stdout: '/home/u' }
       if (joined.includes('-O forward')) return { code: ++forwards === 1 ? 1 : 0, stdout: '' }
       if (joined.includes('%{http_code}')) return { code: 0, stdout: '204' }
-      if (joined.includes('cat /home/u/.claude/settings.json')) return { code: 0, stdout: '{}' }
+      if (joined.includes("cat '/home/u/.claude/settings.json'")) return { code: 0, stdout: '{}' }
       return { code: 0, stdout: '' }
     })
-    const rh = new RemoteHooks({ run })
+    const rh = new RemoteHooks({ run }, allRemote)
     const res = await rh.setup('p1', conn, '/s.sock', { port: 51234, token: 'tok', version: '1' })
-    expect(res?.endpointPath).toBe('/home/u/.nodeterm/hook-endpoint-p1.env')
+    expect(res?.endpointPath).toBe(`/home/u/.nodeterm/hook-endpoint-p1-${owner}.env`)
     expect(forwards).toBe(2)
   })
 
@@ -210,16 +328,16 @@ describe('RemoteHooks.setup', () => {
     const a = await harness().rh.setup('proj', conn, '/s', { port: 1, token: 't', version: '1' })
     const { rh, calls } = harness()
     const b = await rh.setup('ssh-browse-xyz', conn, '/s', { port: 2, token: 't', version: '1' })
-    expect(a?.endpointPath).toBe('/home/u/.nodeterm/hook-endpoint-proj.env')
-    expect(b?.endpointPath).toBe('/home/u/.nodeterm/hook-endpoint-ssh-browse-xyz.env')
+    expect(a?.endpointPath).toBe(`/home/u/.nodeterm/hook-endpoint-proj-${ownerT}.env`)
+    expect(b?.endpointPath).toBe(`/home/u/.nodeterm/hook-endpoint-ssh-browse-xyz-${ownerT}.env`)
     // the browse writes ITS OWN endpoint file, never the real project's.
     const joined = calls.map((c) => c.args.join(' '))
     expect(
       joined.some(
-        (j) => j.includes('cat > ') && j.includes("hook-endpoint-ssh-browse-xyz.env'")
+        (j) => j.includes('cat > ') && j.includes(`hook-endpoint-ssh-browse-xyz-${ownerT}.env'`)
       )
     ).toBe(true)
-    expect(joined.some((j) => j.includes('hook-endpoint-proj.env'))).toBe(false)
+    expect(joined.some((j) => j.includes('hook-endpoint-proj-'))).toBe(false)
   })
 })
 
@@ -246,15 +364,16 @@ describe('RemoteHooks.setup — a hostile remote $HOME', () => {
   it('quotes every path it builds from $HOME, so a home with a space still installs', async () => {
     const { rh, conn, runs } = harness({ responses: { $HOME: '/Users/Enes K' } })
     const res = await rh.setup('p1', conn, '/s.sock', { port: 51234, token: 'tok', version: '1' })
-    expect(res?.endpointPath).toBe('/Users/Enes K/.nodeterm/hook-endpoint-p1.env')
+    expect(res?.endpointPath).toBe(`/Users/Enes K/.nodeterm/hook-endpoint-p1-${owner}.env`)
     const joined = runs.map((r) => r.cmd)
-    expect(joined.some((j) => j.includes(`mkdir -p '/Users/Enes K/.nodeterm'`))).toBe(true)
+    expect(joined.some((j) => j.includes(`mkdir -p -- '/Users/Enes K/.nodeterm' && `))).toBe(true)
+    expect(joined.some((j) => j.includes(`chmod 700 '/Users/Enes K/.nodeterm';`))).toBe(true)
     expect(
       joined.some(
-        (j) => j.includes('cat > ') && j.includes("/Users/Enes K/.nodeterm/hook-endpoint-p1.env'")
+        (j) => j.includes('cat > ') && j.includes(`/Users/Enes K/.nodeterm/hook-endpoint-p1-${owner}.env'`)
       )
     ).toBe(true)
-    expect(joined.some((j) => j.includes(`cat > '/Users/Enes K/.claude/settings.json'`))).toBe(true)
+    expect(joined.some((j) => j.includes(`mv -f -- "$nt_stage/publish" '/Users/Enes K/.claude/settings.json'`))).toBe(true)
     // No path derived from $HOME survives UNQUOTED in any remote SHELL LINE (the last argv element
     // of an ssh child is the command the remote shell parses; the `-R` forward spec is an ssh
     // OPTION, not a shell word, so it is excluded by construction).
@@ -297,26 +416,19 @@ describe('RemoteHooks — the opencode XDG path expression', () => {
     expect(probe('/home/u')).toBe('ARGC=1|/home/u/.config/opencode/AGENTS.md')
   })
 
-  for (const [what, install] of [
-    ['canvas control', (rh: RemoteHooks, c: typeof conn) => rh.installCanvasControl(c, '/s.sock', HOSTILE)],
-    ['context link', (rh: RemoteHooks, c: typeof conn) => rh.installContextLink(c, '/s.sock', HOSTILE)]
-  ] as const) {
-    it(`${what} routes the opencode target through that safe form`, async () => {
-      const { rh, conn: c, runs } = harness()
-      await install(rh, c)
-      const lines = runs
-        .map((r) => r.args[r.args.length - 1])
-        .filter((l) => l.includes('opencode/AGENTS.md'))
-      expect(lines.length).toBeGreaterThan(0)
-      for (const line of lines) {
-        // The untrusted half is bound to a single-quoted shell variable; it never appears raw
-        // inside the double-quoted expansion, where `$`/backticks would still be live.
-        expect(line).toContain(`NT_H='${HOSTILE}'`)
-        expect(line).toContain('"${XDG_CONFIG_HOME:-$NT_H/.config}/opencode/AGENTS.md"')
-        expect(line).not.toContain(`{XDG_CONFIG_HOME:-${HOSTILE}`)
-      }
-    })
-  }
+  it('the legacy-block clean-up routes the opencode target through that safe form', async () => {
+    const { rh, conn: c, runs } = harness()
+    await rh['stripLegacyInstructionBlocks'](c, '/s.sock', HOSTILE)
+    const lines = runs.map((r) => r.args[r.args.length - 1]).filter((l) => l.includes('opencode/AGENTS.md'))
+    expect(lines.length).toBeGreaterThan(0)
+    for (const line of lines) {
+      // The untrusted half is bound to a single-quoted shell variable; it never appears raw
+      // inside the double-quoted expansion, where `$`/backticks would still be live.
+      expect(line).toContain(`NT_H='${HOSTILE}'`)
+      expect(line).toContain('"${XDG_CONFIG_HOME:-$NT_H/.config}/opencode/AGENTS.md"')
+      expect(line).not.toContain(`{XDG_CONFIG_HOME:-${HOSTILE}`)
+    }
+  })
 })
 
 describe('RemoteHooks.ensureFullscreenTui — the fourth $(dirname …) site', () => {
@@ -416,16 +528,16 @@ describe('RemoteHooks.setup — grok', () => {
     expect(Object.keys(cfg.hooks).sort()).toEqual(GROK_EVENTS)
   })
 
-  it('quotes the remote dirname, so a $GROK_HOME containing a space still installs', async () => {
+  it('quotes the remote parent, so a $GROK_HOME containing a space still installs', async () => {
     // isSafeRemoteGrokHome deliberately permits spaces. An unquoted `mkdir -p $(dirname '…')`
-    // word-splits into two args, never creates the directory, and the correctly-quoted `cat >`
-    // then fails — fail-open, so the only symptom is a host with no hooks and no diagnostic.
+    // word-splits into two args, never creates the directory, and the correctly-quoted write
+    // then fails — fail-open, so the only symptom is a host with no hooks.
     const { rh, conn, runs } = harness({
       responses: { '$HOME': '/home/dev', 'GROK_HOME': '/opt/my grok' }
     })
     await rh.setup('p1', conn, '/s.sock', { port: 1234, token: 't', version: '1' })
-    const write = runs.find((r) => r.cmd.includes('cat > ') && r.cmd.includes('nodeterm-status.json'))
-    expect(write!.cmd).toContain(`mkdir -p "$(dirname '/opt/my grok/hooks/nodeterm-status.json')"`)
+    const write = runs.find((r) => writesTo(r.cmd, '/opt/my grok/hooks/nodeterm-status.json'))
+    expect(write!.cmd).toContain(`mkdir -p -- '/opt/my grok/hooks'`)
   })
 
   it('a grok failure never breaks the connect (fail open)', async () => {
@@ -488,14 +600,14 @@ describe('RemoteHooks.ensureFullscreenTui', () => {
     const calls: { args: string[]; stdin?: string }[] = []
     const run = vi.fn(async (args: string[], stdin?: string) => {
       calls.push({ args, stdin })
-      if (isReadOf(args, target)) return { code: 0, stdout: JSON.stringify({ hooks: { Stop: [] } }) }
+      if (isReadOf(args, target)) return { code: 0, stdout: `${target}\n` + JSON.stringify({ hooks: { Stop: [] } }) }
       return { code: 0, stdout: '' }
     })
-    const rh = new RemoteHooks({ run })
+    const rh = new RemoteHooks({ run }, allRemote)
     await rh.ensureFullscreenTui(conn, '/s.sock', '/home/u')
     const write = calls.find((c) => isWriteTo(c.args, target))
     expect(write).toBeTruthy()
-    expect(JSON.parse(write!.stdin!)).toEqual({ hooks: { Stop: [] }, tui: 'fullscreen' })
+    expect(JSON.parse(write!.stdin!.slice(JSON.stringify({ hooks: { Stop: [] } }).length))).toEqual({ hooks: { Stop: [] }, tui: 'fullscreen' })
   })
 
   it('never overwrites an existing tui value (write-if-absent) — no write issued', async () => {
@@ -503,10 +615,10 @@ describe('RemoteHooks.ensureFullscreenTui', () => {
     const calls: { args: string[]; stdin?: string }[] = []
     const run = vi.fn(async (args: string[]) => {
       calls.push({ args })
-      if (isReadOf(args, target)) return { code: 0, stdout: JSON.stringify({ tui: 'default' }) }
+      if (isReadOf(args, target)) return { code: 0, stdout: `${target}\n` + JSON.stringify({ tui: 'default' }) }
       return { code: 0, stdout: '' }
     })
-    const rh = new RemoteHooks({ run })
+    const rh = new RemoteHooks({ run }, allRemote)
     await rh.ensureFullscreenTui(conn, '/s.sock', '/home/u')
     expect(calls.some((c) => isWriteTo(c.args, target))).toBe(false)
   })
@@ -516,9 +628,9 @@ describe('RemoteHooks.ensureFullscreenTui', () => {
     const calls: { args: string[]; stdin?: string }[] = []
     const run = vi.fn(async (args: string[], stdin?: string) => {
       calls.push({ args, stdin })
-      return { code: 0, stdout: '{}' } // any read → empty settings
+      return { code: 0, stdout: `${target}\n{}` } // resolved target header + empty settings
     })
-    const rh = new RemoteHooks({ run })
+    const rh = new RemoteHooks({ run }, allRemote)
     await rh.ensureFullscreenTuiInAccountDir(conn, '/s.sock', '/home/u', 'acc-1')
     expect(calls.some((c) => isWriteTo(c.args, target))).toBe(true)
     expect(calls.some((c) => (c.stdin ?? '').includes('"tui": "fullscreen"'))).toBe(true)
@@ -534,79 +646,52 @@ describe('RemoteHooks.teardown', () => {
     // cancels using the SAME absolute sock path stored at setup.
     expect(
       run.mock.calls.some(
-        ([a]) => a.join(' ').includes('-O cancel') && a.join(' ').includes('/home/u/.nodeterm/hook-p1.sock:127.0.0.1:51234')
+        ([a]) => a.join(' ').includes('-O cancel') && /hook-[a-f0-9]{20}\.sock:127.0.0.1:51234/.test(a.join(' '))
       )
     ).toBe(true)
   })
 })
 
 describe('RemoteHooks.installCanvasControl', () => {
-  const isWriteTo = (args: string[], p: string) => args.join(' ').includes('cat > ') && args.join(' ').includes(p)
+  const isWriteTo = (args: string[], p: string) => writesTo(args.join(' '), p)
 
-  it('writes an executable shim + the skill, and merges every instruction-file block', async () => {
+  it('writes an executable shim + the skill in claude\'s dir and ~/.agents/skills — and NO instruction-file block (#744)', async () => {
     const { rh, calls } = harness()
     await rh.installCanvasControl(conn, '/s.sock', '/home/u')
     const joined = calls.map((c) => c.args.join(' '))
-    // The shim must land executable: the skill tells the agent to run it via `sh <path>`, but the
-    // instruction blocks and a user's own habits may exec it directly.
-    expect(joined.some((j) => j.includes('cat > \'/home/u/.nodeterm/nodeterm.sh\'') && j.includes('chmod 755'))).toBe(true)
-    // It is the POSIX shim, NOT the retired Electron-as-Node one — nothing may reference a local
-    // interpreter path, which is exactly what made the old CLI unusable off the desktop.
+    // The shim must land executable: the skill tells the agent to run it via `sh <path>`, but a
+    // user's own habits may exec it directly.
+    const shimWrite = joined.find((j) => writesTo(j, '/home/u/.nodeterm/nodeterm.sh')) ?? ''
+    expect(shimWrite).toContain(`chmod 755 ${tempFor(shimWrite, '/home/u/.nodeterm/nodeterm.sh')}`)
+    // It is the POSIX shim, NOT the retired Electron-as-Node one.
     const shim = calls.find((c) => isWriteTo(c.args, '/home/u/.nodeterm/nodeterm.sh'))?.stdin ?? ''
     expect(shim).toContain('#!/bin/sh')
     expect(shim).toContain('--unix-socket')
     expect(shim).not.toContain('ELECTRON_RUN_AS_NODE')
-    // The skill points at the REMOTE shim path (a desktop path would resolve to nothing here).
-    const skill = calls.find((c) => isWriteTo(c.args, '/home/u/.claude/skills/manage-nodeterm-canvas/SKILL.md'))?.stdin ?? ''
-    expect(skill).toContain('name: manage-nodeterm-canvas')
-    expect(skill).toContain('sh "/home/u/.nodeterm/nodeterm.sh"')
-    // codex/gemini get the marker block; opencode's path is expanded by the REMOTE shell, since
-    // the desktop's XDG_CONFIG_HOME says nothing about the host's.
-    expect(joined.some((j) => j.includes('/home/u/.codex/AGENTS.md'))).toBe(true)
-    expect(joined.some((j) => j.includes('/home/u/.gemini/GEMINI.md'))).toBe(true)
-    // …with the remote $HOME bound to a shell variable first, so it is never live inside the
-    // double-quoted expansion (see "the opencode XDG path expression" below).
-    expect(joined.some((j) => j.includes(`NT_H='/home/u'`))).toBe(true)
-    expect(joined.some((j) => j.includes('${XDG_CONFIG_HOME:-$NT_H/.config}/opencode/AGENTS.md'))).toBe(true)
-    expect(joined.some((j) => j.includes('/home/u/.copilot/copilot-instructions.md'))).toBe(true)
-    expect(calls.some((c) => (c.stdin ?? '').includes('nodeterm:manage-canvas:start'))).toBe(true)
+    // The skill points at the REMOTE shim path (a desktop path would resolve to nothing here), in
+    // claude's dir AND in ~/.agents/skills, which codex/gemini/copilot/opencode/grok all read.
+    for (const dir of ['/home/u/.claude/skills', '/home/u/.agents/skills']) {
+      const skill = calls.find((c) => isWriteTo(c.args, `${dir}/manage-nodeterm-canvas/SKILL.md`))?.stdin ?? ''
+      expect(skill, dir).toContain('name: manage-nodeterm-canvas')
+      expect(skill, dir).toContain('sh "/home/u/.nodeterm/nodeterm.sh"')
+    }
+    // Nothing touches a global instruction file any more (they crowded codex's 32 KiB budget).
+    expect(joined.some((j) => /AGENTS\.md|GEMINI\.md|copilot-instructions\.md/.test(j))).toBe(false)
+    expect(calls.some((c) => (c.stdin ?? '').includes('nodeterm:manage-canvas:start'))).toBe(false)
     // no unexpanded tilde survives in any remote path.
     expect(joined.some((j) => j.includes('~/'))).toBe(false)
   })
 
-  it('preserves existing instruction-file content and rewrites its own block only', async () => {
-    const existing = '# my notes\n\n<!-- nodeterm:manage-canvas:start -->\nSTALE\n<!-- nodeterm:manage-canvas:end -->\n'
-    const calls: { args: string[]; stdin?: string }[] = []
-    const run = vi.fn(async (args: string[], stdin?: string) => {
-      calls.push({ args, stdin })
-      const joined = args.join(' ')
-      if (joined.includes('.codex/AGENTS.md') && !joined.includes('cat >')) return { code: 0, stdout: existing }
-      return { code: 0, stdout: '' }
-    })
-    await new RemoteHooks({ run }).installCanvasControl(conn, '/s.sock', '/home/u')
-    const write = calls.find((c) => isWriteTo(c.args, '/home/u/.codex/AGENTS.md'))
-    expect(write?.stdin).toContain('# my notes')
-    expect(write?.stdin).not.toContain('STALE')
-    expect(write?.stdin).toContain('nodeterm canvas')
-  })
+  it('writes only the dirs of agents this host consented to — nothing at all for an unanswered host', async () => {
+    const onlyCodex = harness({ plan: { install: new Set(['codex']), remove: new Set(), decided: true } })
+    await onlyCodex.rh.installCanvasControl(conn, '/s.sock', '/home/u')
+    const a = onlyCodex.calls.map((c) => c.args.join(' '))
+    expect(a.some((j) => writesTo(j, '/home/u/.agents/skills/manage-nodeterm-canvas/SKILL.md'))).toBe(true)
+    expect(a.some((j) => j.includes('/home/u/.claude/'))).toBe(false)
 
-  it('skips the write when the block is already current (idempotent reconnects)', async () => {
-    // A connect happens on every app start and every reconnect; rewriting an unchanged file each
-    // time would churn the user's instruction files (and their mtimes) for nothing.
-    const first = harness()
-    await first.rh.installCanvasControl(conn, '/s.sock', '/home/u')
-    const merged = first.calls.find((c) => c.args.join(' ').includes('cat > \'/home/u/.gemini/GEMINI.md\''))?.stdin ?? ''
-    expect(merged).toBeTruthy()
-
-    const calls: { args: string[]; stdin?: string }[] = []
-    const run = vi.fn(async (args: string[], stdin?: string) => {
-      calls.push({ args, stdin })
-      const joined = args.join(' ')
-      if (joined.includes('.gemini/GEMINI.md') && !joined.includes('cat >')) return { code: 0, stdout: merged }
-      return { code: 0, stdout: '' }
-    })
-    await new RemoteHooks({ run }).installCanvasControl(conn, '/s.sock', '/home/u')
-    expect(calls.some((c) => isWriteTo(c.args, '/home/u/.gemini/GEMINI.md'))).toBe(false)
+    const none = harness({ plan: { install: new Set(), remove: new Set(), decided: false } })
+    await none.rh.installCanvasControl(conn, '/s.sock', '/home/u')
+    expect(none.calls).toHaveLength(0)
   })
 
   it('installs the skill into a remote managed-account config dir', async () => {
@@ -624,18 +709,19 @@ describe('RemoteHooks.installCanvasControl', () => {
     const run = vi.fn(async () => {
       throw new Error('ssh died')
     })
-    await expect(new RemoteHooks({ run }).installCanvasControl(conn, '/s.sock', '/home/u')).resolves.toBeUndefined()
+    await expect(new RemoteHooks({ run }, allRemote).installCanvasControl(conn, '/s.sock', '/home/u')).resolves.toBeUndefined()
   })
 })
 
 describe('RemoteHooks.installContextLink', () => {
-  const isWriteTo = (args: string[], p: string) => args.join(' ').includes('cat > ') && args.join(' ').includes(p)
+  const isWriteTo = (args: string[], p: string) => writesTo(args.join(' '), p)
 
-  it('writes an executable shim + the skill, and merges the instruction blocks', async () => {
+  it('writes an executable shim + the skill in claude\'s dir and ~/.agents/skills, no block', async () => {
     const { rh, calls } = harness()
     await rh.installContextLink(conn, '/s.sock', '/home/u')
     const joined = calls.map((c) => c.args.join(' '))
-    expect(joined.some((j) => j.includes("cat > '/home/u/.nodeterm/context.sh'") && j.includes('chmod 755'))).toBe(true)
+    const shimWrite = joined.find((j) => writesTo(j, '/home/u/.nodeterm/context.sh')) ?? ''
+    expect(shimWrite).toContain(`chmod 755 ${tempFor(shimWrite, '/home/u/.nodeterm/context.sh')}`)
     // The shim is the thin client: it POSTs and prints. All transcript parsing stays on the
     // desktop, which is what makes the host's missing `node` irrelevant.
     const shim = calls.find((c) => isWriteTo(c.args, '/home/u/.nodeterm/context.sh'))?.stdin ?? ''
@@ -643,29 +729,13 @@ describe('RemoteHooks.installContextLink', () => {
     expect(shim).toContain('/context-link/')
     expect(shim).toContain('--unix-socket')
     expect(shim).not.toContain('ELECTRON_RUN_AS_NODE')
-    const skill = calls.find((c) => isWriteTo(c.args, '/home/u/.claude/skills/get-linked-context/SKILL.md'))?.stdin ?? ''
-    expect(skill).toContain('name: get-linked-context')
-    expect(skill).toContain('sh "/home/u/.nodeterm/context.sh"')
-    expect(calls.some((c) => (c.stdin ?? '').includes('nodeterm:get-linked-context:start'))).toBe(true)
+    for (const dir of ['/home/u/.claude/skills', '/home/u/.agents/skills']) {
+      const skill = calls.find((c) => isWriteTo(c.args, `${dir}/get-linked-context/SKILL.md`))?.stdin ?? ''
+      expect(skill, dir).toContain('name: get-linked-context')
+      expect(skill, dir).toContain('sh "/home/u/.nodeterm/context.sh"')
+    }
+    expect(calls.some((c) => (c.stdin ?? '').includes('nodeterm:get-linked-context:start'))).toBe(false)
     expect(joined.some((j) => j.includes('~/'))).toBe(false)
-  })
-
-  it('leaves the canvas-control block in the same file alone', async () => {
-    // Both features merge into ~/.codex/AGENTS.md under DIFFERENT markers. Installing one must
-    // not evict the other, or every connect would leave the host with exactly one of the two.
-    const existing =
-      '<!-- nodeterm:manage-canvas:start -->\nCANVAS BLOCK\n<!-- nodeterm:manage-canvas:end -->\n'
-    const calls: { args: string[]; stdin?: string }[] = []
-    const run = vi.fn(async (args: string[], stdin?: string) => {
-      calls.push({ args, stdin })
-      const joined = args.join(' ')
-      if (joined.includes('.codex/AGENTS.md') && !joined.includes('cat >')) return { code: 0, stdout: existing }
-      return { code: 0, stdout: '' }
-    })
-    await new RemoteHooks({ run }).installContextLink(conn, '/s.sock', '/home/u')
-    const write = calls.find((c) => isWriteTo(c.args, '/home/u/.codex/AGENTS.md'))
-    expect(write?.stdin).toContain('CANVAS BLOCK')
-    expect(write?.stdin).toContain('nodeterm:get-linked-context:start')
   })
 
   it('installs the skill into a remote managed-account config dir', async () => {
@@ -680,7 +750,7 @@ describe('RemoteHooks.installContextLink', () => {
     const run = vi.fn(async () => {
       throw new Error('ssh died')
     })
-    await expect(new RemoteHooks({ run }).installContextLink(conn, '/s.sock', '/home/u')).resolves.toBeUndefined()
+    await expect(new RemoteHooks({ run }, allRemote).installContextLink(conn, '/s.sock', '/home/u')).resolves.toBeUndefined()
   })
 })
 
@@ -701,7 +771,7 @@ describe('RemoteHooks.writeNodeTokens', () => {
       if (opts.throws) throw new Error('ssh died')
       return { code: opts.code ?? 0, stdout: '' }
     })
-    return { rh: new RemoteHooks({ run }), calls, run }
+    return { rh: new RemoteHooks({ run }, allRemote), calls, run }
   }
 
   it('writes every token through STDIN — a credential never rides an ssh command line', async () => {
@@ -723,7 +793,7 @@ describe('RemoteHooks.writeNodeTokens', () => {
       /cat > ('\/home\/u\/\.nodeterm\/node-tokens\/\.nodeterm-[0-9a-f-]{36}\.tmp')/
     )?.[1]
     expect(temp).toBeTruthy()
-    expect(writes[0].cmd).toContain(`chmod 600 -- ${temp}`)
+    expect(writes[0].cmd).toContain(`chmod 600 ${temp}`)
     expect(writes[0].cmd).toContain(
       `mv -f -- ${temp} '/home/u/.nodeterm/node-tokens/node-1'`
     )
@@ -784,7 +854,7 @@ describe('RemoteHooks.writeNodeTokens', () => {
       if (cmd.includes('node-1')) throw new Error('EACCES')
       return { code: 0, stdout: '' }
     })
-    await new RemoteHooks({ run }).writeNodeTokens(conn, '/s.sock', '/home/u', ['node-1', 'node-2'], mint)
+    await new RemoteHooks({ run }, allRemote).writeNodeTokens(conn, '/s.sock', '/home/u', ['node-1', 'node-2'], mint)
     expect(calls.some((c) => c.includes("node-tokens/node-2'"))).toBe(true)
   })
 
@@ -833,7 +903,7 @@ describe('RemoteHooks.writeNodeTokens', () => {
         code: args.join(' ').includes('cat >') ? 1 : 0,
         stdout: ''
       }))
-      await new RemoteHooks({ run }).writeNodeTokens(conn, '/s.sock', '/home/u', ['node-1'], mint)
+      await new RemoteHooks({ run }, allRemote).writeNodeTokens(conn, '/s.sock', '/home/u', ['node-1'], mint)
       expect(forget).toHaveBeenCalledWith('node-1')
       forget.mockRestore()
     })
@@ -844,7 +914,7 @@ describe('RemoteHooks.writeNodeTokens', () => {
         if (args.join(' ').includes('cat >')) throw new Error('EACCES')
         return { code: 0, stdout: '' }
       })
-      await new RemoteHooks({ run }).writeNodeTokens(conn, '/s.sock', '/home/u', ['node-1'], mint)
+      await new RemoteHooks({ run }, allRemote).writeNodeTokens(conn, '/s.sock', '/home/u', ['node-1'], mint)
       expect(forget).toHaveBeenCalledWith('node-1')
       forget.mockRestore()
     })
@@ -885,8 +955,99 @@ describe('RemoteHooks.setup — the host $HOME is data, not truth', () => {
   it('installs hooks for a host whose $HOME is not spelled in ASCII', async () => {
     const { rh, calls } = harness({ responses: { 'printf %s "$HOME"': '/home/gökhan' } })
     const res = await rh.setup('p1', conn, '/s.sock', { port: 51234, token: 'tok', version: '1' })
-    expect(res?.endpointPath).toBe('/home/gökhan/.nodeterm/hook-endpoint-p1.env')
+    expect(res?.endpointPath).toBe(`/home/gökhan/.nodeterm/hook-endpoint-p1-${owner}.env`)
     const joined = calls.map((c) => c.args.join(' '))
-    expect(joined.some((j) => j.includes(`cat > '/home/gökhan/.claude/settings.json'`))).toBe(true)
+    expect(joined.some((j) => j.includes(`mv -f -- "$nt_stage/publish" '/home/gökhan/.claude/settings.json'`))).toBe(true)
+  })
+})
+
+// ── The per-agent installs run CONCURRENTLY, and the order that still matters ────────────────
+//
+// Serially these were ~16 remote round trips in a row — 3.54 s on a 50 ms-RTT link, measured
+// against a real sshd — and every terminal of a switched-to project waits through them, because
+// `connectOnce` does not publish the master until this returns. What must NOT be parallelized with
+// them is the tunnel and the endpoint file: that file is what every installed hook POSTs through.
+describe('RemoteHooks.setup — install concurrency', () => {
+  /** A harness whose `run` blocks each matching command until the test releases it, so overlap is
+   *  observable rather than inferred from wall-clock. */
+  function gatedHarness(gateOn: string) {
+    const calls: string[] = []
+    const inFlight = new Set<string>()
+    let peak = 0
+    const gates: (() => void)[] = []
+    const run = vi.fn(async (args: string[]) => {
+      const joined = args.join(' ')
+      calls.push(joined)
+      if (joined.includes(gateOn)) {
+        inFlight.add(joined)
+        peak = Math.max(peak, inFlight.size)
+        await new Promise<void>((resolve) => gates.push(resolve))
+        inFlight.delete(joined)
+      }
+      if (joined.includes('$HOME')) return { code: 0, stdout: '/home/u' }
+      if (joined.includes('%{http_code}')) return { code: 0, stdout: '204' }
+      return { code: 0, stdout: '' }
+    })
+    return {
+      rh: new RemoteHooks({ run }, allRemote),
+      calls,
+      releaseAll: () => {
+        for (const g of gates.splice(0)) g()
+      },
+      gateCount: () => gates.length,
+      peak: () => peak
+    }
+  }
+
+  it('starts every agent script write together instead of one at a time', async () => {
+    // The script write is the FIRST round trip of each per-agent installer, so several of them in
+    // flight at once is exactly "the installers overlap". Serially this number is 1.
+    const h = gatedHarness('agent-hooks')
+    const done = h.rh.setup('p1', conn, '/s.sock', { port: 1, token: 't', version: '1' })
+    // Let the pre-install steps (HOME, tunnel, endpoint) settle and the fan-out start.
+    for (let i = 0; i < 50 && h.gateCount() < 2; i++) await Promise.resolve()
+    expect(h.peak()).toBeGreaterThan(1)
+    h.releaseAll()
+    // The installers each take a few more gated round trips; release until the setup lands.
+    for (let i = 0; i < 40; i++) {
+      await Promise.resolve()
+      h.releaseAll()
+    }
+    await expect(done).resolves.toEqual({ endpointPath: `/home/u/.nodeterm/hook-endpoint-p1-${ownerT}.env` })
+  })
+
+  it('the TUNNEL and the ENDPOINT FILE are both complete before any agent install starts', async () => {
+    // The ordering rule the fan-out must not swallow: every hook this installs POSTs through the
+    // endpoint file, and the endpoint is only written once the tunnel has verified end to end.
+    const { rh, calls } = harness()
+    await rh.setup('p1', conn, '/s.sock', { port: 51234, token: 'tok', version: '1' })
+    const joined = calls.map((c) => c.args.join(' '))
+    const firstInstall = joined.findIndex((j) => j.includes('agent-hooks'))
+    const forward = joined.findIndex((j) => j.includes('-O forward'))
+    const verify = joined.findIndex((j) => j.includes('%{http_code}'))
+    const endpoint = calls.findIndex((c) => (c.stdin ?? '').includes("NODETERM_HOOK_TOKEN='tok'"))
+    expect(firstInstall).toBeGreaterThan(-1)
+    expect(forward).toBeGreaterThan(-1)
+    expect(verify).toBeGreaterThan(forward)
+    expect(endpoint).toBeGreaterThan(verify)
+    expect(firstInstall).toBeGreaterThan(endpoint)
+  })
+
+  it('one agent failing does not discard the endpoint the others are installed against', async () => {
+    // `allSettled`, not `all`: by this point the tunnel is verified and the endpoint written, so a
+    // single installer's failure must cost that agent its hooks and nothing else. (Every installer
+    // catches its own errors today — this is the guard for the next one that forgets.)
+    const { rh } = harness({ failOn: '.grok' })
+    const res = await rh.setup('p1', conn, '/s.sock', { port: 1, token: 't', version: '1' })
+    expect(res?.endpointPath).toBe(`/home/u/.nodeterm/hook-endpoint-p1-${ownerT}.env`)
+  })
+
+  it('still installs every agent — claude, gemini, codex, grok and copilot', async () => {
+    const { rh, calls } = harness()
+    await rh.setup('p1', conn, '/s.sock', { port: 1, token: 't', version: '1' })
+    const joined = calls.map((c) => c.args.join(' '))
+    for (const agent of ['claude', 'gemini', 'codex', 'grok', 'copilot']) {
+      expect(joined.some((j) => j.includes(`agent-hooks/${agent}.sh`))).toBe(true)
+    }
   })
 })

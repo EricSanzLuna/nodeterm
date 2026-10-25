@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { useSettings } from '../../../state/settings'
 import { SettingsSection } from '../SettingsSection'
 import { SearchableRow } from '../SearchableRow'
@@ -7,9 +8,24 @@ import { NumberField } from '@renderer/ui/NumberField'
 import { Select } from '@renderer/ui/Select'
 import { SegmentedPill } from '@renderer/ui/SegmentedPill'
 import { Input } from '@renderer/ui/Input'
-import { hintLabel } from '@shared/platform-utils'
+import { hintLabel, isMacPlatform, isWindowsPlatform } from '@shared/platform-utils'
+import { trackpadRoutingSupported } from '@renderer/canvas/wheel-gesture'
+import { isBrowserRuntime } from '@renderer/bridge/runtime'
+import { backgroundCloseDescription, backgroundCloseRowVisible } from '@renderer/lib/backgroundClose'
+import type { BackgroundOnCloseSetting } from '@shared/types'
 import { clampWheelZoomSpeed } from '@renderer/canvas/wheel-zoom'
 import { DEFAULT_WORKTREE_PATH_TEMPLATE } from '@shared/worktree'
+import type { NewProjectStorage } from '@shared/project-storage'
+import { Button } from '@renderer/ui/Button'
+import type { NodeSize } from '@shared/default-node-size'
+import {
+  NODE_SIZE_CHOICES,
+  NODE_SIZE_CHOICE_LABELS,
+  nodeSizeField,
+  nodeSizePatch,
+  nodeSizeResetPatch,
+  type NodeSizeChoice
+} from '@renderer/lib/defaultNodeSizeSetting'
 
 const ROWS = {
   defaultView: {
@@ -27,7 +43,10 @@ const ROWS = {
   gridSize: { title: 'Grid size', keywords: ['grid', 'size', 'snap'] },
   nodeSize: {
     title: 'Default node size',
-    keywords: ['node', 'size', 'width', 'height', 'terminal', 'default']
+    keywords: [
+      'node', 'size', 'width', 'height', 'terminal', 'default', 'sticky', 'note', 'browser', 'web',
+      'editor', 'diff', 'file', 'manager', 'video', 'simulator', 'trigger', 'dino'
+    ]
   },
   snap: { title: 'Snap to grid', keywords: ['snap', 'grid', 'align'] },
   autoAlign: {
@@ -35,10 +54,26 @@ const ROWS = {
     keywords: ['snap', 'grid', 'align', 'arrange', 'auto', 'mode']
   },
   panHover: { title: 'Pan-hover delay (ms)', keywords: ['pan', 'hover', 'delay', 'focus', 'guard'] },
+  focusFollowsPointer: {
+    title: 'Terminal focus follows pointer',
+    keywords: ['focus', 'hover', 'pointer', 'click', 'follows', 'x11', 'sloppy', 'mouse', 'keyboard', 'terminal', 'mac']
+  },
   doubleClick: { title: 'Double-click to focus', keywords: ['double', 'click', 'focus'] },
   focusZoom: {
     title: 'Zoom when going to a node',
     keywords: ['zoom', 'focus', 'go to', 'node', 'jump', 'camera', 'session', 'sidebar']
+  },
+  closeProjectOnLastSession: {
+    title: 'Offer to close a project after its last session',
+    keywords: ['close', 'project', 'last', 'session', 'node', 'tab', 'recently closed', 'cleanup', 'agent', 'terminal']
+  },
+  rememberLock: {
+    title: 'Remember the canvas lock',
+    keywords: ['lock', 'canvas', 'view', 'pan', 'zoom', 'freeze', 'remember', 'restart', 'persist']
+  },
+  openLinks: {
+    title: 'Allow nodeterm:// links',
+    keywords: ['link', 'url', 'scheme', 'deep link', 'nodeterm://', 'open', 'other apps', 'protocol', 'external']
   },
   mdPreview: {
     title: 'Open Markdown in preview',
@@ -52,6 +87,10 @@ const ROWS = {
     title: 'Sidebar: group by',
     keywords: ['sidebar', 'sessions', 'group', 'status', 'project', 'attention']
   },
+  projectStorage: {
+    title: 'New folder projects store their canvas',
+    keywords: ['project', 'storage', 'app data', 'nodeterm', 'folder', 'repo', 'project.json', 'git', 'client']
+  },
   worktreePath: {
     title: 'Worktree path template',
     keywords: ['worktree', 'git', 'path', 'folder', 'repo', 'branch', 'template']
@@ -63,7 +102,7 @@ const ROWS = {
   },
   trackpadPan: {
     title: 'Trackpad scroll pans',
-    keywords: ['trackpad', 'pan', 'scroll', 'zoom', 'magic', 'mouse', 'two-finger', 'macos']
+    keywords: ['trackpad', 'pan', 'scroll', 'zoom', 'magic', 'mouse', 'two-finger', 'macos', 'windows', 'touchpad']
   },
   dragMode: {
     title: 'Canvas left-drag',
@@ -75,14 +114,26 @@ const ROWS = {
   },
   keepAwake: {
     title: 'Keep awake while agents work',
-    keywords: ['sleep', 'awake', 'power', 'battery', 'suspend', 'run']
+    keywords: ['sleep', 'awake', 'power', 'battery', 'suspend', 'run', 'lid', 'thermal', 'heat']
   },
   confirmQuit: {
     title: 'Confirm before quitting',
     keywords: ['quit', 'exit', 'close', 'confirm', 'dialog', 'ask']
+  },
+  backgroundClose: {
+    title: 'Keep running when the window closes',
+    keywords: ['tray', 'background', 'close', 'minimize', 'notification area', 'system tray', 'quit', 'phone']
   }
 }
-const ENTRIES = Object.values(ROWS)
+// The background-close row only exists for a desktop window off macOS, so search must not offer
+// it anywhere else. Decided once: neither the platform nor the runtime changes under a live page.
+const SHOW_BACKGROUND_CLOSE = backgroundCloseRowVisible(isMacPlatform(), isBrowserRuntime())
+// nodeterm:// links are a desktop OS URL scheme: the Server Edition registers none and its bridge
+// stub refuses every link, so the switch would do nothing in a browser tab.
+const SHOW_OPEN_LINKS = !isBrowserRuntime()
+const ENTRIES = Object.values(ROWS).filter(
+  (r) => (SHOW_BACKGROUND_CLOSE || r !== ROWS.backgroundClose) && (SHOW_OPEN_LINKS || r !== ROWS.openLinks)
+)
 
 export function BehaviorSection({ isActive }: { isActive: boolean }): React.JSX.Element {
   const settings = useSettings((s) => s.settings)
@@ -145,29 +196,7 @@ export function BehaviorSection({ isActive }: { isActive: boolean }): React.JSX.
         />
       </SearchableRow>
       <SearchableRow {...ROWS.nodeSize}>
-        <FieldRow
-          label="Default node size (px)"
-          description="Size new terminal and agent nodes open at. Existing nodes keep their size."
-          control={
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <NumberField
-                value={settings.defaultNodeWidth}
-                min={280}
-                max={2400}
-                step={20}
-                onChange={(v) => update({ defaultNodeWidth: v || 640 })}
-              />
-              <span style={{ opacity: 0.6 }}>×</span>
-              <NumberField
-                value={settings.defaultNodeHeight}
-                min={160}
-                max={1600}
-                step={20}
-                onChange={(v) => update({ defaultNodeHeight: v || 440 })}
-              />
-            </div>
-          }
-        />
+        <DefaultNodeSizeRow />
       </SearchableRow>
       <SearchableRow {...ROWS.snap}>
         <FieldRow
@@ -194,9 +223,31 @@ export function BehaviorSection({ isActive }: { isActive: boolean }): React.JSX.
           }
         />
       </SearchableRow>
+      <SearchableRow {...ROWS.focusFollowsPointer}>
+        <FieldRow
+          label="Terminal focus follows pointer"
+          description={
+            settings.terminalFocusFollowsPointer
+              ? 'On: hovering a terminal for the pan-hover delay gives it the keyboard. It keeps the keyboard when the pointer moves off — until you hover another terminal, or click another node, the empty canvas or a field. Turn off for click to focus.'
+              : 'Off (click to focus): click a terminal to type in it. It keeps the keyboard until you click another node, the empty canvas or a field — moving the pointer away changes nothing.'
+          }
+          control={
+            <Switch
+              checked={settings.terminalFocusFollowsPointer}
+              onChange={(v) => update({ terminalFocusFollowsPointer: v })}
+              ariaLabel="Terminal focus follows pointer"
+            />
+          }
+        />
+      </SearchableRow>
       <SearchableRow {...ROWS.panHover}>
         <FieldRow
           label="Pan-hover delay (ms)"
+          description={
+            settings.terminalFocusFollowsPointer
+              ? undefined
+              : 'Not used in click-to-focus mode (Terminal focus follows pointer is off): hovering never takes the keyboard.'
+          }
           control={
             <NumberField
               value={settings.panHoverDelay}
@@ -233,6 +284,47 @@ export function BehaviorSection({ isActive }: { isActive: boolean }): React.JSX.
           }
         />
       </SearchableRow>
+      <SearchableRow {...ROWS.closeProjectOnLastSession}>
+        <FieldRow
+          label="Offer to close a project after its last session"
+          description="When you close the last terminal or agent node in a project with ×, ask whether to close the project too. It stays reopenable from Recently closed."
+          control={
+            <Switch
+              checked={settings.offerCloseProjectOnLastSession}
+              onChange={(v) => update({ offerCloseProjectOnLastSession: v })}
+              ariaLabel="Offer to close a project after its last session"
+            />
+          }
+        />
+      </SearchableRow>
+      <SearchableRow {...ROWS.rememberLock}>
+        <FieldRow
+          label="Remember the canvas lock"
+          description="The bottom-left lock stays on across restarts until you turn it off. Off: every launch starts unlocked."
+          control={
+            <Switch
+              checked={settings.rememberCanvasLock}
+              onChange={(v) => update({ rememberCanvasLock: v })}
+              ariaLabel="Remember the canvas lock"
+            />
+          }
+        />
+      </SearchableRow>
+      {SHOW_OPEN_LINKS && (
+        <SearchableRow {...ROWS.openLinks}>
+          <FieldRow
+            label="Allow nodeterm:// links"
+            description="Lets other apps, scripts and web pages ask nodeterm to open one agent or terminal node, or pre-fill a pairing code. Every link shows a confirm sheet first and opens nothing until you click Open. Off: links are ignored."
+            control={
+              <Switch
+                checked={settings.allowOpenLinks}
+                onChange={(v) => update({ allowOpenLinks: v })}
+                ariaLabel="Allow nodeterm:// links"
+              />
+            }
+          />
+        </SearchableRow>
+      )}
       <SearchableRow {...ROWS.mdPreview}>
         <FieldRow
           label="Open Markdown in preview"
@@ -273,6 +365,22 @@ export function BehaviorSection({ isActive }: { isActive: boolean }): React.JSX.
               ]}
               onChange={(v) => update({ sidebarGrouping: v })}
             />
+          }
+        />
+      </SearchableRow>
+      <SearchableRow {...ROWS.projectStorage}>
+        <FieldRow
+          label="New folder projects store their canvas"
+          description="In the folder writes .nodeterm/project.json there, to share through git. In app data writes nothing into the folder. A folder that already has a project.json opens as it is. Move an existing project from its tab menu."
+          control={
+            <Select
+              aria-label="New folder projects store their canvas"
+              value={settings.newProjectStorage}
+              onChange={(e) => update({ newProjectStorage: e.target.value as NewProjectStorage })}
+            >
+              <option value="folder">In the folder</option>
+              <option value="appData">In app data</option>
+            </Select>
           }
         />
       </SearchableRow>
@@ -337,21 +445,23 @@ export function BehaviorSection({ isActive }: { isActive: boolean }): React.JSX.
           />
         </SearchableRow>
       </div>
-      <SearchableRow {...ROWS.trackpadPan}>
-        <FieldRow
-          label="Trackpad scroll pans"
-          description={hintLabel(
-            'macOS: a two-finger trackpad scroll pans the canvas even with wheel zoom on. The desktop app tells mouse and trackpad apart directly, so a wheel mouse still zooms; in the browser (Server Edition) detection is heuristic — turn off there if a precise-pixel mouse (Magic Mouse, MX) pans when you meant to zoom.'
-          )}
-          control={
-            <Switch
-              checked={settings.trackpadPan}
-              onChange={(v) => update({ trackpadPan: v })}
-              ariaLabel="Trackpad scroll pans"
-            />
-          }
-        />
-      </SearchableRow>
+      {trackpadRoutingSupported({ mac: isMacPlatform(), windows: isWindowsPlatform() }) && (
+        <SearchableRow {...ROWS.trackpadPan}>
+          <FieldRow
+            label="Trackpad scroll pans"
+            description={hintLabel(
+              'A two-finger trackpad scroll pans the canvas even with wheel zoom on, while a wheel mouse still zooms. The macOS desktop app tells mouse and trackpad apart directly; on Windows and in the browser (Server Edition) detection is heuristic — turn off if a smooth-scrolling mouse (Magic Mouse, MX) pans when you meant to zoom.'
+            )}
+            control={
+              <Switch
+                checked={settings.trackpadPan}
+                onChange={(v) => update({ trackpadPan: v })}
+                ariaLabel="Trackpad scroll pans"
+              />
+            }
+          />
+        </SearchableRow>
+      )}
       <SearchableRow {...ROWS.dragMode}>
         <FieldRow
           label="Canvas left-drag"
@@ -384,7 +494,7 @@ export function BehaviorSection({ isActive }: { isActive: boolean }): React.JSX.
       <SearchableRow {...ROWS.keepAwake}>
         <FieldRow
           label="Keep awake while agents work"
-          description="Holds off idle sleep while a local agent is running. A closed lid still sleeps the machine."
+          description="Holds off idle sleep while a local agent is running. Lets the machine sleep on battery below 5% or when it runs critically hot. A closed lid still sleeps the machine, except on macOS when plugged in with an external display connected."
           control={
             <Switch
               checked={settings.keepAwakeWhileAgentsWork}
@@ -407,6 +517,83 @@ export function BehaviorSection({ isActive }: { isActive: boolean }): React.JSX.
           }
         />
       </SearchableRow>
+      {SHOW_BACKGROUND_CLOSE && (
+        <SearchableRow {...ROWS.backgroundClose}>
+          <FieldRow
+            label="Keep running when the window closes"
+            description={backgroundCloseDescription(isWindowsPlatform())}
+            control={
+              <Select
+                aria-label="Keep running when the window closes"
+                value={settings.runInBackgroundOnClose}
+                onChange={(e) => update({ runInBackgroundOnClose: e.target.value as BackgroundOnCloseSetting })}
+              >
+                <option value="auto">Automatic</option>
+                <option value="on">Always</option>
+                <option value="off">Never (closing quits)</option>
+              </Select>
+            }
+          />
+        </SearchableRow>
+      )}
     </SettingsSection>
+  )
+}
+
+/**
+ * One width × height pair for whichever kind the picker names. New nodes of that kind open at it;
+ * existing nodes keep their size. The model (and why terminal is special) is in
+ * lib/defaultNodeSizeSetting.ts.
+ */
+function DefaultNodeSizeRow(): React.JSX.Element {
+  const settings = useSettings((s) => s.settings)
+  const update = useSettings((s) => s.update)
+  const [choice, setChoice] = useState<NodeSizeChoice>('terminal')
+  const field = nodeSizeField(settings, choice)
+  const set = (size: NodeSize): void => {
+    update(nodeSizePatch(settings, choice, size))
+  }
+  return (
+    <FieldRow
+      label="Default node size (px)"
+      description="Size new nodes of the chosen kind open at. Existing nodes keep their size."
+      control={
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <Select
+            aria-label="Node kind"
+            value={choice}
+            onChange={(e) => setChoice(e.target.value as NodeSizeChoice)}
+          >
+            {NODE_SIZE_CHOICES.map((c) => (
+              <option key={c} value={c}>
+                {NODE_SIZE_CHOICE_LABELS[c]}
+              </option>
+            ))}
+          </Select>
+          <NumberField
+            ariaLabel={`${NODE_SIZE_CHOICE_LABELS[choice]} default width`}
+            value={field.size.width}
+            min={field.min.width}
+            max={field.max.width}
+            step={20}
+            onChange={(v) => set({ width: v || field.size.width, height: field.size.height })}
+          />
+          <span style={{ opacity: 0.6 }}>×</span>
+          <NumberField
+            ariaLabel={`${NODE_SIZE_CHOICE_LABELS[choice]} default height`}
+            value={field.size.height}
+            min={field.min.height}
+            max={field.max.height}
+            step={20}
+            onChange={(v) => set({ width: field.size.width, height: v || field.size.height })}
+          />
+          {field.isCustom && (
+            <Button variant="ghost" onClick={() => update(nodeSizeResetPatch(settings, choice))}>
+              Reset
+            </Button>
+          )}
+        </div>
+      }
+    />
   )
 }

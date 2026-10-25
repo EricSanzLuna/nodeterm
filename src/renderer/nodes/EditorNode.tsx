@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
+import { Tooltip } from '../components/Tooltip'
+import { IconClose } from '../components/icons'
 import { Handle, NodeResizer, Position, useReactFlow, type NodeProps } from '@xyflow/react'
 import { NODE_MIN_SIZES } from '../lib/nodeSizing'
 import { monaco } from '../editor/monaco-setup'
@@ -6,6 +8,8 @@ import { monacoTheme } from '../lib/appTheme'
 import { useAppTheme } from '../state/useAppTheme'
 import { renderMarkdown } from '../lib/markdown'
 import { opensInPreview } from '../lib/markdownPreview'
+import { canvasOwnsMarkdownChord } from '../lib/markdownChord'
+import { isGlobalKanbanOpen, isKanbanOpen } from '../state/viewMode'
 import { useSettings } from '../state/settings'
 import { sshFs } from '../terminal/ssh-fs'
 import { useProjects } from '../state/projects'
@@ -245,9 +249,11 @@ export function EditorNode({ id, data, selected }: NodeProps<CanvasNode>) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Cmd/Ctrl+M toggles a rendered markdown preview when this node is hovered.
+  // Cmd/Ctrl+M toggles a rendered markdown preview when this node is hovered — and never while a
+  // board is up: the hover flag can be stale under the opaque board, whose card modal owns the
+  // chord there (same rule as the terminal node; see `canvasOwnsMarkdownChord`).
   useEffect(() => window.nodeTerminal.onMarkdownToggle(() => {
-    if (hoveredRef.current) toggleRef.current()
+    if (canvasOwnsMarkdownChord(hoveredRef.current, isGlobalKanbanOpen() || isKanbanOpen(useProjects.getState().activeProjectId ?? ''))) toggleRef.current()
   }), [])
 
   // Whatever the markdown toggle is bound to; '' when the user unbound it, in which case the
@@ -255,13 +261,15 @@ export function EditorNode({ id, data, selected }: NodeProps<CanvasNode>) {
   const mdChip = chipFor('node.toggleMarkdown')
 
   return (
+    <>
     <div
       className={`term-node editor-node${selected ? ' selected' : ''}`}
       style={{ borderTopColor: data.color }}
       onMouseEnter={() => (hoveredRef.current = true)}
       onMouseLeave={() => (hoveredRef.current = false)}
     >
-      <NodeResizer minWidth={NODE_MIN_SIZES.editor.width} minHeight={NODE_MIN_SIZES.editor.height} isVisible={selected} color={data.color} />
+      {/* Paint only: the old resize box in its old place (see .nt-resize-ghost in styles.css). */}
+      <NodeResizer isVisible={selected} color={data.color} lineClassName="nt-resize-ghost" handleClassName="nt-resize-ghost" />
       {/* Invisible target handle so a rope from an agent node that opened this can attach. */}
       <Handle
         id="flow-in"
@@ -281,31 +289,32 @@ export function EditorNode({ id, data, selected }: NodeProps<CanvasNode>) {
           imageDims && <span className="editor-node__dims">{imageDims}</span>
         ) : isPdf ? null : (
           <>
-            <button
-              className="editor-node__toggle"
-              title={commandTooltip('Toggle markdown preview', 'node.toggleMarkdown')}
-              onClick={togglePreview}
-            >
-              {preview ? 'Edit' : 'Preview'}
-            </button>
-            <button
-              className="editor-node__save"
-              disabled={!dirty}
-              title={hintLabel('Save (⌘S)')}
-              onClick={save}
-            >
-              Save
-            </button>
+            <Tooltip label={commandTooltip('Toggle markdown preview', 'node.toggleMarkdown')}>
+              <button
+                className="editor-node__toggle"
+                aria-label="Toggle markdown preview"
+                onClick={togglePreview}
+              >
+                {preview ? 'Edit' : 'Preview'}
+              </button>
+            </Tooltip>
+            <Tooltip label={hintLabel('Save (⌘S)')}>
+              <button className="editor-node__save" disabled={!dirty} onClick={save}>
+                Save
+              </button>
+            </Tooltip>
           </>
         )}
         <MaximizeButton id={id} maximized={!!data.premaxRect} />
-        <button
-          className="term-node__close"
-          title="Close"
-          onClick={() => deleteElements({ nodes: [{ id }] })}
-        >
-          ×
-        </button>
+        <Tooltip label="Close">
+          <button
+            className="term-node__close"
+            aria-label="Close"
+            onClick={() => deleteElements({ nodes: [{ id }] })}
+          >
+            <IconClose />
+          </button>
+        </Tooltip>
       </div>
 
       <div className="editor-node__body">
@@ -347,7 +356,10 @@ export function EditorNode({ id, data, selected }: NodeProps<CanvasNode>) {
           </div>
         ) : (
           <>
-            <div className="editor-node__monaco nodrag nowheel" ref={bodyRef} />
+            {/* `nokey`: React Flow's own key handling (the selected node's arrow-key move, its
+                key-press hooks) stands down only for inputs, a contenteditable attribute or
+                `.nokey` — and Monaco types through an EditContext div, none of those (#930). */}
+            <div className="editor-node__monaco nodrag nowheel nokey" ref={bodyRef} />
             {preview && (
               <div className="term-md nodrag nowheel">
                 <div className="term-md__bar">
@@ -364,5 +376,12 @@ export function EditorNode({ id, data, selected }: NodeProps<CanvasNode>) {
         )}
       </div>
     </div>
+    {/* Sibling of the root, not a child: under Liquid Glass the root has a backdrop-filter,
+        which makes it the containing block for these absolute edges, so they were clipped and
+        covered (only the top edge stayed grabbable). Out here they sit on the node wrapper.
+        AFTER the root, never before it: focus mode reparents the root out of this wrapper, and
+        React inserting a control "before the root" would then throw NotFoundError. */}
+    <NodeResizer minWidth={NODE_MIN_SIZES.editor.width} minHeight={NODE_MIN_SIZES.editor.height} isVisible={selected} color={data.color} />
+    </>
   )
 }

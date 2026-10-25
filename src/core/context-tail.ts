@@ -4,7 +4,7 @@
 // as ContextWindowUsage keyed by sessionId.
 import fs from 'fs'
 import type { ContextWindowUsage } from '../shared/types'
-import { cachedWindowFor, resolveModelWindow } from './model-window'
+import { cachedWindowFor } from './model-window'
 import { splitCompleteLines } from './subagent-tail'
 
 const POLL_MS = 1000
@@ -30,15 +30,16 @@ const toLines = (text: string | string[]): string[] =>
  */
 export function parseLatestUsage(
   text: string | string[]
-): { used: number; model: string | null } | null {
+): { used: number; model: string | null; effort?: string } | null {
   const lines = toLines(text)
   let found = false
   let usedTokens = 0
   let model: string | null = null
+  let effort: string | undefined
   for (let i = lines.length - 1; i >= 0; i--) {
     const s = lines[i].trim()
     if (!s || !s.includes('"usage"') || !s.includes('"assistant"')) continue
-    let o: { type?: string; message?: { model?: string; usage?: Record<string, number> } }
+    let o: { type?: string; effort?: unknown; message?: { model?: string; usage?: Record<string, number> } }
     try {
       o = JSON.parse(s)
     } catch {
@@ -52,13 +53,20 @@ export function parseLatestUsage(
     if (!found) {
       found = true
       usedTokens = used // the LATEST usage — earlier lines are visited only to resolve the model
+      // The reasoning effort of that same request: Claude Code writes a top-level `effort` on each
+      // assistant record it sent with one (`...E!==void 0&&{effort:E}` in the 2.1.283 bundle — the
+      // same field the CLI's own history reader walks). Taken from the LATEST record ONLY, never
+      // carried forward like the model: a record without it means that request had no effort (a
+      // model that does not take one), and an older value would be a stale claim.
+      if (typeof o.effort === 'string' && o.effort) effort = o.effort
     }
     // Same rule as the old forward scan's "carry the prior model forward": the effective model
     // is the nearest usage line AT OR BEFORE the latest one that names it.
     model = o.message.model ?? null
     if (model !== null) break
   }
-  return found ? { used: usedTokens, model } : null
+  if (!found) return null
+  return effort === undefined ? { used: usedTokens, model } : { used: usedTokens, model, effort }
 }
 
 /**
@@ -107,19 +115,141 @@ export function parseTaskNotifications(text: string | string[]): TaskNotificatio
   return out
 }
 
+/** IDs of settled tools, including Escape/decline results. Never infer an answer from
+ * another tool's result or from result text. */
+export function parseToolResultIds(text: string | string[]): string[] {
+  const ids: string[] = []
+  for (const line of toLines(text)) {
+    if (!line.includes('tool_result')) continue
+    try {
+      const o = JSON.parse(line)
+      if (!Array.isArray(o.message?.content)) continue
+      for (const c of o.message.content) {
+        if (c?.type === 'tool_result' && typeof c.tool_use_id === 'string' && c.tool_use_id)
+          ids.push(c.tool_use_id)
+      }
+    } catch { /* torn or malformed transcript line */ }
+  }
+  return ids
+}
+
 /**
- * Did this chunk of transcript carry a TOOL RESULT? That is the moment a tool the CLI was blocked
- * on has settled — which is the only signal we get when an ask ENDS without a hook.
- *
- * The case: an `AskUserQuestion` picker is up (node = needs-you) and the user presses Esc. Claude
- * records "User declined to answer questions" as the tool's result and carries on, but the aborted
- * tool fires no PostToolUse, and Stop does not run either — so nothing told us the ask was over and
- * the node sat on NEEDS YOU (badge, notch capsule, phone card) until the next prompt hours later.
- *
- * Deliberately not decline-specific: any tool_result means the blocking tool finished, whatever the
- * answer was. The caller only acts on it while the node is still in needs-you, so a normal turn's
- * constant stream of results costs nothing.
+ * The two texts Claude Code writes as a USER record when the user interrupts a turn (Esc, or
+ * Ctrl+C once). A CLOSED set: measured on 2.1.285 (`shared/agents/__fixtures__/claude/
+ * interrupt-capture.json`) — `[Request interrupted by user]` after streamed text,
+ * `… for tool use]` when a tool call or its permission dialog was cancelled. Any other wording is
+ * ignored, so a future CLI that words it differently degrades to what happened before this
+ * existed (the node waits for its next hook, or the stale sweep), never to a guess.
  */
+export const CLAUDE_INTERRUPT_MARKERS: ReadonlySet<string> = new Set([
+  '[Request interrupted by user]',
+  '[Request interrupted by user for tool use]'
+])
+
+const PROMPT_ID_RE = /^[A-Za-z0-9_-]{1,128}$/
+
+/** How many opening-prompt ids a per-session scanner remembers (oldest dropped first). */
+export const TURN_PROMPTS_SEEN_MAX = 256
+
+type TranscriptRecord = {
+  type?: unknown
+  isSidechain?: unknown
+  isMeta?: unknown
+  promptId?: unknown
+  message?: { content?: unknown }
+}
+
+const isMarkerRecord = (o: TranscriptRecord): boolean => {
+  const content = o.message?.content
+  if (!Array.isArray(content) || content.length !== 1) return false
+  const part = content[0] as { type?: unknown; text?: unknown } | null
+  return part?.type === 'text' && typeof part.text === 'string' && CLAUDE_INTERRUPT_MARKERS.has(part.text)
+}
+
+/** A main-thread user record that OPENS a turn: the typed (or dequeued) prompt itself — not a tool
+ *  result, not a meta record, not the interrupt marker. */
+const isOpeningPrompt = (o: TranscriptRecord): boolean => {
+  if (o.isMeta === true) return false
+  const content = o.message?.content
+  if (typeof content === 'string') return true
+  if (!Array.isArray(content) || content.length === 0) return false
+  if (content.some((c) => (c as { type?: unknown } | null)?.type === 'tool_result')) return false
+  return !isMarkerRecord(o)
+}
+
+/**
+ * The interrupt markers of ONE transcript, read chunk by chunk. Stateful: it remembers the turn ids
+ * whose OPENING prompt record it has already read (bounded, `TURN_PROMPTS_SEEN_MAX`), because a
+ * marker only counts for a turn whose prompt came BEFORE it in the file.
+ *
+ * That order is not a detail. On "queue a message while Claude works, then press Esc" the CLI
+ * writes the marker tagged with the QUEUED prompt's id and the queued prompt record ~36 ms AFTER
+ * it (measured in real transcripts, 2.1.209–2.1.283: 34 of 114 accepted-shape markers carried the
+ * NEXT prompt's id, 31 of them behind a `queue-operation`; redacted in
+ * `shared/agents/__fixtures__/claude/interrupt-queued.json`). That queued prompt's
+ * UserPromptSubmit makes it the node's current turn, so an id match alone ended the NEW live turn.
+ * A marker whose turn was not opened earlier in what this scanner has read is dropped — the
+ * interrupted turn really did end, but the node is already in the next one.
+ *
+ * `record` lines are read for prompts only and never report (the remote tail's historical read).
+ */
+export interface TurnInterruptScanner {
+  scan(text: string | string[], opts?: { record?: boolean }): string[]
+}
+
+export function createTurnInterruptScanner(max = TURN_PROMPTS_SEEN_MAX): TurnInterruptScanner {
+  const seen = new Set<string>()
+  const remember = (id: string): void => {
+    seen.delete(id)
+    seen.add(id)
+    if (seen.size > max) seen.delete(seen.values().next().value as string)
+  }
+  return {
+    scan(text, opts) {
+      const out: string[] = []
+      for (const line of toLines(text)) {
+        // Cheap pre-filter before the parse — this runs over every transcript chunk. Every record
+        // this scanner cares about is a user record carrying a promptId.
+        if (!line.includes('"promptId"') || !line.includes('"user"')) continue
+        let o: TranscriptRecord
+        try {
+          o = JSON.parse(line)
+        } catch {
+          continue
+        }
+        if (o?.type !== 'user' || o.isSidechain === true) continue
+        if (typeof o.promptId !== 'string' || !PROMPT_ID_RE.test(o.promptId)) continue
+        if (isMarkerRecord(o)) {
+          if (!opts?.record && seen.has(o.promptId)) out.push(o.promptId)
+        } else if (isOpeningPrompt(o)) {
+          remember(o.promptId)
+        }
+      }
+      return out
+    }
+  }
+}
+
+/**
+ * Turn ids (`promptId`) of the interrupt markers in these transcript lines, in file order, counting
+ * a marker only when its turn's opening prompt precedes it IN THESE LINES (see
+ * `createTurnInterruptScanner`, which the tails use to carry that across reads). Pure.
+ *
+ * No hook fires when the user interrupts a Claude turn (Esc during streaming, a tool call or a
+ * permission dialog; Ctrl+C once) — measured on 2.1.285 — and the CLI's `idle_prompt`
+ * notification does not follow an interrupted turn either. This marker is the one trace the
+ * interrupt leaves. The id is only a CANDIDATE: the status mirror acts on it only when it names
+ * the turn the node is in right now (`recordTurnInterrupt`).
+ *
+ * Only a main-thread user record whose content is an ARRAY holding exactly one text part with a
+ * marker text counts. A prompt the user typed is stored as a plain string, so typing the marker's
+ * words cannot produce one.
+ */
+export function parseTurnInterrupts(text: string | string[]): string[] {
+  return createTurnInterruptScanner().scan(text)
+}
+
+/** Legacy presence scanner; answer consumers must use parseToolResultIds. */
 export function hasToolResult(text: string | string[]): boolean {
   for (const line of toLines(text)) {
     const s = line.trim()
@@ -141,8 +271,11 @@ export function hasToolResult(text: string | string[]): boolean {
 export interface ContextTailOptions {
   /** Fired when a tracked session's transcript announces a completed async subagent. */
   onTaskNotification?: (sessionId: string, n: TaskNotification) => void
-  /** Fired when a tracked session's transcript records a tool RESULT — see `hasToolResult`. */
-  onToolResult?: (sessionId: string) => void
+  /** Fired when a tracked session's transcript records a tool RESULT — see `parseToolResultIds`. */
+  onToolResult?: (sessionId: string, toolUseId: string) => void
+  /** Fired when a tracked session's transcript records a turn INTERRUPT marker, with that turn's id
+   *  — see `parseTurnInterrupts`. Claude only; the consumer decides whether it is the live turn. */
+  onTurnInterrupted?: (sessionId: string, turnId: string) => void
   /**
    * How to read the used/window numbers out of this agent's transcript. Defaults to claude's
    * `parseLatestUsage`. gemini and codex pass their own (`core/gemini-session.ts`
@@ -156,7 +289,7 @@ export interface ContextTailOptions {
    */
   parse?: (
     text: string | string[]
-  ) => { used: number; window?: number | null; model: string | null } | null
+  ) => { used: number; window?: number | null; model: string | null; effort?: string } | null
   /**
    * Re-read the tracked file from byte 0 on every tick instead of tailing an offset.
    *
@@ -167,18 +300,31 @@ export interface ContextTailOptions {
    * keeps paying for. The file is a few KB, so re-reading it whole costs nothing worth optimizing.
    */
   wholeFile?: boolean
+  /**
+   * Replace the byte read entirely, for a source that is not a text file: cursor's numbers live in a
+   * SQLite `store.db` (WAL), whose bytes parse as nothing. Called every tick with the key the last
+   * successful read returned; a change gate lives in the source (return null when nothing changed
+   * or the read failed, so the meter keeps its last value). `text` is handed to `parse` as one line.
+   */
+  readSource?: (path: string, lastKey: string | undefined) => Promise<{ text: string; key: string } | null>
 }
 
 interface Tracked {
+  /** Claude interrupt markers, with the opening prompts already read (see the scanner). */
+  interrupts: TurnInterruptScanner
   path: string
   offset: number
   used: number
   window: number
   model: string | null
+  /** Reasoning effort of the latest request (claude only — see parseLatestUsage); null = none. */
+  effort: string | null
   // Last pushed snapshot — a push fires only when one of these changes.
   lastUsed: number
   lastModel: string | null
+  lastEffort: string | null
   lastWindow: number
+  sessionWindow: number | null
   /** An async read is in flight — the next tick skips this session instead of double-reading. */
   reading: boolean
   /**
@@ -193,10 +339,14 @@ interface Tracked {
    * usage in it leaves the last known window alone.
    */
   parsedWindow: number | null
+  /** `readSource`'s last change key (undefined until its first successful read). */
+  sourceKey?: string
 }
 
 export interface ContextTail {
-  track(sessionId: string | undefined, transcriptPath: string | undefined): void
+  track(sessionId: string | undefined, transcriptPath: string | undefined, sessionWindow?: number | null): void
+  /** Replay a live snapshot only when a consumer explicitly asks to rehydrate. */
+  replay(sessionId: string): void
   untrack(sessionId: string | undefined): void
   /** The transcript path currently tracked for a session, if any. */
   pathFor(sessionId: string | undefined): string | undefined
@@ -223,6 +373,8 @@ export function createContextTail(
       windowTokens: t.window,
       usedPercent,
       model: t.model,
+      ...(t.effort !== null && { effort: t.effort }),
+      windowSource: customParse ? 'transcript' : t.sessionWindow === null ? 'estimate' : 'session-env',
       updatedAt: Date.now()
     }
     send(payload)
@@ -237,10 +389,24 @@ export function createContextTail(
     t.reading = true
     try {
       let size = -1
-      try {
-        size = (await fs.promises.stat(t.path)).size
-      } catch {
-        // file not created yet / unreadable — skip the byte read, still reconcile below
+      if (opts?.readSource) {
+        const r = await opts.readSource(t.path, t.sourceKey)
+        if (r) {
+          t.sourceKey = r.key
+          const latest = parse([r.text])
+          if (latest) {
+            t.used = latest.used
+            t.model = latest.model ?? t.model
+            t.effort = latest.effort ?? null
+            t.parsedWindow = latest.window ?? t.parsedWindow
+          }
+        }
+      } else {
+        try {
+          size = (await fs.promises.stat(t.path)).size
+        } catch {
+          // file not created yet / unreadable — skip the byte read, still reconcile below
+        }
       }
       if (size >= 0) {
         const before = t.offset
@@ -281,44 +447,36 @@ export function createContextTail(
           if (latest) {
             t.used = latest.used
             t.model = latest.model ?? t.model
+            t.effort = latest.effort ?? null
             t.parsedWindow = latest.window ?? t.parsedWindow
           }
           if (opts?.onTaskNotification) {
             for (const n of parseTaskNotifications(completeLines))
               opts.onTaskNotification(sessionId, n)
           }
-          if (opts?.onToolResult && hasToolResult(completeLines)) opts.onToolResult(sessionId)
+          if (opts?.onToolResult)
+            for (const id of parseToolResultIds(completeLines)) opts.onToolResult(sessionId, id)
+          if (opts?.onTurnInterrupted)
+            for (const id of t.interrupts.scan(completeLines)) opts.onTurnInterrupted(sessionId, id)
         }
       }
 
-      // Reconcile the window every tick: kick off async API resolution once per model
-      // (self-gating), and use the best cached/static value now.
-      if (t.model) void resolveModelWindow(t.model)
-      // Whose number is the denominator: the transcript's own when the agent states one, else
-      // claude's model-family inference.
-      //
-      // `cachedWindowFor` is CLAUDE's inference and is consulted only on claude's path (no custom
-      // parser). It always answers a number — DEFAULT_WINDOW (200k) for anything it doesn't
-      // recognize — so handing it "gpt-5.6-sol" or "gemini-3.5-flash" would not fail, it would
-      // confidently return the wrong denominator. A custom parser that could not state a window
-      // therefore yields `null`, and null pushes NOTHING (the guard below): a meter is a
-      // percentage, and a used count over a guessed denominator is worse than no meter at all.
-      //
-      // Claude's path is unchanged by construction: no custom parser ⇒ `cachedWindowFor(t.model)`
-      // exactly as before, always > 0, so the added guard can never fire for it.
-      const win = customParse ? t.parsedWindow : cachedWindowFor(t.model)
+      // The observed session env outranks model-family estimates, even when it is smaller.
+      // Custom parsers own their denominator and never inherit Claude configuration.
+      const win = customParse ? t.parsedWindow : t.sessionWindow ?? cachedWindowFor(t.model)
 
-      if (!sessions.has(sessionId)) return // untracked while this async read was in flight
+      if (sessions.get(sessionId) !== t) return // untracked while this async read was in flight
       if (
         t.used > 0 &&
         win !== null &&
         win > 0 &&
-        (t.used !== t.lastUsed || t.model !== t.lastModel || win !== t.lastWindow)
+        (t.used !== t.lastUsed || t.model !== t.lastModel || t.effort !== t.lastEffort || win !== t.lastWindow)
       ) {
         t.window = win
         push(sessionId, t)
         t.lastUsed = t.used
         t.lastModel = t.model
+        t.lastEffort = t.effort
         t.lastWindow = win
       }
     } finally {
@@ -335,26 +493,30 @@ export function createContextTail(
   }
 
   return {
-    track(sessionId, transcriptPath) {
+    track(sessionId, transcriptPath, sessionWindow) {
       if (!sessionId || !transcriptPath) return
       const existing = sessions.get(sessionId)
-      if (existing) {
-        if (existing.path !== transcriptPath) {
-          existing.path = transcriptPath
-          existing.offset = 0
-          existing.carry = null
+      if (existing && existing.path === transcriptPath) {
+        if (sessionWindow !== undefined && sessionWindow !== existing.sessionWindow) {
+          existing.sessionWindow = sessionWindow
+          existing.lastWindow = 0 // publish even if only provenance changed
+          void read(sessionId, existing)
         }
         return
       }
       const t: Tracked = {
+        interrupts: createTurnInterruptScanner(),
         path: transcriptPath,
         offset: 0,
         used: 0,
         window: 0,
         model: null,
+        effort: null,
         lastUsed: 0,
         lastModel: null,
+        lastEffort: null,
         lastWindow: 0,
+        sessionWindow: sessionWindow ?? null,
         reading: false,
         carry: null,
         parsedWindow: null
@@ -362,6 +524,10 @@ export function createContextTail(
       sessions.set(sessionId, t)
       void read(sessionId, t) // immediate first value (resumed sessions already have content)
       if (!timer) timer = setInterval(tick, POLL_MS)
+    },
+    replay(sessionId) {
+      const t = sessions.get(sessionId)
+      if (t && t.used > 0 && t.lastWindow > 0) push(sessionId, t)
     },
     untrack(sessionId) {
       if (!sessionId) return

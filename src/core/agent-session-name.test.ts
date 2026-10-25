@@ -6,6 +6,7 @@ import { tmpdir } from 'os'
 import path from 'path'
 import { readAgentSessionName } from './agent-session-name'
 import { rememberGrokSessionDir, forgetGrokSession } from './grok-session'
+import { setCustomAgentBaseResolver } from '../shared/agents/config'
 
 const root = mkdtempSync(path.join(tmpdir(), 'agent-session-name-'))
 afterAll(() => rmSync(root, { recursive: true, force: true }))
@@ -20,6 +21,50 @@ describe('readAgentSessionName', () => {
     // The account id is claude's concept; passing one must not change grok's answer.
     expect(await readAgentSessionName('gs1', 'acct-2', 'grok')).toBe('Grok named it')
     forgetGrokSession('gs1')
+  })
+
+  it('reads a REMOTE grok session on its host, not on this machine', async () => {
+    // §8.4: for an SSH node the shells derive the session directory from the LOCAL sessions root
+    // while the payload's `cwd` came from the host — a path on the wrong machine. The remote reader
+    // answers first, and its answer is final.
+    const dir = path.join(root, 'gs-remote')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(path.join(dir, 'summary.json'), JSON.stringify({ generated_title: 'LOCAL NAME' }))
+    rememberGrokSessionDir('gs-remote', dir)
+    const remote = async () => ({
+      text: JSON.stringify({ generated_title: 'name from the host' })
+    })
+    expect(await readAgentSessionName('gs-remote', undefined, 'grok', { grokRemoteSummary: remote }))
+      .toBe('name from the host')
+    forgetGrokSession('gs-remote')
+  })
+
+  it('a remote session that cannot be read yields NO name, never the local one', async () => {
+    // The mutation this exists for. "Could not read the host" and "there is nothing" are different
+    // facts; answering a question about the host with a fact about this machine is how a node ends
+    // up wearing another session's name. An empty body is still an answer from the remote reader.
+    const dir = path.join(root, 'gs-remote-2')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(path.join(dir, 'summary.json'), JSON.stringify({ generated_title: 'LOCAL NAME' }))
+    rememberGrokSessionDir('gs-remote-2', dir)
+    const unreadable = async () => ({ text: '' })
+    expect(
+      await readAgentSessionName('gs-remote-2', undefined, 'grok', { grokRemoteSummary: unreadable })
+    ).toBeNull()
+    forgetGrokSession('gs-remote-2')
+  })
+
+  it('a reader that does not own the session falls through to the local map', async () => {
+    // `null` means "not a remote session" — the only answer that routes locally.
+    const dir = path.join(root, 'gs-local')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(path.join(dir, 'summary.json'), JSON.stringify({ generated_title: 'local one' }))
+    rememberGrokSessionDir('gs-local', dir)
+    const notMine = async () => null
+    expect(
+      await readAgentSessionName('gs-local', undefined, 'grok', { grokRemoteSummary: notMine })
+    ).toBe('local one')
+    forgetGrokSession('gs-local')
   })
 
   it('sends everything else to the claude transcript reader', async () => {
@@ -40,6 +85,33 @@ describe('readAgentSessionName', () => {
     expect(await readAgentSessionName('thread-1', undefined, 'codex')).toBeNull()
     expect(await readAgentSessionName('thread-1', 'acct-2', 'codex')).toBeNull()
     delete process.env.CODEX_HOME
+  })
+
+  it("routes cursor to its chat store's reader: null for an unknown id, never claude's scan", async () => {
+    process.env.CURSOR_CONFIG_DIR = path.join(root, 'no-such-cursor-dir')
+    expect(await readAgentSessionName('66666666-e4c7-4f28-9d99-027f84c10837', undefined, 'cursor')).toBeNull()
+    delete process.env.CURSOR_CONFIG_DIR
+  })
+
+  it('routes a custom agent built on cursor to the cursor store, not claude\'s reader', async () => {
+    const { DatabaseSync } = await import('node:sqlite')
+    const cfg = path.join(root, 'cursor-cfg')
+    const id = '77777777-e4c7-4f28-9d99-027f84c10837'
+    const d = path.join(cfg, 'chats', 'b', id)
+    mkdirSync(d, { recursive: true })
+    const db = new DatabaseSync(path.join(d, 'store.db'))
+    db.exec('CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB); CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);')
+    db.prepare("INSERT INTO meta (key, value) VALUES ('0', ?)").run(Buffer.from(JSON.stringify({ name: 'Cursor named it' })).toString('hex'))
+    db.close()
+    process.env.CURSOR_CONFIG_DIR = cfg
+    setCustomAgentBaseResolver((a) => (a === 'my-cursor' ? 'cursor' : undefined))
+    try {
+      expect(await readAgentSessionName(id, undefined, 'cursor')).toBe('Cursor named it')
+      expect(await readAgentSessionName(id, undefined, 'my-cursor')).toBe('Cursor named it')
+    } finally {
+      setCustomAgentBaseResolver(null)
+      delete process.env.CURSOR_CONFIG_DIR
+    }
   })
 
   it('answers null for an empty session id without asking either reader', async () => {

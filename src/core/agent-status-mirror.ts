@@ -1,3 +1,4 @@
+import { subagentReplay } from './subagent-replay'
 import fs from 'fs'
 import path from 'path'
 import { writeFileAtomic } from './fs-atomic'
@@ -6,6 +7,7 @@ import type { AgentId } from '@shared/agents/config'
 import type { AgentState, NormalizedAgentEvent } from '@shared/agents/normalize'
 import type { ObservedClaudeAccount } from '@shared/types'
 import { WORKING_STALE_MS, isStaleWorking } from '@shared/agents/stale'
+import { parseIdentitySeed } from '@shared/agent-identity-seed'
 
 /**
  * Mirrors the live per-node agent status to a small JSON file so an EXTERNAL reader (the
@@ -31,13 +33,33 @@ import { WORKING_STALE_MS, isStaleWorking } from '@shared/agents/stale'
 // late PostToolUse `working` POST can arrive after the `Stop` `done`. Hold `done` against any
 // non-newTurn `working` for this long.
 export const DONE_HOLDOFF_MS = 3000
-// Drop entries whose state hasn't been refreshed in this long, so the file can't accumulate
-// unbounded nodes or advertise a stale "working" from a crashed/abandoned session.
+// Drop a node's STATE once it hasn't been refreshed in this long, so the file can't advertise a
+// stale "working" from a crashed/abandoned session. The node's IDENTITY (agentId/sessionId/
+// account/name) outlives it — see IDENTITY_EXPIRE_MS.
 export const EXPIRE_MS = 6 * 60 * 60_000
+/**
+ * How long an entry whose state has expired is kept as an IDENTITY-ONLY entry (no `state`, nothing
+ * state-derived). EXPIRE_MS is about the state, and dropping the whole entry with it was a
+ * device-measured bug: the phone's chat view finds a node's transcript ONLY through the `sessionId`
+ * it reads here, so a conversation typed in the terminal and left idle overnight opened on the
+ * phone as "No conversation yet" until the next prompt fired a hook.
+ *
+ * Measured from `updatedAt` (the last STATE commit), deliberately not from the last time an id was
+ * seen: a node's session id only changes across a session boundary, and every boundary commits a
+ * state, so "30 days since the node last did anything" is the same clock. Identity-only entries are
+ * also dropped as soon as their node is known to be gone (`setMirrorLiveNodesProvider`); this TTL
+ * is the bound when that cannot be known (a folder project that is unavailable, an SSH project
+ * never connected).
+ */
+export const IDENTITY_EXPIRE_MS = 30 * 24 * 60 * 60_000
 // Coalesce bursty hook POSTs (a single turn fires many tool events) into one disk write.
 export const WRITE_DEBOUNCE_MS = 300
 
 export interface MirrorEntry {
+  /** Tickets introduced concurrently with a picker, retained until reply or explicit reset. */
+  concurrentApprovalIds?: string[]
+  /** Live question identity, independent of the short-lived display stash. */
+  pendingQuestion?: { sessionId: string; toolUseId: string }
   /** working/waiting/blocked/done; undefined = idle/unknown (e.g. after a session reset). */
   state?: AgentState
   agentId?: AgentId
@@ -138,6 +160,34 @@ export interface MirrorEntry {
    * renderer re-reports its persisted set at boot, and a wake (or `clearNode`) drops the flag.
    */
   hibernated?: true
+  /**
+   * The CURRENT stateless entry was committed by a VERIFIED `SessionStart` this run, and nothing
+   * has committed a state since. A CLI that has just started or resumed and taken no turn cannot
+   * be holding an approval, so its `idle_prompt` is allowed to commit a verified, non-inferred
+   * `done` (see `reduceEffectiveEntry`). Without that, a resumed CLI idling at its prompt was
+   * unmessageable forever: the boundary left it unverified and only a turn could re-verify it.
+   * Runtime-only (not in `buildFile`'s allowlist); cleared by every state commit.
+   */
+  sessionStarted?: { sessionId: string; agentId: NormalizedAgentEvent['agentId']; at: number }
+  /**
+   * Claude only: the CLI's id (`prompt_id`) for the turn this node is in, from the
+   * `UserPromptSubmit` that opened it (`NormalizedAgentEvent.turnId`). What lets a transcript
+   * interrupt marker end exactly THIS turn (`recordTurnInterrupt`) — no hook fires for an
+   * Esc/Ctrl+C, so the marker is the only signal, and one read back from history names an older
+   * turn and must change nothing. Runtime-only (not in `buildFile`'s allowlist): after a restart
+   * no marker can match, which degrades to the stale sweep. Cleared by a
+   * session boundary.
+   */
+  turnId?: string
+  /**
+   * The entry's state EXPIRED (no state commit for EXPIRE_MS) and was stripped: this is an
+   * IDENTITY-ONLY entry kept so external readers can still find the node's session (see
+   * IDENTITY_EXPIRE_MS). It carries no `state` and no evidence about one; agent messaging reads it
+   * as "no current observation", exactly like a node that has never posted. Runtime-only (not in
+   * `buildFile`'s allowlist — the file says the same thing by omitting `state`); cleared by the next
+   * state commit.
+   */
+  stateExpired?: true
 }
 
 /** This host's Server-Edition install metadata (spec: server-update). Written by the installer
@@ -168,6 +218,60 @@ export interface MirrorSettings {
   autoSupported?: boolean
   /** Managed accounts usable on THIS host; dirs are absolute on that host. */
   claudeAccounts?: { id: string; dir: string }[]
+  /**
+   * Which values THIS host's `codex` accepts for `--ask-for-approval`, read from its own `--help`.
+   * Absent = not probed / not knowable for this host, which means "use `on-request` and `never`
+   * only" — the two values every codex from 0.146.0 to 0.154.0 takes.
+   *
+   * A reader must not emit a value that is not in this list. `untrusted` was removed in codex
+   * 0.149.0 and clap EXITS on an unknown value, so a phone that launches Manual-mode Codex from a
+   * hardcoded table gets a dead pane with the CLI's usage error in it (issue #785). It is a
+   * per-agent, per-host fact for the same reason `autoSupported` is: it answers for *codex* on
+   * *this* host and generalizes to neither another agent nor another machine.
+   */
+  codexApprovalValues?: string[]
+  /**
+   * THIS host's `codex` accepts `--no-daemon` — present only as `true`, when its own `--help` said
+   * so. A reader launching a plain Codex TUI must then add the flag: from codex-cli 0.157.0 the TUI
+   * otherwise starts or joins ONE shared app-server per CODEX_HOME that keeps the environment of the
+   * pane that started it, so the new session's hooks and tool shells run as another node (measured on
+   * 0.159.2; see shared/agents/codex-daemon.ts). Never together with `--remote` (codex refuses).
+   * Absent = unknown = emit nothing: clap exits on an unknown option.
+   */
+  codexNoDaemon?: true
+  /**
+   * The user's custom agents (Settings → Agents), reduced to what a phone needs to chat with one:
+   * which builtin harness it inherits (the chat capability follows `baseAgent`) and which binary
+   * names its pane runs as (the pane-owner check before a send). Built ONLY by
+   * `mirrorCustomAgents` (`core/mirror-custom-agents.ts`) — never the raw `launchCmd`/`args`/`env`,
+   * which routinely carry API keys and proxy URLs. Absent on old files ⇒ a reader refuses every
+   * custom node, exactly as before this field existed.
+   */
+  customAgents?: MirrorCustomAgent[]
+  /**
+   * `process.platform` of the machine whose sessions this file describes (`darwin` / `linux` /
+   * `win32`). A phone must not type POSIX shell syntax into a `win32` host's fresh pane — pwsh and
+   * cmd reject `2>/dev/null`, `env -u`, `VAR=x cmd` — so it asks the host to launch instead
+   * (`pty.attach { launch }`). Absent on old files and on SSH slices (whose hosts are POSIX).
+   */
+  hostPlatform?: string
+}
+
+/** One custom agent as the mirror advertises it (see MirrorSettings.customAgents). */
+export interface MirrorCustomAgent {
+  /** `custom:<uuid>` — the node's `agentId`. */
+  id: string
+  label: string
+  /** The builtin harness it inherits capabilities from; absent for a baseless custom agent. */
+  baseAgent?: string
+  /**
+   * Plain binary basenames the pane-owner predicate would accept — `binariesFor(id, customAgents)`,
+   * published only when every name matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` (enforced by the
+   * builder). EMPTY when the launch command cannot be named honestly (e.g. `bash -lc …`) or the
+   * derived name is outside that alphabet (a URL, credential, quoted value or `${env:…}` template);
+   * a reader must then refuse, never fall back to a guess.
+   */
+  binaries: string[]
 }
 
 export interface MirrorFile {
@@ -176,6 +280,9 @@ export interface MirrorFile {
   nodes: Record<
     string,
     {
+      /** Absent = unknown: idle, between sessions, or an IDENTITY-ONLY entry whose state expired
+       *  (older than EXPIRE_MS — see IDENTITY_EXPIRE_MS). A reader must never read absence as
+       *  "working"; the identity fields stay valid either way. */
       state?: AgentState
       agentId?: AgentId
       sessionId?: string
@@ -427,12 +534,23 @@ export function reduceEntry(
   return reduceEffectiveEntry(prev, resolveGrokStopCancelled(ev), now)
 }
 
+function uncorrelatedStartIdle(prev: MirrorEntry | undefined, ev: NormalizedAgentEvent, now: number): boolean {
+  const started = prev?.sessionStarted
+  return !!started && ev.kind === 'state' && !!ev.idle &&
+    (ev.sessionId !== started.sessionId || ev.agentId !== started.agentId ||
+     prev.sessionId !== started.sessionId || now < started.at)
+}
+
 function reduceEffectiveEntry(
   prev: MirrorEntry | undefined,
   ev: NormalizedAgentEvent,
   now: number
 ): MirrorEntry {
   const next: MirrorEntry = prev ? { ...prev } : { updatedAt: now }
+  // Ignore foreign idle proof before generic identity capture can overwrite the session.
+  const started = prev?.sessionStarted
+  if (uncorrelatedStartIdle(prev, ev, now)) return next
+
   /**
    * Commit a state onto `next` — and everything that must move WITH it. One function rather than
    * the same four lines at each branch, because the alternative was measured: of the three branches
@@ -445,16 +563,24 @@ function reduceEffectiveEntry(
    * `proof` is the evidence for THIS transition, passed in rather than read off `ev` so the one
    * caller that means something different has to say so out loud.
    */
-  const commitState = (state: AgentState | undefined, proof: boolean): void => {
+  const commitState = (
+    state: AgentState | undefined,
+    proof: boolean,
+    idleAfterSessionStart = false
+  ): void => {
     next.state = state
     next.updatedAt = now
     next.stateVerified = proof
     if (proof) next.verifiedAt = now
     next.clientRevision = ev.clientRevision
+    delete next.sessionStarted
+    delete next.stateExpired
     // Which KIND of `done` this is, recorded on the same edge as the state itself. `idle` is only
     // ever meaningful on a `done`; assigning (not merging) is the point — a later, genuine turn-end
     // `done` must clear the marker, or a node would stay tainted for the rest of its session.
-    if (state === 'done' && ev.idle) next.idleInferred = true
+    // The one idle `done` that is NOT inferred is the one right after a verified session start:
+    // no turn has run, so no approval can be pending behind the prompt (see `sessionStarted`).
+    if (state === 'done' && ev.idle && !idleAfterSessionStart) next.idleInferred = true
     else delete next.idleInferred
     // The entry's STATE now comes from this run, so it is no longer the one restored off disk.
     // Cleared HERE and only here: an event that commits no state — a context/usage event, a
@@ -462,6 +588,39 @@ function reduceEffectiveEntry(
     // it was. `restored` means "this state came off disk", not "we have heard something since
     // boot", and gate 2 will read it as the former.
     delete next.restored
+  }
+  // Unrelated tool hooks (including untagged child hooks) are not answers. Keep both
+  // the state and its original evidence/identity until a correlated result or explicit reset.
+  const resetApprovals = (ev.kind === 'session' && ev.sessionPhase === 'start') ||
+    (ev.sessionId === prev?.sessionId && (ev.kind === 'session' || ev.newTurn || ev.interrupted))
+  if (resetApprovals) delete next.concurrentApprovalIds
+  else {
+    if (ev.pendingId && ev.state === 'blocked' && ev.askKind === 'approval' &&
+        (prev?.pendingQuestion || prev?.concurrentApprovalIds?.length)) {
+      next.concurrentApprovalIds = [...new Set([...(prev?.concurrentApprovalIds ?? []), ev.pendingId])]
+    }
+    if (ev.pendingId && ev.state === 'working' && next.concurrentApprovalIds) {
+      next.concurrentApprovalIds = next.concurrentApprovalIds.filter(id => id !== ev.pendingId)
+      if (!next.concurrentApprovalIds.length) delete next.concurrentApprovalIds
+    }
+  }
+  const ask = prev?.pendingQuestion
+  if (ask) {
+    const sameSession = ev.sessionId === ask.sessionId
+    const reset = (ev.kind === 'session' && ev.sessionPhase === 'start') ||
+      (sameSession && (ev.kind === 'session' || ev.newTurn || ev.interrupted))
+    const answered = sameSession && ev.answeredQuestionId === ask.toolUseId
+    if (!reset && !answered) return next
+    delete next.pendingQuestion
+  }
+  if (ev.questionId && ev.sessionId) {
+    next.pendingQuestion = { sessionId: ev.sessionId, toolUseId: ev.questionId }
+  }
+  if (next.concurrentApprovalIds?.length && !next.pendingQuestion) {
+    // A new picker is independent of outstanding child permissions. Other state events
+    // hold blocked attention; lifecycle events must not refresh that state's evidence.
+    if (ev.kind === 'state') commitState('blocked', !!ev.verified)
+    return next
   }
   // Identity is captured off ANY event (mirrors the renderer's per-event setSessionId +
   // agentId threading). agentId is always present on a NormalizedAgentEvent.
@@ -473,12 +632,27 @@ function reduceEffectiveEntry(
   // event without the label is a codex/gemini event or a payload with no transcript_path, neither
   // of which is evidence that this node stopped being on the account it was last seen on.
   if (ev.account) next.account = ev.account
+  // The live turn's id rides the event that opens it; nothing else touches it until the next turn
+  // or a session boundary (below). See `recordTurnInterrupt`.
+  // A prompt with no usable id (`''`) forgets the old one rather than keeping it.
+  if (ev.kind === 'state' && ev.turnId !== undefined) {
+    if (ev.turnId) next.turnId = ev.turnId
+    else delete next.turnId
+  }
 
   if (ev.kind === 'state' && ev.state) {
     // An `idle` done (Claude went quiet at its prompt) is a RESCUE, not a turn end: it may only
     // move a node that is still `working`. A node that is blocked/waiting is ALSO idle at the
     // prompt — clearing it there would drop a live approval — and one already done needs nothing.
-    if (ev.idle && prev?.state !== 'working') return next
+    // ONE exception: a verified idle right after a verified session start, with no state committed
+    // in between. A just-started or just-resumed CLI at its prompt is genuinely idle — and without
+    // this it stays unverified until a turn it can only get from a message it cannot receive.
+    const idleAfterSessionStart =
+      ev.idle === true &&
+      ev.verified === true &&
+      !!started &&
+      prev.state === undefined
+    if (ev.idle && prev?.state !== 'working' && !idleAfterSessionStart) return next
     // An unanswered Codex `request_user_input`: the ask arrives as waiting+awaitingInput and the
     // turn's OWN Stop follows as `done` before the user answers (the ask ends the turn; the answer
     // opens a new one). That done must not flip the node green over a live question — hold
@@ -509,7 +683,7 @@ function reduceEffectiveEntry(
     // working did not change the state whose proof this describes. `clientRevision` is ASSIGNED
     // rather than merged — an event with no stamp is a report that this node is running a script
     // that cannot send one, which is exactly what a stale entry would hide.
-    if (!heldOff) commitState(ev.state, ev.verified === true)
+    if (!heldOff) commitState(ev.state, ev.verified === true, idleAfterSessionStart)
   } else if (ev.kind === 'session') {
     // SessionStart / SessionEnd both reset the node to idle (renderer: setState(id, undefined)).
     // The proof goes with the state it was about, and `false` is passed EXPLICITLY rather than
@@ -518,9 +692,55 @@ function reduceEffectiveEntry(
     // and is what makes a refusal retryable.
     commitState(undefined, false)
     next.awaitingInput = undefined
+    delete next.turnId
+    // The boundary proves nothing about a state (and leaves `verifiedAt` alone), but a VERIFIED
+    // start arms the idle rescue above.
+    if (ev.sessionPhase === 'start' && ev.verified === true && ev.sessionId) {
+      next.sessionStarted = { sessionId: ev.sessionId, agentId: ev.agentId, at: now }
+    }
   }
   // subagent-start / subagent-end / recurring: identity captured above, main state untouched.
   return next
+}
+
+/**
+ * The identity-only form of an entry whose state expired: agentId, sessionId, account and name,
+ * with the state and everything state-derived removed. `undefined` when there is no identity worth
+ * keeping (neither an agentId nor a sessionId). `updatedAt` keeps the state's clock — it is what the
+ * identity TTL is measured from, and it keeps the entry reading as old to any freshness check.
+ */
+function identityOnly(e: MirrorEntry): MirrorEntry | undefined {
+  if (!e.agentId && !e.sessionId) return undefined
+  return {
+    ...(e.agentId ? { agentId: e.agentId } : {}),
+    ...(e.sessionId ? { sessionId: e.sessionId } : {}),
+    ...(e.account ? { account: e.account } : {}),
+    ...(e.name ? { name: e.name } : {}),
+    ...(e.restored ? { restored: true as const } : {}),
+    updatedAt: e.updatedAt,
+    stateExpired: true
+  }
+}
+
+/**
+ * Age one entry against the two horizons. Pure. Returns the entry unchanged while its state is
+ * fresh (or it is hibernated — hibernation IS long idleness), its identity-only form past
+ * EXPIRE_MS, and `undefined` once it should go: past IDENTITY_EXPIRE_MS, or past EXPIRE_MS for a
+ * node `liveIds` says no longer exists. A FRESH entry is never pruned by existence — a brand-new
+ * node may not have been saved yet. `liveIds` undefined = unknowable, prune by TTL only.
+ */
+export function ageEntry(
+  id: string,
+  e: MirrorEntry,
+  now: number,
+  expireMs = EXPIRE_MS,
+  liveIds?: ReadonlySet<string>
+): MirrorEntry | undefined {
+  if (e.hibernated || now - e.updatedAt <= expireMs) return e
+  if (now - e.updatedAt > IDENTITY_EXPIRE_MS) return undefined
+  if (liveIds && !liveIds.has(id)) return undefined
+  if (e.stateExpired) return e
+  return identityOnly(e)
 }
 
 /**
@@ -566,13 +786,16 @@ export function buildFile(
   settings?: MirrorSettings,
   usage?: MirrorUsage,
   inbox?: MirrorInbox,
-  server?: MirrorServer
+  server?: MirrorServer,
+  liveIds?: ReadonlySet<string>
 ): MirrorFile {
   const out: MirrorFile = { v: 1, updatedAt: now, nodes: {} }
-  for (const [id, e] of Object.entries(nodes)) {
-    // A hibernated entry never expires: hibernation IS long idleness, so the staleness rule would
-    // erase exactly the durable fact the flag carries (see MirrorEntry.hibernated).
-    if (now - e.updatedAt > expireMs && !e.hibernated) continue
+  for (const [id, entry] of Object.entries(nodes)) {
+    // Past `expireMs` the STATE goes but the identity stays (see IDENTITY_EXPIRE_MS). A hibernated
+    // entry never expires at all: hibernation IS long idleness, so the staleness rule would erase
+    // exactly the durable fact the flag carries (see MirrorEntry.hibernated).
+    const e = ageEntry(id, entry, now, expireMs, liveIds)
+    if (!e) continue
     // Undefined fields drop out of JSON.stringify — an idle node keeps agentId/sessionId
     // without a `state` key.
     out.nodes[id] = {
@@ -698,7 +921,8 @@ export function toolActivity(toolName: string, toolInput: Record<string, unknown
     case 'Read':
       out = `Reading ${basename(str(ti.file_path) || str(ti.notebook_path)) || 'file'}`
       break
-    case 'Bash': {
+    case 'Bash':
+    case 'Shell': { // cursor's shell tool, same `command` key (measured hook payload)
       const cmd = str(ti.command).replace(/\s+/g, ' ').trim()
       out = `Running ${cmd ? clip(cmd, 60) : 'command'}`
       break
@@ -1143,6 +1367,34 @@ function pushInboxEvent(e: Omit<InboxEvent, 'id'>): void {
  * event — never seen, or aged off the capped feed — is NOT relevant either (returns false), so a
  * held push whose event the mirror no longer tracks is dropped rather than sent late. Pure read.
  */
+/**
+ * The hook-reply tickets the mirror still considers open for ONE node: its unresolved approval
+ * cards' `pendingId`s plus the approvals held concurrently with a picker. The phone's
+ * `agent.answer` uses it to bind a ticket to the node it names (a pendingId from another node, or
+ * one already answered, is refused). Question/plan holds are not here — their pendingId is
+ * stripped from the inbox card — so those bind through the renderer's `held` instead. Pure read.
+ */
+export function pendingTicketsFor(nodeId: string): string[] {
+  const out = new Set<string>()
+  for (const e of inboxEvents) {
+    if (e.nodeId === nodeId && !e.resolved && e.kind === 'approval' && e.pendingId) out.add(e.pendingId)
+  }
+  for (const id of state.get(nodeId)?.concurrentApprovalIds ?? []) out.add(id)
+  return [...out]
+}
+
+/**
+ * The ask that is CURRENTLY open on a node — its newest unresolved approval/question card, the same
+ * pick the phone renders its answer card from (`LiveActivityManager.needsYouContent`). The relay's
+ * `agent.key` compares it with the kind of answer it is about to type: a question's digit typed
+ * into a permission prompt ANSWERS it (`2` = "don't ask again"). Undefined = no open ask. Pure read.
+ */
+export function openAskFor(nodeId: string): { kind: 'approval' | 'question'; pendingId?: string } | undefined {
+  const e = newestUnresolved(inboxEvents, nodeId)
+  if (!e) return undefined
+  return { kind: e.kind as 'approval' | 'question', ...(e.pendingId ? { pendingId: e.pendingId } : {}) }
+}
+
 export function isEventUnresolved(nodeId: string, eventId: string): boolean {
   for (const e of inboxEvents) {
     if (e.id === eventId && e.nodeId === nodeId) return !e.resolved
@@ -1150,10 +1402,11 @@ export function isEventUnresolved(nodeId: string, eventId: string): boolean {
   return false
 }
 
-/** Mark a node's unresolved approval/question events resolved (it left blocked/waiting). */
-function resolveUnresolvedFor(nodeId: string): void {
+/** Settle older attention cards, optionally retaining independent child approval tickets. */
+function resolveUnresolvedFor(nodeId: string, keepApprovalIds: readonly string[] = []): void {
   for (const e of inboxEvents) {
-    if (e.nodeId === nodeId && !e.resolved && (e.kind === 'approval' || e.kind === 'question')) {
+    if (e.nodeId === nodeId && !e.resolved && (e.kind === 'approval' || e.kind === 'question') &&
+        !(e.kind === 'approval' && e.pendingId && keepApprovalIds.includes(e.pendingId))) {
       e.resolved = true
     }
   }
@@ -1200,6 +1453,25 @@ function safeUsage(): MirrorUsage | undefined {
  * (spec: server-update). Called once by the SERVER shell on launch; absent ⇒ the mirror writes no
  * `server` key (the desktop app's shape is byte-identical to before this block existed).
  */
+let liveNodesProvider: (() => ReadonlySet<string> | undefined) | null = null
+/**
+ * Which node ids exist in ANY project (open or closed), so an identity-only entry for a deleted
+ * node can be dropped (see IDENTITY_EXPIRE_MS). The provider answers `undefined` when it cannot know
+ * the full set — then nothing is pruned by existence, only by TTL. A throw reads as `undefined`.
+ */
+export function setMirrorLiveNodesProvider(p: (() => ReadonlySet<string> | undefined) | null): void {
+  liveNodesProvider = p
+}
+
+function safeLiveNodes(): ReadonlySet<string> | undefined {
+  if (!liveNodesProvider) return undefined
+  try {
+    return liveNodesProvider() ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
 export function setMirrorServerProvider(p: (() => MirrorServer | undefined) | null): void {
   serverProvider = p
 }
@@ -1280,9 +1552,13 @@ function loadPersisted(file: string): void {
         // Hibernated entries survive the expiry, as in buildFile: hours of idleness is what the
         // flag MEANS. (The renderer also re-reports its persisted set at boot — this restore just
         // keeps the file honest in the window before that report lands.)
-        if (now - updatedAt > EXPIRE_MS && e.hibernated !== true) continue
+        const expired = now - updatedAt > EXPIRE_MS && e.hibernated !== true
+        // Past EXPIRE_MS only the IDENTITY is restored (as buildFile would write it): the phone's
+        // chat view still needs the session id, the 6 h rule is about the state. Past the identity
+        // TTL, or with no identity at all, nothing is.
+        if (expired && (now - updatedAt > IDENTITY_EXPIRE_MS || (!e.agentId && !e.sessionId))) continue
         state.set(id, {
-          state: e.state,
+          ...(expired ? { stateExpired: true as const } : { state: e.state }),
           agentId: e.agentId,
           sessionId: e.sessionId,
           // Identity survives the restart like agentId/sessionId does — for a hand-launched
@@ -1384,21 +1660,68 @@ interface NeedsYouClassification {
  */
 export function recordAgentEvent(rawEvent: NormalizedAgentEvent): NormalizedAgentEvent {
   if (!rawEvent?.nodeId) return rawEvent
+  subagentReplay.record(rawEvent)
   const ev = resolveGrokStopCancelled(rawEvent)
   const nodeId = ev.nodeId
   const now = Date.now()
   const prev = state.get(nodeId)
   const prevState = prev?.state
+  if (uncorrelatedStartIdle(prev, ev, now)) {
+    // Broadcast no state proof either: a renderer must not show this stale done as fresh.
+    return { nodeId, kind: 'state', agentId: prev?.sessionStarted?.agentId ?? ev.agentId, sessionId: prev?.sessionId }
+  }
   const next = reduceEffectiveEntry(prev, ev, now)
   state.set(nodeId, next)
+  const questionAnswered = !!prev?.pendingQuestion && !next.pendingQuestion &&
+    ev.sessionId === prev.pendingQuestion.sessionId && ev.answeredQuestionId === prev.pendingQuestion.toolUseId
+  if (questionAnswered || (ev.pendingId && ev.state === 'working')) {
+    for (const card of inboxEvents) {
+      if (card.nodeId !== nodeId) continue
+      if ((questionAnswered && card.kind === 'question') ||
+          (ev.pendingId && card.kind === 'approval' && card.pendingId === ev.pendingId)) card.resolved = true
+    }
+  }
+  if (next.concurrentApprovalIds?.length && !next.pendingQuestion) {
+    if (ev.kind !== 'state' && ev.kind !== 'session') {
+      scheduleWrite()
+      return ev
+    }
+    if (ev.pendingId && ev.state === 'blocked' && ev.askKind === 'approval') {
+      produceInboxFromState(nodeId, ev, prevState, 'blocked', now, true)
+    }
+    const pendingId = next.concurrentApprovalIds[next.concurrentApprovalIds.length - 1]
+    const card = inboxEvents.find(e => e.nodeId === nodeId && e.pendingId === pendingId && !e.resolved)
+    if (questionAnswered || (ev.pendingId && ev.state === 'working')) {
+      fireNodeStateChange({ nodeId, agentId: ev.agentId, sessionId: next.sessionId, ts: now,
+        event: 'update', state: 'needsYou', kind: 'approval', pendingId, message: card?.title ?? 'Needs approval' })
+    }
+    scheduleWrite()
+    return { ...ev, kind: 'state', state: 'blocked', sessionId: next.sessionId, askKind: 'approval', pendingId }
+  }
   // reduceEntry held an unanswered `request_user_input` through its turn-end `done` — rewrite
   // the broadcast to what the reducer decided, so every consumer (canvas store, notch, phone)
   // agrees the node is still waiting rather than each re-deriving it from the raw done.
   let out = ev
+  if (next.pendingQuestion && prev?.pendingQuestion && next.state) {
+    if (ev.kind !== 'state' && ev.kind !== 'session') return ev
+    // A concurrent permission is independent of the held picker. Publish its ticket/card,
+    // but keep the parent's waiting badge and question correlation until its own answer.
+    if (ev.pendingId && ev.state === 'blocked' && ev.askKind === 'approval') {
+      produceInboxFromState(nodeId, ev, prevState, 'blocked', now, true)
+      scheduleWrite()
+      return { ...ev, state: next.state, sessionId: next.sessionId }
+    }
+    scheduleWrite()
+    // Broadcast the same held state to Desktop, Server, canvas/board and the phone.
+    return { ...ev, kind: 'state', state: next.state, sessionId: next.sessionId,
+      verified: ev.verified, newTurn: undefined, interrupted: undefined,
+      askKind: 'question', pendingId: undefined }
+  }
   if (ev.kind === 'state' && ev.state === 'done' && next.awaitingInput && next.state === 'waiting') {
     out = { ...ev, state: 'waiting' }
   }
-  const classification = produceInboxFromState(nodeId, out, prevState, next.state, now)
+  const classification = produceInboxFromState(nodeId, out, prevState, next.state, now, false,
+    next.concurrentApprovalIds)
   scheduleWrite()
   if (!classification) return out
   // Enrich the broadcast event from the SAME classification the inbox used. A question drops
@@ -1417,16 +1740,18 @@ function produceInboxFromState(
   ev: NormalizedAgentEvent,
   prevState: AgentState | undefined,
   nextState: AgentState | undefined,
-  now: number
+  now: number,
+  concurrentApproval = false,
+  keepApprovalIds: readonly string[] = []
 ): NeedsYouClassification | undefined {
   // Clear any stashed question options on a new turn or session boundary — a stale option set must
   // never attach to a later, unrelated question. (State-leave clearing is handled below.)
   if (ev.kind === 'session' || (ev.kind === 'state' && ev.state === 'working' && ev.newTurn)) {
     pendingQuestions.delete(nodeId)
   }
-  // Leaving blocked/waiting (any newer, different state — incl. a session reset to idle) resolves
+  // Leaving needs-you (including a session reset to idle) resolves
   // that node's pending approval/question cards; they move to the phone's archive.
-  if ((prevState === 'blocked' || prevState === 'waiting') && nextState !== prevState) {
+  if ((prevState === 'blocked' || prevState === 'waiting') && nextState !== 'blocked' && nextState !== 'waiting') {
     resolveUnresolvedFor(nodeId)
     pendingQuestions.delete(nodeId)
   }
@@ -1464,7 +1789,7 @@ function produceInboxFromState(
     const stash = freshStash(nodeId, now)
     // Only a real AskUserQuestion picker (options present) forces the QUESTION classification — an
     // approval-only stash (a PermissionRequest summary) must stay an approval.
-    const options = stash?.options
+    const options = concurrentApproval ? undefined : stash?.options
     // multiSelect rides only a real question (options present) — an approval-only stash never sets it.
     const multiSelect = options ? stash?.multiSelect : undefined
     const hasQuestion = !!options
@@ -1504,7 +1829,10 @@ function produceInboxFromState(
     // stops muzzling — and the new ask fires. A different-title unresolved event never suppresses:
     // that is a genuinely NEW ask. Always return the classification below so the broadcast
     // enrichment stays consistent across the re-assert.
-    const dup = newestUnresolved(inboxEvents, nodeId)
+    const dup = concurrentApproval
+      ? inboxEvents.find(e => e.nodeId === nodeId && e.kind === 'approval' && !e.resolved && e.pendingId === ev.pendingId)
+      : newestUnresolved(inboxEvents.filter(e =>
+        !(e.kind === 'approval' && e.pendingId && keepApprovalIds.includes(e.pendingId))), nodeId)
     const sameTitle = !!dup && dup.title === title
     const freshDup = sameTitle && dup ? now - dup.ts < QUESTION_DEDUP_WINDOW_MS : false
     const newAsk = !freshDup
@@ -1527,11 +1855,10 @@ function produceInboxFromState(
       })
     }
     if (newAsk) {
-      // A NEW ask settles every older one for this node: the CLI blocks on an ask, so it cannot be
-      // asking something else unless the previous one was answered. Without this the Inbox kept a
-      // card per ask and the user had to dismiss answered questions by hand — the state never
-      // leaves `blocked` between them, so the transition-based resolve never ran.
-      resolveUnresolvedFor(nodeId)
+      // A new parent ask settles older parent asks, but child approval tickets are independent.
+      // Preserve those tickets while the parent proceeds to another picker; settle older questions
+      // even when the state never leaves needs-you between them.
+      if (!concurrentApproval) resolveUnresolvedFor(nodeId, keepApprovalIds)
       pushInboxEvent({
         ...baseEvent,
         kind,
@@ -1608,6 +1935,14 @@ function clearActivity(nodeId: string, now: number): void {
   inboxNodes.set(nodeId, { contextPercent: n.contextPercent, updatedAt: now })
 }
 
+/** Child hooks must not replace the parent transcript association while a picker is open. */
+export function ignoreQuestionHook(nodeId: string, payload: Record<string, unknown>): boolean {
+  if (payload.agent_id) return true
+  const ask = state.get(nodeId)?.pendingQuestion
+  return !!ask && payload.hook_event_name !== 'SessionStart' &&
+    typeof payload.session_id === 'string' && payload.session_id !== ask.sessionId
+}
+
 /**
  * Fold a RAW hook tool event into the per-node "what it's doing now" line (spec:
  * mobile-usage-inbox). Called from the shells' `setRawListener` for claude events. PreToolUse sets
@@ -1615,7 +1950,8 @@ function clearActivity(nodeId: string, now: number): void {
  * the line actually changes (raw POSTs are bursty).
  */
 export function recordRawToolEvent(nodeId: string, payload: Record<string, unknown>): void {
-  if (!nodeId) return
+  // Approval summaries must reach the phone even when the child transcript is excluded.
+  if (!nodeId || (payload.hook_event_name !== 'PermissionRequest' && ignoreQuestionHook(nodeId, payload))) return
   const hook = typeof payload.hook_event_name === 'string' ? payload.hook_event_name : ''
   const now = Date.now()
   if (hook === 'PreToolUse') {
@@ -1707,6 +2043,7 @@ export function recordContextUsage(nodeId: string, percent: number): void {
  * fires ONE end edge when the node was mid-turn (see below).
  */
 export function clearNode(nodeId: string): void {
+  subagentReplay.clearParent(nodeId)
   // Read BEFORE the delete — the end edge below is decided on the state the node died holding.
   const prev = state.get(nodeId)
   let changed = state.delete(nodeId)
@@ -1798,9 +2135,125 @@ export function setNodeHibernated(nodeId: string, on: boolean): void {
   scheduleWrite()
 }
 
+/**
+ * Seed IDENTITY for nodes the mirror has no session for — the `agent:seed-identity` cast's only
+ * writer. The renderer's agentStatus store keeps each node's `sessionId`/`agentId` in localStorage
+ * indefinitely, while this mirror learns them only from hook events; a node idle since before this
+ * app run (or whose entry was dropped before identity outlived the state) is therefore absent here,
+ * and the phone — which finds a transcript only by the session id it reads off this file — showed
+ * "No conversation yet" until the next prompt fired a hook.
+ *
+ * The rules, each a refusal:
+ *  - validated by `parseIdentitySeed` (bounded count, safe ids — the values come from hand-editable
+ *    localStorage and the ids are shell-reaching elsewhere);
+ *  - a node the workspace does not know is skipped (a deleted node's stale localStorage entry must
+ *    not be advertised); an unknowable workspace (`undefined`) accepts, bounded by the identity TTL
+ *    and the renderer's own filter;
+ *  - an entry that already carries a `sessionId` is NEVER touched — a hook-fed id is fresher than
+ *    anything localStorage remembers — and neither is one whose `agentId` disagrees;
+ *  - an entry holding a STATE is never filled either, even with no session id: a seeded id is
+ *    last-known and possibly stale, and beside a live state it would read as the id of the session
+ *    that state belongs to (the phone's permission-dialog guard reads it exactly so);
+ *  - a STATELESS entry with no session id (the boot replay's hibernated-only entry, a restored
+ *    stateless one) gets its identity filled, nothing else;
+ *  - a new entry is the IDENTITY-ONLY shape (`stateExpired`, no state, no proof) with `updatedAt`
+ *    set just past EXPIRE_MS, so it reads as OLD to every freshness check. That matters because
+ *    `stateExpired` is not persisted: restored after a restart it is re-derived from the age, so a
+ *    fresh `updatedAt` would come back as a plain stateless entry and join the session-name sweep
+ *    (a transcript read per pass, over ssh for a remote node). The identity TTL then runs from the
+ *    seed — but the renderer re-seeds whenever the entry has been pruned, so in practice the
+ *    identity lives as long as the node and its localStorage entry do.
+ * Returns how many entries changed. Schedules a write (and so an SSH slice push) only then.
+ */
+export function seedNodeIdentities(input: unknown): number {
+  const entries = parseIdentitySeed(input)
+  if (entries.length === 0) return 0
+  const liveIds = safeLiveNodes()
+  const now = Date.now()
+  let changed = 0
+  for (const s of entries) {
+    if (liveIds && !liveIds.has(s.nodeId)) continue
+    const e = state.get(s.nodeId)
+    if (e) {
+      if (e.sessionId || e.state) continue
+      if (e.agentId && e.agentId !== s.agentId) continue
+      state.set(s.nodeId, {
+        ...e,
+        agentId: s.agentId,
+        sessionId: s.sessionId,
+        ...(!e.account && s.account ? { account: s.account } : {})
+      })
+    } else {
+      state.set(s.nodeId, {
+        agentId: s.agentId,
+        sessionId: s.sessionId,
+        ...(s.account ? { account: s.account } : {}),
+        updatedAt: now - EXPIRE_MS - 1,
+        stateExpired: true
+      })
+    }
+    changed++
+  }
+  if (changed > 0) scheduleWrite()
+  return changed
+}
+
 /** A node's published session name (see MirrorEntry.name), or undefined. */
 export function nodeSessionName(nodeId: string): string | undefined {
   return state.get(nodeId)?.name
+}
+
+/** Shared Desktop/Server transcript rescue. An unrelated result is never an answer. */
+export function recordQuestionResult(
+  nodeId: string, sessionId: string, toolUseId: string
+): NormalizedAgentEvent | undefined {
+  const ask = state.get(nodeId)?.pendingQuestion
+  if (!ask || ask.sessionId !== sessionId || ask.toolUseId !== toolUseId) return
+  return recordAgentEvent({ nodeId, agentId: 'claude', sessionId, kind: 'state',
+    state: 'working', answeredQuestionId: toolUseId })
+}
+
+/**
+ * A Claude transcript recorded an interrupt marker (`parseTurnInterrupts`) for turn `turnId`: the
+ * event that ends the node's turn, or undefined when the marker is not about the CURRENT turn.
+ *
+ * Claude Code sends NO hook when the user interrupts a turn — Esc while it streams, runs a tool or
+ * shows a permission dialog, or Ctrl+C once (measured on 2.1.285,
+ * `shared/agents/__fixtures__/claude/interrupt-capture.json`) — and its `idle_prompt` notification,
+ * which the `idle` rescue listens for, fires after a normal turn but not after an interrupted one.
+ * Without this the node sat on RUNNING (or NEEDS YOU, for a dismissed dialog) until the 20-minute
+ * stale sweep: `--after` dependents waited, Eco never saw it idle, the phone showed it working.
+ *
+ * It ends the turn only when the marker names the turn the node is in NOW (same session, same
+ * `turnId`, state still working/blocked/waiting): a marker the tail reads back from history, one
+ * from a turn that already ended, one from another session, or one arriving after a restart
+ * (turnId is runtime-only) changes nothing. The id match is only HALF the safety story: on "queue a
+ * message, then Esc" the CLI tags the marker with the QUEUED prompt's id, which is the current turn
+ * by then — the tail's scanner therefore drops a marker whose turn it has not seen OPENED before it
+ * (`createTurnInterruptScanner`, context-tail.ts).
+ *
+ * The event is an ordinary interrupted `done` — the shape a `Stop` with `is_interrupt` already
+ * produced — so every consumer handles it with the rules it already has (no completion alert,
+ * the question/approval resets). It carries no `verified`: a transcript read is not a hook POST.
+ */
+export function turnInterruptEvent(
+  nodeId: string, sessionId: string, turnId: string
+): NormalizedAgentEvent | undefined {
+  const e = state.get(nodeId)
+  if (!e || e.sessionId !== sessionId || !e.turnId || e.turnId !== turnId) return
+  if (e.state !== 'working' && e.state !== 'blocked' && e.state !== 'waiting') return
+  return { nodeId, agentId: e.agentId ?? 'claude', sessionId, kind: 'state', state: 'done', interrupted: true }
+}
+
+/** `turnInterruptEvent`, recorded. The shells do NOT call this: they push `turnInterruptEvent`'s
+ *  event through their normal hook-event path, so every consumer of that stream (the Notch HUD,
+ *  agent messaging's receipt watch, station notices, the Server Edition's delivery queue and
+ *  `--after` scheduler) sees the interrupt exactly as it sees a hook. */
+export function recordTurnInterrupt(
+  nodeId: string, sessionId: string, turnId: string
+): NormalizedAgentEvent | undefined {
+  const ev = turnInterruptEvent(nodeId, sessionId, turnId)
+  return ev ? recordAgentEvent(ev) : undefined
 }
 
 /** A node's current main state, or undefined when unknown. Read-only peek for the shells. */
@@ -1818,6 +2271,19 @@ export function mirrorEntry(nodeId: string): MirrorEntry | undefined {
 }
 
 /**
+ * Every node whose CURRENT agent session is `sessionId` (usually one; a session resumed in two nodes
+ * is two). Read-only peek: the relay access policies attribute a `context:update` — keyed by the
+ * agent session, not the node — to the nodes it describes, so a peer limited to some projects
+ * receives a meter only for a session that runs in one of them.
+ */
+export function nodesForAgentSession(sessionId: string): string[] {
+  const out: string[] = []
+  if (typeof sessionId !== 'string' || !sessionId) return out
+  for (const [nodeId, e] of state) if (e.sessionId === sessionId) out.push(nodeId)
+  return out
+}
+
+/**
  * The nodes the mirror currently believes are `working`, with the identity a synthetic event needs.
  * Read-only peek for the shells — the reconnect resync asks the host about exactly these, because
  * `working` is the only state a lost hook event can strand (see remote-ssh/agent-resync-decide.ts).
@@ -1830,14 +2296,24 @@ export function workingNodes(): { nodeId: string; agentId?: string; sessionId?: 
   return out
 }
 
-/** The entries the session-name sweep walks: id + what it needs to resolve and dedupe. */
+/**
+ * The entries the session-name sweep walks: id + what it needs to resolve and dedupe.
+ *
+ * Identity-only entries (`stateExpired`) are left out: before they existed the sweep only ever saw
+ * nodes active within EXPIRE_MS, and keeping it there keeps its cost (a transcript read — over ssh
+ * for a remote node — per node per pass) where it was. A node that has done nothing for 6 h has not
+ * been renamed either; a `/rename` is a prompt, whose hook re-grows the state and re-admits it.
+ */
 export function sessionNameSweepEntries(): {
   nodeId: string
   sessionId?: string
   agentId?: string
   name?: string
 }[] {
-  return [...state].map(([nodeId, e]) => ({
+  // NB: the Server Edition's context-link sweep also reads this list (src/server/context-link.ts,
+  // `agentSessions` default), so it too sees only nodes active within EXPIRE_MS — the same set it
+  // saw before identity-only entries existed; giving it their session ids is a separate change.
+  return [...state].filter(([, e]) => !e.stateExpired).map(([nodeId, e]) => ({
     nodeId,
     sessionId: e.sessionId,
     agentId: e.agentId,
@@ -1943,8 +2419,9 @@ export async function flush(): Promise<void> {
   //  - RESOLVED must not get a LONGER one. It is the phone's archive, but the phone keeps its own
   //    copy of what it has read; this file is a live side-channel, not the archive of record, and
   //    the cap already bounds history.
-  // 6 h is the horizon at which the module stops believing anything about a node at all, so an
-  // event outliving `state`/`inboxNodes` would be a card about a node the mirror has forgotten.
+  // 6 h is the horizon at which the module stops believing anything about a node's STATE (only its
+  // identity survives it), so an event outliving `state`/`inboxNodes` would be a card about a state
+  // the mirror has forgotten.
   // Well clear of QUESTION_DEDUP_WINDOW_MS (10 min), so the title-dedup is untouched.
   //
   // Pruned BEFORE the doc is built, unlike the two below: `buildFile` applies the expiry to `nodes`
@@ -1954,10 +2431,28 @@ export async function flush(): Promise<void> {
   if (inboxEvents.some((e) => now - e.ts > EXPIRE_MS)) {
     inboxEvents = inboxEvents.filter((e) => now - e.ts <= EXPIRE_MS)
   }
+  // Age memory FIRST, with the same rule buildFile applies: an expired state is stripped to its
+  // identity (so no in-process reader — messaging, triggers, the resync — sees a 6 h-old state),
+  // and an identity past its TTL or for a node that no longer exists is dropped, so the map itself
+  // can't grow without bound.
+  // Ask for the live node set only when some entry is past EXPIRE_MS: only those can be pruned by
+  // existence, and the provider scans every project (it runs on every flush otherwise — each event
+  // burst plus the 60 s heartbeat).
+  let anyExpired = false
+  for (const e of state.values()) {
+    if (!e.hibernated && now - e.updatedAt > EXPIRE_MS) {
+      anyExpired = true
+      break
+    }
+  }
+  const liveIds = anyExpired ? safeLiveNodes() : undefined
+  for (const [id, e] of state) {
+    const aged = ageEntry(id, e, now, EXPIRE_MS, liveIds)
+    if (!aged) state.delete(id)
+    else if (aged !== e) state.set(id, aged)
+  }
   const inbox: MirrorInbox = { events: inboxEvents, nodes: Object.fromEntries(inboxNodes) }
-  const doc = buildFile(Object.fromEntries(state), now, undefined, safeSettings(), safeUsage(), inbox, safeServer())
-  // Also drop expired entries from memory so the map itself can't grow without bound.
-  for (const [id, e] of state) if (now - e.updatedAt > EXPIRE_MS) state.delete(id)
+  const doc = buildFile(Object.fromEntries(state), now, undefined, safeSettings(), safeUsage(), inbox, safeServer(), liveIds)
   // Prune stale per-node activity the same way (events stay — they are capped feed history).
   for (const [id, n] of inboxNodes) if (now - n.updatedAt > EXPIRE_MS) inboxNodes.delete(id)
   for (const cb of flushListeners) {
@@ -1978,6 +2473,7 @@ export async function flush(): Promise<void> {
 
 /** Reset all module state (in-memory map + config + listeners + inbox). Test-only. */
 export function _resetForTest(): void {
+  subagentReplay.clear()
   state.clear()
   if (sweepTimer) clearInterval(sweepTimer)
   sweepTimer = null
@@ -1988,6 +2484,7 @@ export function _resetForTest(): void {
   settingsProvider = null
   usageProvider = null
   serverProvider = null
+  liveNodesProvider = null
   inboxEvents = []
   inboxNodes.clear()
   inboxSeq = 0

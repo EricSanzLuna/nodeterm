@@ -12,11 +12,8 @@
  * installer): the property under test is what the REAL writer does to a REAL symlink, and a mock
  * of the writer is exactly the fixture that cannot discriminate.
  *
- * MUTATION: swap `installHooksInto`'s `writeFileSync` for an unlink-then-write, or for the atomic
- * write-temp-then-rename this repo uses for PUBLISHED files, and the symlink assertion reddens.
- * (Atomic rename is the right rule for a file we own and the wrong one here: `renameAtomic`
- * REPLACES the link with the temp file, which is the fork this test exists to prevent. That is
- * why `installHooksInto` is left writing in place — the file belongs to the CLI, not to us.)
+ * MUTATION: publish the staged config to the symlink path instead of its resolved target.
+ * The symlink assertion must fail: atomic publication is safe only at the shared target.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import {
@@ -34,6 +31,8 @@ import { initPlatform, resetPlatformForTests } from './platform'
 import { fakePlatform, type FakePlatform } from './platform-fake'
 import { IPC } from '../shared/ipc'
 import { registerClaudeAccountsIpc } from './claude-accounts-service'
+import { createIntegrationLifecycle, registerIntegrationLifecycle } from './agent-integrations'
+import { DEFAULT_SETTINGS } from '../shared/types'
 import { resetClaudeAccountsSourceForTests } from './claude-config-dir'
 
 let fake: FakePlatform
@@ -60,12 +59,21 @@ beforeEach(() => {
   process.env.USERPROFILE = root
   fake = fakePlatform({ userDataDir })
   initPlatform(fake)
+  // The consent lifecycle decides whether an account gets the hook (#744); claude is enabled here.
+  registerIntegrationLifecycle(
+    createIntegrationLifecycle({
+      settings: () => ({ ...DEFAULT_SETTINGS, agentIntegrations: { agents: { claude: 'enabled' }, origin: 'asked' } }),
+      userDataDir: () => userDataDir,
+      shims: () => ({ context: path.join(userDataDir, 'context-links', 'context.sh') })
+    })
+  )
   registerClaudeAccountsIpc()
 })
 afterEach(() => {
   if (realHome === undefined) delete process.env.HOME
   else process.env.HOME = realHome
   delete process.env.USERPROFILE
+  registerIntegrationLifecycle(null)
   resetPlatformForTests()
   resetClaudeAccountsSourceForTests()
   rmSync(root, { recursive: true, force: true })

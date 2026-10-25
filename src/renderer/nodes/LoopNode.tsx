@@ -1,4 +1,6 @@
+import { reportTextDelivery } from '../lib/textDelivery'
 import { useEffect, useRef } from 'react'
+import { IconChevronDown, IconChevronRight, IconClose, IconPlay } from '../components/icons'
 import { Handle, NodeResizer, Position, type NodeProps } from '@xyflow/react'
 import { NODE_MIN_SIZES } from '../lib/nodeSizing'
 import type { CanvasNode } from '../state/workspace'
@@ -31,7 +33,7 @@ export function LoopNode({ id, data, selected }: NodeProps<CanvasNode>) {
 
   const trigger = (e: React.MouseEvent) => {
     e.stopPropagation()
-    if (task) void api.pty.sendText(id.replace(/^loop-/, ''), task)
+    if (task) void api.pty.sendText(id.replace(/^loop-/, ''), task).then(reportTextDelivery)
   }
 
   // Manual dismiss: cron/schedule cards persist across turns/sessions/restarts, so a job
@@ -52,8 +54,10 @@ export function LoopNode({ id, data, selected }: NodeProps<CanvasNode>) {
   const select = () => useAgentNodes.getState().select(id)
 
   return (
+    <>
     <div onPointerDownCapture={select} className={`loop-node${active ? ' working' : ''}`}>
-      <NodeResizer isVisible={selected} minWidth={NODE_MIN_SIZES.loop.width} minHeight={NODE_MIN_SIZES.loop.height} color="#bf7af0" />
+      {/* Paint only: the old resize box in its old place (see .nt-resize-ghost in styles.css). */}
+      <NodeResizer isVisible={selected} color="var(--state-automation)" lineClassName="nt-resize-ghost" handleClassName="nt-resize-ghost" />
       <Handle type="target" position={Position.Top} isConnectable={false} />
       <div className="loop-node__head nodrag" onClick={toggle} style={{ cursor: 'pointer' }}>
         <button
@@ -64,7 +68,7 @@ export function LoopNode({ id, data, selected }: NodeProps<CanvasNode>) {
             toggle()
           }}
         >
-          {expanded ? '▾' : '▸'}
+          {expanded ? <IconChevronDown /> : <IconChevronRight />}
         </button>
         <span className="loop-node__dot" />
         <span className="loop-node__type">{label}</span>
@@ -72,7 +76,7 @@ export function LoopNode({ id, data, selected }: NodeProps<CanvasNode>) {
         {schedule && <span className="loop-node__sched">{schedule}</span>}
         {task && (
           <button className="loop-node__play" title="Run now (manual trigger)" onClick={trigger}>
-            ▶
+            <IconPlay />
           </button>
         )}
         <button
@@ -80,7 +84,7 @@ export function LoopNode({ id, data, selected }: NodeProps<CanvasNode>) {
           title="Dismiss card (does not remove the job)"
           onClick={dismiss}
         >
-          ×
+          <IconClose />
         </button>
       </div>
       {(task || schedule) && !expanded && <div className="loop-node__task">{task || schedule}</div>}
@@ -97,5 +101,12 @@ export function LoopNode({ id, data, selected }: NodeProps<CanvasNode>) {
         </div>
       )}
     </div>
+    {/* Sibling of the root, not a child: under Liquid Glass the root has a backdrop-filter,
+        which makes it the containing block for these absolute edges, so they were clipped and
+        covered (only the top edge stayed grabbable). Out here they sit on the node wrapper.
+        AFTER the root, never before it: focus mode reparents the root out of this wrapper, and
+        React inserting a control "before the root" would then throw NotFoundError. */}
+    <NodeResizer isVisible={selected} minWidth={NODE_MIN_SIZES.loop.width} minHeight={NODE_MIN_SIZES.loop.height} color="var(--state-automation)" />
+    </>
   )
 }

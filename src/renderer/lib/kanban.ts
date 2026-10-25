@@ -1,5 +1,16 @@
-import type { BoardLogAuthor, CanvasNodeState, KanbanAssignment, KanbanCardMeta, KanbanColumn, KanbanLabel, KanbanLabelColor, KanbanPriority, Project, ProjectKanban } from '@shared/types'
-import { NODE_COLORS } from '../state/workspace'
+import type {
+  CanvasNodeState, KanbanColumn, KanbanColumnCategory, Project, ProjectKanban
+} from '@shared/types'
+import { columnCategory } from '@shared/kanban-category'
+import { columnOrder, placeAssignment, type CardAnchor } from '@shared/kanban-order'
+import { SYSTEM_NODE_COLORS } from '../state/workspace'
+import { defaultKanbanFor } from '@shared/kanban-default-board'
+import { autoLabelColor, boardLabels, cardMeta, createLabel, metaList, setCardLabels } from '@shared/kanban-labels'
+import { prunePullLinks } from '@shared/kanban-pull-links'
+
+// The card-meta + label transforms live in `@shared/kanban-labels` (the host core applies the
+// same ones for the phone's label verb); re-exported so every renderer import stays as it was.
+export * from '@shared/kanban-labels'
 
 // Pure kanban board transforms — the ONLY place board structure changes. The UI computes
 // the next board here and hands it whole to setProjectKanban (no second live source).
@@ -10,21 +21,21 @@ import { NODE_COLORS } from '../state/workspace'
 const kid = (prefix: string): string => `${prefix}-${Math.random().toString(36).slice(2, 10)}`
 
 /** Default board for a project whose file has no `kanban` yet. NOT written to disk
- *  until the first user edit (the spec's lazy-default rule). */
-export function defaultKanban(): ProjectKanban {
-  return {
-    columns: [
-      { id: kid('kcol'), title: 'To Do', color: NODE_COLORS[0] },
-      { id: kid('kcol'), title: 'In Progress', color: NODE_COLORS[2] },
-      { id: kid('kcol'), title: 'Done', color: NODE_COLORS[1] }
-    ],
-    assignments: []
-  }
+ *  until the first user edit (the spec's lazy-default rule) — EXCEPT when the phone asks for one
+ *  outright (relay `projects.ensureBoard`), which seeds the same three columns from the same
+ *  shared definition so a board born on either surface is the same board.
+ *
+ *  Its column ids are DETERMINISTIC per project (`defaultKanbanFor`): every client renders this
+ *  board until someone edits it, and with boards syncing live two clients' first edits must land on
+ *  the same three columns, not six. So it takes the project it is the default OF — never pass the
+ *  active project's default for another project's board. */
+export function defaultKanban(projectId: string): ProjectKanban {
+  return defaultKanbanFor(projectId)
 }
 
 /** Color for the next added column — cycles the node palette. */
 export function nextColumnColor(k: ProjectKanban): string {
-  return NODE_COLORS[k.columns.length % NODE_COLORS.length]
+  return SYSTEM_NODE_COLORS[k.columns.length % SYSTEM_NODE_COLORS.length]
 }
 
 export function addColumn(k: ProjectKanban, title: string, color: string): ProjectKanban {
@@ -55,6 +66,26 @@ export function renameColumn(k: ProjectKanban, columnId: string, title: string):
 
 export function recolorColumn(k: ProjectKanban, columnId: string, color: string): ProjectKanban {
   return { ...k, columns: k.columns.map((c) => (c.id === columnId ? { ...c, color } : c)) }
+}
+
+/** Sets (or, with `undefined`, clears) a column's lifecycle category. Returns the SAME board when
+ *  nothing changes (unknown column, or the value it already reads as), so a caller can skip a
+ *  no-op persist. The UI confirms first when the column holds cards (`categoryChangeImpact`). */
+export function setColumnCategory(
+  k: ProjectKanban,
+  columnId: string,
+  category: KanbanColumnCategory | undefined
+): ProjectKanban {
+  const target = k.columns.find((c) => c.id === columnId)
+  if (!target || columnCategory(target) === columnCategory({ category })) return k
+  return {
+    ...k,
+    columns: k.columns.map((c) => {
+      if (c.id !== columnId) return c
+      const { category: _old, ...rest } = c
+      return category ? { ...rest, category } : rest
+    })
+  }
 }
 
 /** Moves a column before `beforeId` (null = to the end). */
@@ -90,9 +121,10 @@ export function deleteColumn(k: ProjectKanban, columnId: string): ProjectKanban 
   }
 }
 
-/** Node ids assigned to `columnId`, in board order. */
+/** Node ids assigned to `columnId`, in board order — rank first, array order for entries without
+ *  one (@shared/kanban-order). Every board reader goes through this. */
 export function assignedTo(k: ProjectKanban, columnId: string): string[] {
-  return k.assignments.filter((a) => a.columnId === columnId).map((a) => a.nodeId)
+  return columnOrder(k.assignments, columnId).map((a) => a.nodeId)
 }
 
 /**
@@ -122,15 +154,29 @@ export function unassigned(k: ProjectKanban, sessionIds: string[]): string[] {
   return sessionIds.filter((id) => !assigned.has(id))
 }
 
+/** The explicit "bottom of the column" anchor for `assignNode` — a drop BELOW the last card, or on
+ *  the column's empty space under its cards. Everything else that names no card lands at the top. */
+export const AT_COLUMN_END: unique symbol = Symbol('kanban.atColumnEnd')
+
 /** Assigns/moves a session card. `columnId` null = back to Ungrouped (assignment removed;
- *  Ungrouped order is canvas order, so `beforeNodeId` is ignored there). Inserts before
- *  `beforeNodeId`'s assignment when that assignment is in the target column, else at the
- *  end. Unknown target column is a no-op. */
+ *  Ungrouped order is canvas order, so the anchor is ignored there).
+ *
+ *  Placement in the destination column:
+ *  - `beforeNodeId` names a card IN that column → just above it;
+ *  - `AT_COLUMN_END` → at the bottom (only a positional drop asks for this);
+ *  - anything else — `null`, or a card that is not in that column — is UNANCHORED and lands at
+ *    the TOP. An unanchored move is "file this here" (the card menu, the agent `assign` verb, a
+ *    card created from a column): appended at the bottom of a long "Done" column, the card an
+ *    agent just finished read as having disappeared.
+ *
+ *  The move writes one `rank` and keeps the array in rank order (`placeAssignment`, which the
+ *  relay's move verb shares). Unknown target column, or a card already exactly there, returns the
+ *  SAME board. */
 export function assignNode(
   k: ProjectKanban,
   nodeId: string,
   columnId: string | null,
-  beforeNodeId: string | null
+  beforeNodeId: string | null | typeof AT_COLUMN_END
 ): ProjectKanban {
   if (nodeId === beforeNodeId) return k
   if (columnId === null) {
@@ -138,14 +184,10 @@ export function assignNode(
     return { ...k, assignments: k.assignments.filter((a) => a.nodeId !== nodeId) }
   }
   if (!k.columns.some((c) => c.id === columnId)) return k
-  const moved: KanbanAssignment = { nodeId, columnId }
-  const without = k.assignments.filter((a) => a.nodeId !== nodeId)
-  const before = beforeNodeId
-    ? without.find((a) => a.nodeId === beforeNodeId && a.columnId === columnId)
-    : undefined
-  const idx = before ? without.indexOf(before) : -1
-  const at = idx === -1 ? without.length : idx
-  return { ...k, assignments: [...without.slice(0, at), moved, ...without.slice(at)] }
+  const anchor: CardAnchor =
+    beforeNodeId === AT_COLUMN_END ? 'end' : typeof beforeNodeId === 'string' ? { before: beforeNodeId } : 'top'
+  const assignments = placeAssignment(k.assignments, nodeId, columnId, anchor)
+  return assignments === k.assignments ? k : { ...k, assignments }
 }
 
 /** Drops assignments of nodes that no longer exist. Returns the SAME object when nothing
@@ -156,8 +198,10 @@ export function pruneAssignments(k: ProjectKanban, liveIds: string[]): ProjectKa
   const meta = metaList(k).filter((m) => m && live.has(m.nodeId))
   const sameAssignments = assignments.length === k.assignments.length
   const sameMeta = meta.length === metaList(k).length
-  if (sameAssignments && sameMeta) return k
-  const next: ProjectKanban = { ...k, assignments }
+  // Pull request tombstones/opt-outs name cards too, and prune with them.
+  const pruned = prunePullLinks(k, live)
+  if (sameAssignments && sameMeta) return pruned
+  const next: ProjectKanban = { ...pruned, assignments }
   if (Array.isArray(k.meta)) {
     if (meta.length) next.meta = meta
     else delete next.meta
@@ -175,217 +219,6 @@ export function columnForNode(
   if (!k) return undefined
   const a = k.assignments.find((x) => x.nodeId === nodeId)
   return a ? k.columns.find((c) => c.id === a.columnId) : undefined
-}
-
-/** Tolerant read of a card's metadata — `meta` may be absent or (hand-edited) malformed. */
-export function cardMeta(k: ProjectKanban, nodeId: string): KanbanCardMeta | undefined {
-  if (!Array.isArray(k.meta)) return undefined
-  return k.meta.find((m) => m && m.nodeId === nodeId)
-}
-
-const metaList = (k: ProjectKanban): KanbanCardMeta[] => (Array.isArray(k.meta) ? k.meta : [])
-
-/** Writes one card's meta back; an entry with no fields left is DROPPED (absent = clean file),
- *  and an emptied meta array drops the key entirely. */
-function withCardMeta(
-  k: ProjectKanban,
-  nodeId: string,
-  next: Omit<KanbanCardMeta, 'nodeId'> | null
-): ProjectKanban {
-  const rest = metaList(k).filter((m) => m && m.nodeId !== nodeId)
-  const keep =
-    next &&
-    ((next.assignees?.length ?? 0) > 0 ||
-      next.dueAt !== undefined ||
-      next.priority !== undefined ||
-      (next.labels?.length ?? 0) > 0)
-  const meta = keep ? [...rest, { nodeId, ...next }] : rest
-  const { meta: _m, ...bare } = k
-  return meta.length ? { ...bare, meta } : bare
-}
-
-/** Adds the person to the card (or removes them if already assigned — matched by NAME, the
- *  presence identity's stable part; color is display-only and may drift per machine). */
-export function toggleAssignee(
-  k: ProjectKanban,
-  nodeId: string,
-  person: BoardLogAuthor
-): ProjectKanban {
-  const cur = cardMeta(k, nodeId)
-  const had = (cur?.assignees ?? []).some((a) => a.name === person.name)
-  const assignees = had
-    ? (cur?.assignees ?? []).filter((a) => a.name !== person.name)
-    : [...(cur?.assignees ?? []), person]
-  return withCardMeta(k, nodeId, {
-    assignees,
-    dueAt: cur?.dueAt,
-    priority: cur?.priority,
-    labels: cur?.labels
-  })
-}
-
-/** Sets (or clears, with null) the card's due timestamp. */
-export function setCardDue(k: ProjectKanban, nodeId: string, dueAt: number | null): ProjectKanban {
-  const cur = cardMeta(k, nodeId)
-  return withCardMeta(k, nodeId, {
-    assignees: cur?.assignees,
-    priority: cur?.priority,
-    labels: cur?.labels,
-    ...(dueAt === null ? {} : { dueAt })
-  })
-}
-
-/** Sets (or clears, with null) the card's priority. */
-export function setCardPriority(
-  k: ProjectKanban,
-  nodeId: string,
-  priority: KanbanPriority | null
-): ProjectKanban {
-  const cur = cardMeta(k, nodeId)
-  return withCardMeta(k, nodeId, {
-    assignees: cur?.assignees,
-    dueAt: cur?.dueAt,
-    labels: cur?.labels,
-    ...(priority === null ? {} : { priority })
-  })
-}
-
-// ── Board labels (Notion-style palette) ──────────────────────────────────────────────────────
-
-/** Ordered color palette for the picker (also the fallback order). Chip colors live in the UI
- *  (`kanbanLabelColors.ts`); this is the closed set of names only. */
-export const KANBAN_LABEL_COLORS: KanbanLabelColor[] = [
-  'default',
-  'gray',
-  'brown',
-  'orange',
-  'yellow',
-  'green',
-  'blue',
-  'purple',
-  'pink',
-  'red'
-]
-
-/** Normalize any read color to a known palette value ('default' for garbage from a hand-edited file). */
-export function labelColor(c: unknown): KanbanLabelColor {
-  return KANBAN_LABEL_COLORS.includes(c as KanbanLabelColor) ? (c as KanbanLabelColor) : 'default'
-}
-
-/** The board's label palette (defensive against a missing/garbage array), ids+names deduped-safe. */
-export function boardLabels(k: ProjectKanban): KanbanLabel[] {
-  if (!Array.isArray(k.labels)) return []
-  return k.labels.filter(
-    (l): l is KanbanLabel => !!l && typeof l.id === 'string' && typeof l.name === 'string'
-  )
-}
-
-/** The resolved labels applied to a card, in palette order, dropping ids with no matching label. */
-export function labelsForCard(k: ProjectKanban, nodeId: string): KanbanLabel[] {
-  const ids = cardMeta(k, nodeId)?.labels
-  if (!Array.isArray(ids) || !ids.length) return []
-  const set = new Set(ids)
-  return boardLabels(k).filter((l) => set.has(l.id))
-}
-
-/** Create a new board label; returns the next board AND the new id (so the caller can select it). */
-export function createLabel(
-  k: ProjectKanban,
-  name: string,
-  color: KanbanLabelColor
-): { k: ProjectKanban; id: string } {
-  const id = kid('klbl')
-  const label: KanbanLabel = { id, name: name.trim(), color: labelColor(color) }
-  return { k: { ...k, labels: [...boardLabels(k), label] }, id }
-}
-
-export function renameLabel(k: ProjectKanban, id: string, name: string): ProjectKanban {
-  return { ...k, labels: boardLabels(k).map((l) => (l.id === id ? { ...l, name: name.trim() } : l)) }
-}
-
-export function recolorLabel(k: ProjectKanban, id: string, color: KanbanLabelColor): ProjectKanban {
-  return {
-    ...k,
-    labels: boardLabels(k).map((l) => (l.id === id ? { ...l, color: labelColor(color) } : l))
-  }
-}
-
-/** Deletes a board label AND strips its id from every card's meta (no dangling references). */
-export function deleteLabel(k: ProjectKanban, id: string): ProjectKanban {
-  const labels = boardLabels(k).filter((l) => l.id !== id)
-  const meta = metaList(k)
-    .map((m) => (m?.labels?.includes(id) ? { ...m, labels: m.labels.filter((x) => x !== id) } : m))
-    // an entry emptied to nothing but the nodeId is dropped, matching withCardMeta's invariant
-    .filter(
-      (m) =>
-        (m.assignees?.length ?? 0) > 0 ||
-        m.dueAt !== undefined ||
-        m.priority !== undefined ||
-        (m.labels?.length ?? 0) > 0
-    )
-  const { labels: _l, meta: _m, ...bare } = k
-  return {
-    ...bare,
-    ...(labels.length ? { labels } : {}),
-    ...(meta.length ? { meta } : {})
-  }
-}
-
-/** Moves a label before `beforeId` (null = to the end) — the palette's display order. */
-export function reorderLabels(k: ProjectKanban, id: string, beforeId: string | null): ProjectKanban {
-  if (id === beforeId) return k
-  const labels = boardLabels(k)
-  const dragged = labels.find((l) => l.id === id)
-  if (!dragged) return k
-  const without = labels.filter((l) => l.id !== id)
-  const idx = beforeId ? without.findIndex((l) => l.id === beforeId) : -1
-  const at = idx === -1 ? without.length : idx
-  return { ...k, labels: [...without.slice(0, at), dragged, ...without.slice(at)] }
-}
-
-/** Toggle a label on a card (add if absent, remove if present). Preserves the card's other meta. */
-export function toggleCardLabel(k: ProjectKanban, nodeId: string, labelId: string): ProjectKanban {
-  const cur = cardMeta(k, nodeId)
-  const has = (cur?.labels ?? []).includes(labelId)
-  const labels = has
-    ? (cur?.labels ?? []).filter((x) => x !== labelId)
-    : [...(cur?.labels ?? []), labelId]
-  return withCardMeta(k, nodeId, {
-    assignees: cur?.assignees,
-    dueAt: cur?.dueAt,
-    priority: cur?.priority,
-    labels
-  })
-}
-
-/** Does a card pass the label filter? Empty filter = everything; otherwise the card must carry
- *  AT LEAST ONE of the selected labels (OR semantics, like Trello's default). */
-export function cardMatchesLabelFilter(
-  k: ProjectKanban,
-  nodeId: string,
-  filterIds: readonly string[]
-): boolean {
-  if (!filterIds.length) return true
-  const on = new Set(cardMeta(k, nodeId)?.labels ?? [])
-  return filterIds.some((id) => on.has(id))
-}
-
-/** Set a card's exact label list (dedup; empty drops the field/entry). */
-export function setCardLabels(k: ProjectKanban, nodeId: string, ids: string[]): ProjectKanban {
-  const cur = cardMeta(k, nodeId)
-  const labels = [...new Set(ids)]
-  return withCardMeta(k, nodeId, {
-    assignees: cur?.assignees,
-    dueAt: cur?.dueAt,
-    priority: cur?.priority,
-    ...(labels.length ? { labels } : {})
-  })
-}
-
-/** Auto-color for a created label: rotate the palette skipping 'default' (Notion-style). */
-export function autoLabelColor(k: ProjectKanban): KanbanLabelColor {
-  const colors = KANBAN_LABEL_COLORS.filter((c) => c !== 'default')
-  return colors[boardLabels(k).length % colors.length]
 }
 
 // ── Unification: legacy free-text node tags → board labels ────────────────────────────────────
@@ -431,7 +264,7 @@ export function migrateProjectTags(project: Project): Project {
   const nodeTags = tagged
     .map((n) => ({ nodeId: n.id, tags: (n.tags as string[]).filter((t) => t !== 'claude') }))
     .filter((x) => x.tags.length > 0)
-  const kanban = migrateTagsToLabels(project.kanban ?? defaultKanban(), nodeTags)
+  const kanban = migrateTagsToLabels(project.kanban ?? defaultKanban(project.id), nodeTags)
   const nodes: CanvasNodeState[] = project.nodes.map((n) => {
     if (!Array.isArray(n.tags) || !n.tags.length) return n
     const hadClaude = n.tags.includes('claude')

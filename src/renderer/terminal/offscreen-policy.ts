@@ -107,19 +107,10 @@ export function shouldDeferReleaseForLiveWork(i: LiveWorkInput): boolean {
   return wouldKillLiveWork(i)
 }
 
-/**
- * THE FIFTH LEVER (CLAUDE.md: "a fifth lever owes the same gate"): an ARMED node — one holding a
- * `pendingLaunch` for the canvas-control `--after` edge — has work a kill would strand, even though
- * nothing is running in it yet. The launch is delivered by session NAME (`sendText` → tmux
- * paste-buffer), so with tmux underneath a release is harmless: the client detaches, the session
- * stays typeable, and the launch still lands. On the plain-shell fallback the pty IS the shell, so
- * the same release destroys the pane the launch was going to be typed into, and nothing revives a
- * released node except the camera coming back — the launch is held until someone happens to look.
- * Same shape as `shouldDeferReleaseForLiveWork`, and uncapped for the same reason: what this waits
- * for (the launch firing, or the user disarming it) always ends the hold.
- */
+/** A held launch needs the attached transport for echo verification, including with tmux.
+ * Keep the view until submission/recovery rather than reverting to a blind paste by session name. */
 export function shouldDeferReleaseForHeldLaunch(i: { tmuxBacked: boolean; armed: boolean }): boolean {
-  return !i.tmuxBacked && i.armed
+  return i.armed
 }
 
 /**
@@ -164,7 +155,9 @@ export function shouldDeferReleaseForEco(i: {
   /**
    * Has ANY hook event been seen for this node in this app run (`lastEventAt` is set)? Without
    * one, `planHibernation` refuses the node outright — unknown idle is not idle — so there is
-   * nothing to wait for. See the header.
+   * nothing to wait for. See the header. The PERSISTED `agentStatus.lastSeen` clock deliberately
+   * does not count here (the caller reads `lastEventAt` only): it cannot make a node hibernatable,
+   * so it must not make its viewer wait for a hibernation either.
    */
   idleKnown: boolean
   /** How long this node has been continuously out of view. */

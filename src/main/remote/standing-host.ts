@@ -15,9 +15,9 @@
 //
 // The heavy lifting (relay wiring, RPC/frame handlers, fs jail, canvas mirror, approval gate) is
 // shared with the interactive host via `connectHostSession`. Pin/lookup logic is the pure,
-// unit-tested `approved-devices-core`.
+// unit-tested `approved-devices-core`; the pins live in the PHONE store (`phonePins`) and nowhere
+// else — the desktop relay roles have their own stores, which this module never reads.
 
-import { randomUUID } from 'crypto'
 import { dialog, ipcMain, type BrowserWindow } from 'electron'
 import { IPC } from '../../shared/ipc'
 import type { CanvasMutation, Settings } from '../../shared/types'
@@ -39,7 +39,16 @@ import { currentCanvas, initHostCanvasHub, subscribeCanvas } from './host-canvas
 import { hostIdFromPublicKeyB64 } from './relay-id'
 import { removeRelayAdvertisement, writeRelayAdvertisement } from './relay-advertise'
 import { isPinned, pinDevice } from './approved-devices-core'
-import { loadApprovedDevices, saveApprovedDevices } from './approved-devices'
+import { phonePins } from './approved-devices'
+import { registerPeerSessionKiller } from './peer-revoke'
+import { createPhoneApprovals } from '../../core/phone-approval'
+import {
+  POP_REFUSED_MESSAGE_DESKTOP,
+  computePopProof,
+  fetchPopChallenge,
+  popRefusalOf,
+  type PopRefusal
+} from '../../core/relay/relay-pop'
 
 // Re-mint the token this long before its expiry (TTL is ~120s). Floored so a bogus/short exp can't
 // spin us.
@@ -53,33 +62,116 @@ interface HostTokenResponse {
   pairingToken: string
   hostId: string
   exp: number
+  /** How long the token has left, measured on the SERVER's clock at mint time (see tokenTtlMs). */
+  ttlMs: number
+}
+
+/**
+ * How long a freshly minted token has left, in ms.
+ *
+ * `exp` is an absolute instant on the SERVER's clock. Subtracting the LOCAL `Date.now()` from it
+ * folds this machine's clock error into the answer: a clock 75 s fast leaves 120 − 75 = 45 s, minus
+ * the 30 s lead = the 15 s floor, so the host re-mints four times per TTL. Relay log, 2026-09-27: one
+ * host refreshing every 15 s, 238 mints/hour against a free limit of 240 — one stray mint from
+ * locking itself out for the rest of the hour. The response's own `Date` header is the server's
+ * clock at the same instant it computed `exp`, so the difference is clock-independent. It falls
+ * back to the local clock only when the header is missing or unparseable (a proxy that strips it).
+ */
+export function tokenTtlMs(exp: number, serverDate: string | null, localNowMs: number): number {
+  if (!(exp > 0)) return DEFAULT_TTL_MS
+  const serverNowMs = serverDate ? Date.parse(serverDate) : NaN
+  return exp * 1000 - (Number.isFinite(serverNowMs) ? serverNowMs : localNowMs)
 }
 
 /**
  * Mint a standing host token from the API. Pro proves entitlement; the free tier sends
  * its deviceId instead (backend admits it against the server-side free-tier policy —
  * until that ships, the mint fails and free hosting simply stays down, i.e. today's
- * behavior). Returns null on any failure.
+ * behavior).
+ *
+ * When the backend supports it, the mint also carries a proof that this process holds the host's
+ * secret key (relay-pop.ts), so a join code alone can no longer mint this host's tokens. Only a
+ * challenge answered 404/405 means "this backend predates the proof" and gets the legacy mint; any
+ * other challenge failure is transient and mints NOTHING: to a host the backend has seen prove
+ * before, an unproven mint is a 403, which would stop hosting over a blip.
+ *
+ * Returns `{ refused }` for a key-proof refusal and null for every other failure (the caller backs
+ * off and retries). This function stays stateless: the caller counts refusals and stops hosting
+ * only on the second in a row (see `popRefusals` in initStandingHost). One 403 is not a refusal at
+ * all: `pop_required` for a mint sent WITHOUT a proof because the challenge said 404/405. A
+ * reverse proxy answers 404 while the backend redeploys, and the unproven mint that follows can land
+ * on the fresh backend; stopping there would end hosting for good over a redeploy, so it backs off
+ * and the next attempt asks for a challenge again.
  */
 async function mintHostToken(
   entitlement: string | null,
-  hostPublicKeyB64: string
-): Promise<HostTokenResponse | null> {
+  keys: KeyPair
+): Promise<HostTokenResponse | { refused: PopRefusal } | null> {
+  const hostPublicKeyB64 = publicKeyToB64(keys.publicKey)
+  // Read ONCE: the proof's subject must be the exact id the body sends. On a first launch
+  // getDeviceId() mints a uuid and writes it asynchronously, so a second call before that write
+  // lands mints another one, and the backend would refuse the pair as pop_invalid (a key-proof
+  // refusal, which stops phone access when it repeats).
+  const deviceId = entitlement ? null : getDeviceId()
+  const base = entitlement ? { entitlement, hostPublicKeyB64 } : { deviceId, hostPublicKeyB64 }
   const ctrl = new AbortController()
+  // One timer for the whole mint: the challenge, the host-token request and its body read.
   const timer = setTimeout(() => ctrl.abort(), 8000)
   try {
+    const ch = await fetchPopChallenge({
+      apiBase: API_BASE,
+      hostPublicKeyB64,
+      purpose: 'host-token',
+      signal: ctrl.signal
+    })
+    if (!ch.ok && !ch.unsupported) return null // transient: back off, never mint unproven
+    // True only when the challenge said 404/405: the one case this mint goes out unproven although
+    // we hold the key (see the header on what a pop_required then means).
+    const sentUnproven = !ch.ok && ch.unsupported
+    let proof: { popChallenge: string; popProof: string } | null = null
+    if (ch.ok) {
+      try {
+        proof = {
+          popChallenge: ch.challenge,
+          popProof: computePopProof({
+            hostSecretKey: keys.secretKey,
+            hostPublicKeyB64,
+            challenge: ch.challenge,
+            serverPublicKeyB64: ch.serverPublicKeyB64,
+            purpose: 'host-token',
+            // The backend proves host-token against `body.deviceId ?? ''`: '' on the Pro path.
+            subject: deviceId ?? ''
+          })
+        }
+      } catch {
+        // A server key the proof cannot use (malformed, or low-order): back off, never mint.
+        return null
+      }
+    }
     const res = await fetch(`${API_BASE}/v1/relay/host-token`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(
-        entitlement ? { entitlement, hostPublicKeyB64 } : { deviceId: getDeviceId(), hostPublicKeyB64 }
-      ),
+      // popChallenge and popProof travel together or not at all: the backend treats a half-present
+      // proof as pop_invalid, which would repeat on every retry and so stop phone access.
+      body: JSON.stringify({ ...base, ...(proof ?? {}) }),
       signal: ctrl.signal
     })
+    if (res.status === 403) {
+      const refused = popRefusalOf(403, await res.json().catch(() => null))
+      // A backend that came back mid-redeploy (see the header): transient, not a refusal.
+      if (refused === 'pop_required' && sentUnproven) return null
+      if (refused) return { refused }
+    }
     if (!res.ok) return null
     const json = (await res.json().catch(() => ({}))) as Partial<HostTokenResponse>
     if (!json.pairingToken) return null
-    return { pairingToken: json.pairingToken, hostId: json.hostId ?? '', exp: json.exp ?? 0 }
+    const exp = json.exp ?? 0
+    return {
+      pairingToken: json.pairingToken,
+      hostId: json.hostId ?? '',
+      exp,
+      ttlMs: tokenTtlMs(exp, res.headers?.get?.('date') ?? null, Date.now())
+    }
   } catch {
     return null
   } finally {
@@ -111,6 +203,24 @@ function reportKeyLocked(err: Error): void {
     // No dialog available (headless / very early boot): the console line is the fallback.
   }
   console.error('[standing-host] host identity is locked:', err.message)
+}
+
+/**
+ * The relay refused this host's key proof twice in a row, each time on a fresh challenge
+ * (`pop_invalid`, or `pop_required` on a proven mint). It will keep refusing, so hosting stops and
+ * the human is told, once, what to do — instead of phone access going quietly dead, or a retry
+ * loop spending the host's mints. The kind goes to the log only; the dialog text is fixed.
+ */
+function reportPopRefused(kind: PopRefusal): void {
+  try {
+    dialog.showErrorBox(
+      'Remote access stopped',
+      `${POP_REFUSED_MESSAGE_DESKTOP}\n\nPhone access is off. Turn it back on in Settings → Phone after updating.`
+    )
+  } catch {
+    // No dialog available (headless / very early boot): the console line is the fallback.
+  }
+  console.error(`[standing-host] the relay refused this host key proof twice in a row (${kind})`)
 }
 
 export interface StandingHost {
@@ -150,7 +260,6 @@ export function initStandingHost(
     /** Per-session pending approval (unknown device awaiting the human's SAS decision). */
     approvalPub: string | null
     approvalId: string | null
-    approvalTimer: ReturnType<typeof setTimeout> | null
     refreshTimer: ReturnType<typeof setTimeout> | null
   }
 
@@ -160,6 +269,11 @@ export function initStandingHost(
   const pool = new Set<Pooled>()
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
   let reconnectAttempt = 0
+  // Key-proof refusals since the last successful mint or start(). Only the SECOND in a row is
+  // terminal: a POP_SECRET rotation, or a secret mismatch between backend instances, inside one
+  // challenge→mint pair refuses an honest host once, and stopping there would leave every host that
+  // was mid-mint at that moment off until someone turned phone access back on by hand.
+  let popRefusals = 0
 
   function send(channel: string, ...args: unknown[]): void {
     if (!win.isDestroyed()) win.webContents.send(channel, ...args)
@@ -177,17 +291,13 @@ export function initStandingHost(
   // deliberately does NOT fire onClose. `PhonePresence.leave()` (shared with the interactive host)
   // is exactly-once, so a peer never leaves twice (its color is never freed for someone else).
 
-  function clearApproval(p: Pooled): void {
-    if (p.approvalTimer) {
-      clearTimeout(p.approvalTimer)
-      p.approvalTimer = null
-    }
-    p.approvalPub = null
-    p.approvalId = null
-  }
+  const approvals = createPhoneApprovals({
+    persist: (pub) => phonePins.update((store) => pinDevice(store, pub)),
+    cleared: (id) => send(IPC.remoteHostPeerPendingCleared, { id })
+  })
 
   function removeFromPool(p: Pooled): void {
-    clearApproval(p)
+    if (p.approvalId) approvals.clear(p.approvalId)
     p.presence.leave()
     if (p.refreshTimer) {
       clearTimeout(p.refreshTimer)
@@ -195,15 +305,6 @@ export function initStandingHost(
     }
     pool.delete(p)
     p.session.close()
-  }
-
-  // The peer's box key is STABLE across the phone's reconnect churn while the per-attach id
-  // dies with each socket, so an Approve clicked mid-retry still lands when matched by pub
-  // (issue #372's race note). The id stays as the exact-match fallback.
-  function findPending(msg: { id?: string; pub?: string }): Pooled | null {
-    if (msg.pub) for (const p of pool) if (p.approvalPub && p.approvalPub === msg.pub) return p
-    if (msg.id) for (const p of pool) if (p.approvalId && p.approvalId === msg.id) return p
-    return null
   }
 
   /** Keep the pool topped up with TARGET_PENDING un-bridged listeners. */
@@ -222,18 +323,26 @@ export function initStandingHost(
     reconnectTimer.unref?.()
   }
 
-  function scheduleRefreshFor(p: Pooled, exp: number): void {
+  function scheduleRefreshFor(p: Pooled, ttlMs: number): void {
     if (p.refreshTimer) clearTimeout(p.refreshTimer)
-    const untilExpMs = exp > 0 ? exp * 1000 - Date.now() : DEFAULT_TTL_MS
-    const delay = Math.max(MIN_REFRESH_MS, untilExpMs - REFRESH_LEAD_MS)
+    const delay = Math.max(MIN_REFRESH_MS, ttlMs - REFRESH_LEAD_MS)
     p.refreshTimer = setTimeout(() => {
       p.refreshTimer = null
       if (!running || !pool.has(p)) return
+      // This listener held its relay registration for a whole token lifetime: the relay is
+      // reachable, so the reconnect backoff has done its job. This — not a successful mint — is
+      // what resets it (see connectOne).
+      reconnectAttempt = 0
       // A listener serving a client (bridged) is left alone — never cut an active session for a
-      // token refresh; the relay drops it at TTL and onClose replaces it. Only an IDLE listener is
-      // re-minted with a fresh token by dropping it and topping the pool back up.
+      // token refresh. nodeterm-server's relay broker never expires or evicts a bridged socket: it
+      // closes only an UNBRIDGED listener, at its token's exp + 30 s (and evicts the oldest past 8
+      // pending per host). If a bridged socket closes anyway, onClose replaces it. Only an IDLE
+      // listener is re-minted with a fresh token by dropping it and topping the pool back up. That
+      // refresh fires 30 s before exp, so it has 60 s of slack: a timer that runs later than that
+      // (sleep, App Nap) finds the relay already closed the listener, and onClose's reconnect backoff
+      // brings a new one up.
       if (p.bridged) {
-        scheduleRefreshFor(p, 0)
+        scheduleRefreshFor(p, DEFAULT_TTL_MS)
         return
       }
       removeFromPool(p)
@@ -247,6 +356,7 @@ export function initStandingHost(
   async function onPeerReady(pooled: Pooled): Promise<void> {
     if (!pooled.bridged) {
       pooled.bridged = true
+      reconnectAttempt = 0 // a completed handshake proves the relay leg end to end
       // Team presence: a bridged relay client is a peer. It has no mouse, so it stays cursorless
       // and appears in the facepile only — see docs/team-presence.md ("Peers may have no cursor").
       pooled.presence.join()
@@ -256,7 +366,7 @@ export function initStandingHost(
     const pub = s.peerPublicKeyB64()
     let store
     try {
-      store = await loadApprovedDevices()
+      store = await phonePins.load()
     } catch {
       store = { pubkeys: [] as string[] }
     }
@@ -265,31 +375,24 @@ export function initStandingHost(
       s.approve() // pinned device → auto-approve silently
       return
     }
-    // Unknown device → require the host human's approval (shared SAS dialog). Remember the pubkey +
-    // a fresh id on THIS pooled session, so approval pins it even if the phone's browse socket
-    // closes first, and only the matching approve id acts on it.
+    // Keep the handshake-bound consent record after a browse socket closes (#819). The
+    // human may still compare its SAS and pin this exact identity until the bounded deadline.
+    if (!pub || !s.sas()) return // never offer consent without a verified handshake identity
     pooled.approvalPub = pub
-    pooled.approvalId = randomUUID()
-    if (pooled.approvalTimer) clearTimeout(pooled.approvalTimer)
-    pooled.approvalTimer = setTimeout(() => {
-      const expiredId = pooled.approvalId
-      pooled.approvalPub = null
-      pooled.approvalId = null
-      pooled.approvalTimer = null
-      // Tell the renderer the prompt died — without this the dialog outlives the id and
-      // Approve becomes a silent no-op (issue #372).
-      send(IPC.remoteHostPeerPendingCleared, { id: expiredId, pub })
-    }, 120_000)
-    pooled.approvalTimer.unref?.()
-    // `pub` rides along so the renderer can key the dialog on the STABLE device identity: a
-    // retry-churning phone re-raises this event with a fresh id but the same pub + SAS, and
-    // the open dialog just updates in place instead of flashing.
-    send(IPC.remoteHostPeerPending, { sas: s.sas(), id: pooled.approvalId, pub })
+    pooled.approvalId = approvals.add(pub)
+    send(IPC.remoteHostPeerPending, {
+      sas: s.sas(), id: pooled.approvalId, pub, standing: true
+    })
   }
 
   async function connectOne(): Promise<void> {
     if (!running || opening || pendingCount() >= TARGET_PENDING) return
     opening = true
+    // Only a SUCCESSFUL attempt may chain straight into the next one. A failed one has armed
+    // scheduleReconnect()'s backoff, and chaining anyway made that backoff dead code: a host whose
+    // mint was refused re-minted at its own round-trip time (~175 ms, 35k 429s/day in the relay
+    // API log, 2026-09-25) instead of waiting 1 s → 15 s.
+    let opened = false
     try {
       const entitlement = getStoredEntitlement() // null on free tier → mint by deviceId
       // The host key is the identity every paired phone PINNED. If the OS keyring is locked we
@@ -308,20 +411,37 @@ export function initStandingHost(
         scheduleReconnect() // transient disk error: back off and try again
         return
       }
-      const token = await mintHostToken(entitlement, publicKeyToB64(keys.publicKey))
+      const token = await mintHostToken(entitlement, keys)
       if (!running) return
+      if (token && 'refused' in token) {
+        popRefusals += 1
+        if (popRefusals >= 2) {
+          // Terminal: every retry would be refused the same way. stop() clears any armed reconnect.
+          stop()
+          reportPopRefused(token.refused)
+          return
+        }
+        console.warn(`[standing-host] the relay refused this host key proof (${token.refused}); retrying with a fresh challenge`)
+        scheduleReconnect()
+        return
+      }
       if (!token) {
         scheduleReconnect()
         return
       }
-      reconnectAttempt = 0
+      popRefusals = 0 // a successful mint: the key proof is accepted
+      // NOT `reconnectAttempt = 0` here. A mint proves only that the API answered — the relay is a
+      // different host, and when it is unreachable from this machine (relay log, 2026-09-27: a host
+      // on the fixed build, API fine, relay WS failing for 2½ minutes) every mint succeeds, every
+      // socket dies at once, and a reset here made each death re-mint at round-trip speed until the
+      // API's per-IP limit answered 429. The backoff resets on proof the relay leg works instead:
+      // a listener surviving to its refresh, or a completed phone handshake.
       const pooled: Pooled = {
         session: null as unknown as HostSession,
         bridged: false,
         presence: createPhonePresence(),
         approvalPub: null,
         approvalId: null,
-        approvalTimer: null,
         refreshTimer: null
       }
       pooled.session = connectHostSession({
@@ -338,23 +458,33 @@ export function initStandingHost(
         destroyNode: bridge.destroyNode,
         remoteViewer: bridge.remoteViewer,
         nodeActions: bridge.nodeActions,
+        kanban: bridge.kanban,
+        chat: bridge.chat,
+        relayExtras: bridge.relayExtras,
         extraRoots: bridge.workspaceRoots,
         // Typing attribution: this pooled session's input frames are ITS phone's keystrokes.
         getClientId: () => pooled.presence.id(),
         onPeerReady: () => void onPeerReady(pooled),
         onClose: () => {
-          clearApproval(pooled)
+          console.info('[phone-approval] socket-closed', { pending: !!pooled.approvalId })
           pooled.presence.leave()
           if (pooled.refreshTimer) {
             clearTimeout(pooled.refreshTimer)
             pooled.refreshTimer = null
           }
           pool.delete(pooled)
-          ensurePool() // a listener/session dropped → top the pool back up
+          // A session a phone was using ended: its replacement listener was already opened in
+          // onPeerReady, so topping up is normally a no-op. An IDLE listener dropping on its own is
+          // different — our refresh closes intentionally (no onClose), so this is the relay
+          // refusing or unreachable, and re-minting at once is the tight loop the backoff exists
+          // to prevent.
+          if (pooled.bridged) ensurePool()
+          else scheduleReconnect()
         }
       })
       pool.add(pooled)
-      scheduleRefreshFor(pooled, token.exp)
+      opened = true
+      scheduleRefreshFor(pooled, token.ttlMs)
       // A listener is registered at the relay → advertise the identity for LATE ADOPTION
       // (~/.nodeterm/relay.json — see relay-advertise.ts): a phone whose pairing predates the
       // toggle reads it over its SSH bootstrap and gains a relay leg without re-pairing.
@@ -370,19 +500,38 @@ export function initStandingHost(
     } finally {
       opening = false
       // If we're still short (e.g. TARGET_PENDING > 1, or one was consumed while minting), continue.
-      if (running && pendingCount() < TARGET_PENDING) queueMicrotask(() => void connectOne())
+      if (opened && running && pendingCount() < TARGET_PENDING) queueMicrotask(() => void connectOne())
     }
   }
+
+  // Revocation (peer-revoke.ts): cut every pooled session held by a matching key — bridged or still
+  // awaiting SAS — and drop any pending consent for it, including one whose socket already closed
+  // (#819 keeps those alive for the SAS deadline). Otherwise a phone "Remove" would leave the removed
+  // phone in its shell until the socket dropped, or let an open dialog re-pin it afterwards.
+  registerPeerSessionKiller('phone', (match) => {
+    approvals.clearWhere(match)
+    let cut = false
+    for (const p of [...pool]) {
+      const key = p.session.peerPublicKeyB64()
+      if (key && match(key)) {
+        removeFromPool(p)
+        cut = true
+      }
+    }
+    if (cut) ensurePool()
+  })
 
   function start(): void {
     if (running) return
     running = true
     reconnectAttempt = 0
+    popRefusals = 0
     ensurePool()
   }
 
   function stop(): void {
     running = false
+    approvals.stop()
     if (reconnectTimer) {
       clearTimeout(reconnectTimer)
       reconnectTimer = null
@@ -399,28 +548,31 @@ export function initStandingHost(
     else if (!want && running) stop()
   }
 
-  // Host human approved / rejected a pending phone (by its pending id). Shared with the interactive
-  // host; the id scoping means each acts only on its own pending session.
-  ipcMain.on(IPC.remoteHostApprove, (_e, msg: { id?: string; pub?: string } = {}) => {
-    const p = findPending(msg ?? {})
-    if (!p) return
-    // Pin the DEVICE (its stable box key), whether or not its session is still live — the phone's
-    // browse socket may have already closed. Prefer the live peer's key, else the remembered one.
-    const pub = p.session.peerPublicKeyB64() ?? p.approvalPub
-    clearApproval(p)
-    if (pub) {
-      void loadApprovedDevices()
-        .then((store) => saveApprovedDevices(pinDevice(store, pub)))
-        .catch(() => {
-          // A failed pin is non-fatal: the device re-prompts next connect. Never block on the write.
-        })
+  // Dedicated request/reply channel: a missing IPC handler rejects instead of silently
+  // discarding consent. Never expose this host-security operation through the relay RPC bridge.
+  ipcMain.handle(IPC.remotePhoneApprove, async (event, msg: { id?: string; pub?: string }) => {
+    if (event.sender !== win.webContents) return { status: 'stale' as const }
+    console.info('[phone-approval] received')
+    const result = await approvals.approve(msg)
+    console.info('[phone-approval] result', result.status)
+    if (result.status !== 'persisted') return result
+    let connected = false
+    for (const p of pool) {
+      if (p.bridged && p.session.peerPublicKeyB64() === msg.pub) {
+        if (p.approvalId) approvals.clear(p.approvalId)
+        p.approvalId = null
+        p.approvalPub = null
+        p.session.approve()
+        connected = true
+      }
     }
-    p.session.approve()
+    return { status: connected ? 'approved' as const : 'saved-disconnected' as const }
   })
-  ipcMain.on(IPC.remoteHostReject, (_e, msg: { id?: string; pub?: string } = {}) => {
-    const p = findPending(msg ?? {})
-    if (!p) return
-    removeFromPool(p) // drop this rejected session
+  ipcMain.on(IPC.remoteHostReject, (event, msg: { id?: string; pub?: string } = {}) => {
+    if (event.sender !== win.webContents || !approvals.reject(msg)) return
+    for (const p of [...pool]) {
+      if (p.approvalPub === msg.pub) removeFromPool(p)
+    }
     ensurePool()
   })
 

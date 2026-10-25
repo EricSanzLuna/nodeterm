@@ -37,17 +37,18 @@
  *     `--remote` dies on a clap usage error after that exec, where there is no fallback left. So
  *     it is answered here, once per app run, entirely off the launch path.
  *
- * SERVER EDITION: `src/server` deliberately registers this and answers `false` — see the comment
- * at its registration site. That is what makes "Server Edition runs plain codex" a decision rather
- * than an accident.
+ * SERVER EDITION: `src/server` registers the same async answer after arming its raw-0600 node
+ * secret. The shared identity is core-owned and local on that host; no Electron primitive is
+ * required.
  */
 import { execFile } from 'child_process'
 import { accessSync, constants } from 'fs'
 import path from 'path'
 import { promisify } from 'util'
 import { IPC } from '../shared/ipc'
+import { directExecutableInvocation } from './exec-path'
 import { platform } from './platform'
-import { type CodexIdentityCaps } from '../shared/types'
+import { UNKNOWN_CODEX_IDENTITY_CAPS, type CodexIdentityCaps } from '../shared/types'
 import { installCodexLauncher, codexThreadIdentityAvailable } from './codex-identity-proxy'
 import { codexHome } from './usage/codex-usage'
 import { findInLoginPath } from './pty-manager'
@@ -115,26 +116,41 @@ export function codexCliSupportsRemote(...helpOutputs: Array<string | null | und
   return helpOutputs.some((h) => /(^|\s)--remote(\s|=|$)/m.test(h ?? ''))
 }
 
-async function probeRemoteFlag(): Promise<boolean> {
+export async function probeCodexRemoteFlagAt(bin: string): Promise<boolean> {
   try {
-    // GUI apps don't inherit the shell PATH — resolve through the login shell like every other
-    // CLI lookup in the app (pty-manager, claude-cli, commit-message).
-    const bin = await findInLoginPath('codex')
-    if (!bin) return false
-    const help = await execFileP(bin, ['--help'], { timeout: PROBE_TIMEOUT_MS })
-      .then((r) => r.stdout)
-      .catch(() => null)
+    const helpInvocation = directExecutableInvocation(bin, ['--help'])
+    const help = helpInvocation
+      ? await execFileP(helpInvocation.executable, helpInvocation.args, {
+          ...helpInvocation.options,
+          timeout: PROBE_TIMEOUT_MS
+        })
+          .then((r) => r.stdout)
+          .catch(() => null)
+      : null
     if (codexCliSupportsRemote(help)) return true
     // Some CLIs list a global flag only under the subcommand that takes it. One extra spawn, paid
     // once per app run and only when the top-level help did not already answer yes.
-    const resumeHelp = await execFileP(bin, ['resume', '--help'], { timeout: PROBE_TIMEOUT_MS })
-      .then((r) => r.stdout)
-      .catch(() => null)
+    const resumeInvocation = directExecutableInvocation(bin, ['resume', '--help'])
+    const resumeHelp = resumeInvocation
+      ? await execFileP(resumeInvocation.executable, resumeInvocation.args, {
+          ...resumeInvocation.options,
+          timeout: PROBE_TIMEOUT_MS
+        })
+          .then((r) => r.stdout)
+          .catch(() => null)
+      : null
     return codexCliSupportsRemote(resumeHelp)
   } catch {
     // Missing CLI, timeout, non-zero exit — all mean "unknown", which means "no shared identity".
     return false
   }
+}
+
+async function probeRemoteFlag(): Promise<boolean> {
+  // GUI apps don't inherit the shell PATH — resolve through the login shell like every other
+  // CLI lookup in the app (pty-manager, claude-cli, commit-message).
+  const bin = await findInLoginPath('codex')
+  return bin ? probeCodexRemoteFlagAt(bin) : false
 }
 
 let latest: CodexIdentityCaps | null = null
@@ -155,15 +171,27 @@ let announce: ((c: CodexIdentityCaps) => void) | null = null
  */
 export async function refreshCodexIdentityCaps(
   probeRemote: () => Promise<boolean> = probeRemoteFlag,
-  probeAppServer: () => boolean | Promise<boolean> = codexManagedRuntimeInstalled
+  probeAppServer: () => boolean | Promise<boolean> = codexManagedRuntimeInstalled,
+  platformName: NodeJS.Platform | string = process.platform
 ): Promise<CodexIdentityCaps> {
-  const appServer = await Promise.resolve()
-    .then(() => probeAppServer())
-    .catch(() => false)
-  const remoteFlag = appServer ? await probeRemote() : false
-  const launcher =
-    appServer && remoteFlag && codexThreadIdentityAvailable() ? installCodexLauncher() : null
-  latest = { shared: !!launcher, launcherPath: launcher, remoteFlag, appServer }
+  if (platformName === 'win32') {
+    // Windows, phase 1: a DELIBERATE off, said out loud. It used to be off by accident — the stat
+    // looks for an extensionless `codex` (the Windows runtime would be `codex.exe`) and the launcher
+    // is an `sh` script PowerShell/cmd cannot resolve by name — with nothing telling the user. The
+    // early return also guarantees `installCodexLauncher` never drops an sh launcher onto a Windows
+    // PATH should a later release ship an extensionless `codex`. Lifting it needs device facts
+    // first (standalone `codex.exe` layout, the daemon's control channel, `--remote`) and a
+    // non-sh launcher; see docs/codex-shared-identity.md ("Windows").
+    latest = { ...UNKNOWN_CODEX_IDENTITY_CAPS, unavailableReason: 'unsupported-platform' }
+  } else {
+    const appServer = await Promise.resolve()
+      .then(() => probeAppServer())
+      .catch(() => false)
+    const remoteFlag = appServer ? await probeRemote() : false
+    const launcher =
+      appServer && remoteFlag && codexThreadIdentityAvailable() ? installCodexLauncher() : null
+    latest = { shared: !!launcher, launcherPath: launcher, remoteFlag, appServer }
+  }
   if (announce) {
     announce(latest)
     announce = null

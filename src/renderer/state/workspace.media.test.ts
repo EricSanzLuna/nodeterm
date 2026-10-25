@@ -2,12 +2,39 @@ import { describe, it, expect } from 'vitest'
 import {
   createVideoNode,
   createWebNode,
+  fileViewerKind,
+  isHtmlFile,
   isVideoFile,
   nodeStatesToFlow,
   flowToNodeStates
 } from './workspace'
 
 describe('video/web nodes', () => {
+  it('isHtmlFile matches local page extensions only', () => {
+    expect(isHtmlFile('/a/b/report.html')).toBe(true)
+    expect(isHtmlFile('/a/b/REPORT.HTM')).toBe(true)
+    expect(isHtmlFile('/a/b/readme.md')).toBe(false)
+    expect(isHtmlFile('/a/b/report.pdf')).toBe(false)
+  })
+
+  it('routes generated documents to their built-in canvas viewers', () => {
+    const view = { renderHtml: true }
+    expect(fileViewerKind('/tmp/page.html', view)).toBe('web')
+    expect(fileViewerKind('/tmp/page.htm', view)).toBe('web')
+    expect(fileViewerKind('/tmp/interview.mp3', view)).toBe('video')
+    expect(fileViewerKind('/tmp/notes.md', view)).toBe('editor')
+    expect(fileViewerKind('/tmp/report.pdf', view)).toBe('editor')
+    expect(fileViewerKind('/tmp/screenshot.png', view)).toBe('editor')
+  })
+
+  it('keeps .html in the editor unless a LOCAL view was asked for', () => {
+    // Explorer / ⌘K / files node: .html means "edit the source".
+    expect(fileViewerKind('/tmp/page.html')).toBe('editor')
+    expect(fileViewerKind('/tmp/interview.mp3')).toBe('video')
+    // An SSH project's page lives on the host; a WebNode can only serve this machine's disk.
+    expect(fileViewerKind('/tmp/page.html', { renderHtml: true, sshFs: true })).toBe('editor')
+  })
+
   it('isVideoFile matches common video extensions, not images', () => {
     expect(isVideoFile('/a/b/clip.mp4')).toBe(true)
     expect(isVideoFile('/a/b/CLIP.WEBM')).toBe(true)
@@ -39,4 +66,27 @@ describe('video/web nodes', () => {
     expect(v.data.filePath).toBe('/clips/demo.mp4')
     expect(w.data.url).toBe('http://localhost:5173')
   })
+})
+
+describe('audio routing', () => {
+  it('routes local and remote audio to the existing media node kind', async () => {
+    const { isAudioFile, isMediaFile } = await import('./workspace')
+    const { fileOpenTarget } = await import('../lib/filesNode')
+    for (const path of ['/host/song.mp3', String.raw`C:\Music\SONG.FLAC`, '/host/sound.m4a', '/host/sound.opus']) {
+      expect(isAudioFile(path)).toBe(true)
+      expect(isMediaFile(path)).toBe(true)
+      expect(fileOpenTarget(path)).toBe('canvas')
+      expect(fileOpenTarget(path, { remote: true })).toBe('canvas')
+      expect(nodeStatesToFlow(flowToNodeStates([createVideoNode(0, path, undefined, true)]))[0].data.filePath).toBe(path)
+    }
+    expect(isAudioFile('/x.mp4')).toBe(false)
+    expect(isMediaFile('/x.txt')).toBe(false)
+  })
+})
+
+it('repairs a legacy audio editor on reload without changing its identity or SSH ownership', () => {
+  const node = nodeStatesToFlow(flowToNodeStates([{ ...createVideoNode(0, '/host/a.mp3', undefined, true), id: 'legacy', type: 'editor' }]))[0]
+  expect(node.type).toBe('video')
+  expect(node.id).toBe('legacy')
+  expect(node.data.sshFs).toBe(true)
 })

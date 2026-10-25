@@ -7,6 +7,8 @@ import type {
   TerminalCursorStyle
 } from '@shared/types'
 import { isWindowsPlatform } from '@shared/platform-utils'
+import { xtermScrollback } from '@shared/scrollback'
+import { toXtermText } from '@shared/capture-paint'
 import { isKnownTerminalThemeId, resolveTerminalTheme } from './themes'
 
 /**
@@ -145,25 +147,18 @@ export function shouldApplyResync(screen: string | null | undefined): screen is 
   return typeof screen === 'string' && screen.length > 0
 }
 
-/** Hard cap on xterm's in-memory scrollback: the cost is per node and one canvas holds many. */
-export const XTERM_SCROLLBACK_MAX = 10000
-
 /**
- * Floor, mirroring the tmux conf's own `history-limit ${Math.max(1000, scrollback)}`, so the two
- * buffers never disagree at the low end.
- */
-export const XTERM_SCROLLBACK_MIN = 1000
-
-/**
- * How many scrollback lines xterm keeps. The WHEEL scrolls tmux (its mouse is on, and the pane is
+ * Scrollback bounds now live in `@shared/scrollback` (the Windows session host's emulator uses the
+ * same cap). Re-exported so existing renderer imports keep working.
+ *
+ * How many scrollback lines xterm keeps: the WHEEL scrolls tmux (its mouse is on, and the pane is
  * on the alternate screen), so this buffer is not what the user scrolls in a tmux session — it is
- * the fallback for a session with no tmux (a plain shell) and the room a cold-restore snapshot
- * replay needs. xterm's default of 1000 lines is too small for the latter, so it follows the same
- * `settings.tmuxScrollback` the user picked for tmux's history-limit, floored and capped.
+ * the fallback for a session with no tmux (a plain shell, the Windows session host) and the room a
+ * cold-restore snapshot replay needs. It follows `settings.tmuxScrollback`, floored and capped.
  */
-export function xtermScrollback(tmuxScrollback: number): number {
-  return Math.min(Math.max(XTERM_SCROLLBACK_MIN, tmuxScrollback), XTERM_SCROLLBACK_MAX)
-}
+export { XTERM_SCROLLBACK_MAX, XTERM_SCROLLBACK_MIN, xtermScrollback } from '@shared/scrollback'
+// The capture → emulator transforms live in @shared so main's relay repaint uses the same rules.
+export { stripTrailingNewline, toXtermText } from '@shared/capture-paint'
 
 /* ------------------------------------------------------------------------------------------- *
  * Terminal appearance — ONE source for both xterm call sites.
@@ -325,6 +320,31 @@ export interface XtermVisualOptions {
   letterSpacing: number
   scrollback: number
   theme: ITheme
+  allowTransparency?: boolean
+}
+
+/**
+ * Glass terminals (Settings → Appearance): the node paints the theme background as a translucent
+ * tint behind the terminal (see `lib/glassContrast.ts`), so xterm itself must paint NO background —
+ * the theme's background with its alpha zeroed, plus `allowTransparency` so the WebGL glyph atlas
+ * is rasterized without a baked-in background (addon-webgl's `_getBackgroundColor`).
+ *
+ * The RGB is kept and only the alpha zeroed, so anything xterm derives from the background
+ * (minimum-contrast adjustment, the cursor accent) still sees the tint's colour, not black.
+ *
+ * Memoized per theme object: `applyLiveOptions` compares themes by IDENTITY, so a fresh object per
+ * call would re-apply the theme — a full palette rebuild on every terminal — on every settings edit.
+ */
+const glassThemes = new WeakMap<ITheme, ITheme>()
+export function glassTheme(theme: ITheme): ITheme {
+  let t = glassThemes.get(theme)
+  if (!t) {
+    const bg = theme.background
+    const rgb = bg && /^#[0-9a-f]{6}$/i.test(bg) ? bg : '#000000'
+    t = Object.freeze({ ...theme, background: `${rgb}00` })
+    glassThemes.set(theme, t)
+  }
+  return t
 }
 
 /**
@@ -335,8 +355,11 @@ export interface XtermVisualOptions {
  * else — the point is that there is no per-site options literal left to drift.
  */
 export function xtermOptionsFromSettings(
-  s: XtermVisualSettings
+  s: XtermVisualSettings,
+  /** Glass terminal (canvas node and kanban card modal; the settings preview never passes it). */
+  glass = false
 ): XtermVisualOptions & { allowProposedApi: true; macOptionClickForcesSelection: true } {
+  const theme = resolveTerminalTheme(s.terminalTheme).theme
   return {
     fontFamily: s.fontFamily,
     fontSize: s.fontSize,
@@ -354,7 +377,9 @@ export function xtermOptionsFromSettings(
     // tmux's own history (see pty-manager's tmuxConf). This buffer backs the plain-shell
     // fallback (tmux unavailable) and the cold-snapshot replay. Capped: per node, many nodes.
     scrollback: xtermScrollback(s.tmuxScrollback),
-    theme: resolveTerminalTheme(s.terminalTheme).theme,
+    theme: glass ? glassTheme(theme) : theme,
+    // Only present when on, so a non-glass terminal's options are exactly what they were.
+    ...(glass ? { allowTransparency: true } : {}),
     allowProposedApi: true,
     // Inside an app that requested mouse tracking (vim, htop) a plain drag goes to the app;
     // Option/Alt forces a selection instead (Shift does the same via xterm's own bypass).
@@ -395,9 +420,10 @@ export interface LiveOptionEffects {
  */
 export function applyLiveOptions(
   term: LiveOptionTarget,
-  s: XtermVisualSettings
+  s: XtermVisualSettings,
+  glass = false
 ): LiveOptionEffects {
-  const next = xtermOptionsFromSettings(s)
+  const next = xtermOptionsFromSettings(s, glass)
   const o = term.options
   // Deliberately NOT including the font WEIGHTS. xterm derives its cell size from
   // `CharSizeService`, which re-measures only on `fontFamily`/`fontSize` — a weight change never
@@ -430,6 +456,10 @@ export function applyLiveOptions(
     o.cursorInactiveStyle = next.cursorInactiveStyle
   }
   if (o.scrollback !== next.scrollback) o.scrollback = next.scrollback
+  // Before the theme, in the same synchronous pass: the WebGL renderer rebuilds its atlas on every
+  // option change, and the two must land together or one frame paints a transparent background
+  // over glyphs rasterized onto an opaque one.
+  if ((o.allowTransparency ?? false) !== glass) o.allowTransparency = glass
   if (themeChanged) o.theme = next.theme
 
   return { metricsChanged, themeChanged }
@@ -519,6 +549,11 @@ export const RESYNC_NOTICE = '\r\n\x1b[90m── reconnected — earlier output 
  */
 export const CO_ATTACH_MOUSE_SEQ = '\x1b[?1000h\x1b[?1002h\x1b[?1006h'
 
+/** Written into a TMUX-BACKED joiner's fresh xterm BEFORE its screen is painted — see
+ *  `PtyCreateResult.coAttachAltScreen`. Must precede the paint: entering the alternate buffer
+ *  clears the display. */
+export const CO_ATTACH_ALT_SCREEN_SEQ = '\x1b[?1049h'
+
 /**
  * The capture generation of the LAST repaint issued for a terminal, so a deferred repaint can tell
  * that a newer capture has superseded it (see `repaintResync`). Weak, and keyed by the xterm itself:
@@ -550,14 +585,28 @@ const resyncGeneration = new WeakMap<ResyncTarget, number>()
  *   parsed into yet, so #1 parses onto the fresh screen and #2 stacks below it. Only the LATEST
  *   capture is painted; superseded ones write nothing (they are strictly older screens of the same
  *   terminal, so there is nothing in them to lose).
+ *
+ * `tmuxClient` (PtyCreateResult.tmuxClient): the reset also drops a tmux client out of the alternate
+ * buffer and clears its mouse tracking; set, both are re-applied between the reset and the paint.
+ * Omitted, nothing is re-applied (a plain shell / session host, or a core that does not say).
  */
-export function repaintResync(term: ResyncTarget, screen: string, alive?: () => boolean): void {
+export function repaintResync(
+  term: ResyncTarget,
+  screen: string,
+  alive?: () => boolean,
+  tmuxClient = false
+): void {
   const generation = (resyncGeneration.get(term) ?? 0) + 1
   resyncGeneration.set(term, generation)
   term.write('', () => {
     if (alive && !alive()) return
     if (resyncGeneration.get(term) !== generation) return // a newer capture supersedes this one
     term.reset()
+    // `reset()` also dropped us to the NORMAL buffer and cleared mouse tracking, and tmux will not
+    // re-send either (it emits them once, at attach). For a tmux client, re-enter the alternate
+    // buffer and re-enable the mouse BEFORE the paint — entering the alt buffer clears the display.
+    // See PtyCreateResult.tmuxClient.
+    if (tmuxClient) term.write(CO_ATTACH_ALT_SCREEN_SEQ + CO_ATTACH_MOUSE_SEQ)
     term.write(toXtermText(screen))
     term.write(RESYNC_NOTICE)
   })
@@ -586,14 +635,6 @@ export function cursorPlacementSeq(cursor: PaneCursor | undefined): string {
   return `\x1b[${cursor.y + 1};${cursor.x + 1}H` + (cursor.visible ? '\x1b[?25h' : '\x1b[?25l')
 }
 
-/**
- * Make text captured from tmux (`capture-pane`, LF-separated lines) safe to `term.write()`.
- * xterm runs with `convertEol: false` — a bare LF moves down but keeps the column, so raw capture
- * output would render as a staircase. Lone LFs become CRLF; existing CRLFs are left alone.
- */
-export function toXtermText(text: string): string {
-  return text.replace(/\r?\n/g, '\r\n')
-}
 
 /**
  * Who closed this node, for the "closed by …" overlay. `by` is null when the destroy was not
@@ -606,18 +647,6 @@ export function closedByLabel(
 ): string {
   if (by === null) return 'another user'
   return peers[by]?.name || 'another user'
-}
-
-/**
- * Drop exactly ONE trailing newline from a tmux capture.
- * `capture-pane -p -e -S -<n>` emits a trailing LF after its last line. Writing it would leave the
- * cursor one row BELOW the last captured row: xterm scrolls, the topmost row of the captured
- * visible screen is pushed into scrollback, and tmux's attach redraw (`\x1b[H\x1b[2J`) then
- * repaints that same screen — so on every warm reattach the first visible row would appear twice.
- * Strip on the RAW capture (LF-separated), before `toXtermText` turns the LFs into CRLFs.
- */
-export function stripTrailingNewline(text: string): string {
-  return text.replace(/\r?\n$/, '')
 }
 
 /**

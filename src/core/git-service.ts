@@ -11,8 +11,10 @@ import type { WorktreeListResult } from '../shared/worktree'
 import type { GitHistoryOptions, GitHistoryResult } from '../shared/git-history'
 import { resolveGitRemote, runRemoteGit } from './remote-ssh/remote-git'
 import { platform } from './platform'
+import { directExecutableInvocation } from './exec-path'
 import { ghPath } from './gh-path'
 import { gitEnv } from './git-env'
+import { worktreeTargetRefusal } from './worktree-target'
 import {
   isValidCloneUrl,
   expandCloneUrl,
@@ -29,6 +31,15 @@ const run = promisify(execFile)
 // (issue #583) — live in git-env.ts, which github/credentials.ts imports as well.
 const GIT_ENV: NodeJS.ProcessEnv = gitEnv()
 
+function ghInvocation(args: string[]): ReturnType<typeof directExecutableInvocation> {
+  const gh = ghPath()
+  return gh ? directExecutableInvocation(gh, args) : null
+}
+
+function ghRunnable(): boolean {
+  return ghInvocation([]) !== null
+}
+
 // Single-flight registry for the one clone the app runs at a time. Module-scoped so a
 // macOS window re-creation can't orphan it.
 type ActiveClone = {
@@ -44,16 +55,21 @@ const GH_AUTH_TTL_MS = 10 * 60_000
 let ghAuthedCache: { value: boolean; at: number } | null = null
 let ghAuthedInFlight: Promise<boolean> | null = null
 
-async function ghAuthed(): Promise<boolean> {
-  const gh = ghPath()
-  if (!gh) return false
+async function ghAuthed(opts?: { recheckNegative?: boolean }): Promise<boolean> {
+  const invocation = ghInvocation(['auth', 'status'])
+  if (!invocation) return false
   const now = Date.now()
-  if (ghAuthedCache && now - ghAuthedCache.at < GH_AUTH_TTL_MS) return ghAuthedCache.value
+  const trusted = ghAuthedCache && (ghAuthedCache.value || !opts?.recheckNegative)
+  if (ghAuthedCache && trusted && now - ghAuthedCache.at < GH_AUTH_TTL_MS) return ghAuthedCache.value
   if (ghAuthedInFlight) return ghAuthedInFlight
   ghAuthedInFlight = (async () => {
     let value = false
     try {
-      await run(gh, ['auth', 'status'], { env: GIT_ENV, maxBuffer: 1024 * 1024 })
+      await run(invocation.executable, invocation.args, {
+        ...invocation.options,
+        env: GIT_ENV,
+        maxBuffer: 1024 * 1024
+      })
       value = true
     } catch {
       value = false
@@ -73,8 +89,7 @@ async function ghAuthed(): Promise<boolean> {
  * call ever (no cache at all) reports `false` while the probe runs; that flips one refresh later.
  */
 function ghAuthedSwr(): boolean {
-  const gh = ghPath()
-  if (!gh) return false
+  if (!ghRunnable()) return false
   const fresh = !!ghAuthedCache && Date.now() - ghAuthedCache.at < GH_AUTH_TTL_MS
   if (!fresh) void ghAuthed().catch(() => {})
   return ghAuthedCache?.value ?? false
@@ -173,7 +188,15 @@ function parseNumstat(out: string): Map<string, { added: number; deleted: number
 function githubTokenFromGitCredentials(cwd: string): Promise<string | null> {
   return new Promise((resolve) => {
     let out = ''
-    const child = spawn('git', ['credential', 'fill'], { cwd: cwd || undefined, env: GIT_ENV })
+    // A STORED token only — never an interactive login. Git Credential Manager (the default helper
+    // in Git for Windows, optional on macOS/Linux) opens a GUI sign-in for an empty store, which
+    // `GIT_TERMINAL_PROMPT=0` does not suppress; Source Control retries publish every few seconds
+    // while the user runs `gh auth login` (renderer/lib/publishFallback), so without this every
+    // retry would stack another GCM window. Helpers other than GCM ignore the variable.
+    const child = spawn('git', ['credential', 'fill'], {
+      cwd: cwd || undefined,
+      env: { ...GIT_ENV, GCM_INTERACTIVE: 'never' }
+    })
     const timer = setTimeout(() => child.kill('SIGKILL'), 5000)
     child.stdout.on('data', (d) => {
       out += d.toString()
@@ -302,6 +325,11 @@ export class GitService {
     // `wtPath` is computed from the LOCAL data dir, so adding it through a remote git would create a
     // worktree at a nonsense path on the host. Refuse (see `isRemoteRepo`).
     if (isRemoteRepo(repoPath)) return Promise.resolve(REMOTE_WORKTREE_REFUSAL())
+    // Every caller's backstop (dialog, `open-worktree`, the issue card, a relay or browser client):
+    // never into the repository's `.git`, never REDIRECTED by a symlink into a hidden folder of the
+    // home directory (see `worktree-target.ts`). Judged on real paths, which no renderer can see.
+    const refusal = worktreeTargetRefusal(wtPath, repoPath)
+    if (refusal) return Promise.resolve({ ok: false, message: refusal })
     return worktreeOps.worktreeAdd(git, repoPath, wtPath, branch, baseRef, isNew)
   }
   worktreeMerge(
@@ -343,7 +371,7 @@ export class GitService {
       hasRemote: false,
       hasOrigin: false,
       hasUpstream: false,
-      ghAvailable: !!ghPath(),
+      ghAvailable: ghRunnable(),
       ghAuthed: false,
       staged: [],
       changes: []
@@ -444,7 +472,7 @@ export class GitService {
       hasRemote,
       hasOrigin,
       hasUpstream,
-      ghAvailable: !!ghPath(),
+      ghAvailable: ghRunnable(),
       ghAuthed: gh,
       staged,
       changes
@@ -781,19 +809,29 @@ export class GitService {
   }
 
   async publish(cwd: string, name: string, isPrivate: boolean): Promise<GitResult> {
-    const gh = ghPath()
-    if (!gh) return { ok: false, message: 'GitHub CLI (gh) not found.' }
     const repo = (name || '').trim()
     // GitHub repo names (optionally `owner/repo`) are limited to these chars and
     // must not start with `-`, so gh can't read the value as an option flag.
     if (!repo || repo.startsWith('-') || !/^[A-Za-z0-9._/-]+$/.test(repo)) {
       return { ok: false, message: 'Invalid repository name.' }
     }
+    const invocation = ghInvocation([
+      'repo',
+      'create',
+      repo,
+      isPrivate ? '--private' : '--public',
+      '--source=.',
+      '--push'
+    ])
+    if (!invocation) return { ok: false, message: 'GitHub CLI (gh) not found.' }
     // Prefer gh's own login; otherwise reuse the user's existing git HTTPS token
     // (the one that already lets them push) so publishing doesn't demand a separate
     // `gh auth login`. If neither is available, signal the UI to start a login.
     const env: NodeJS.ProcessEnv = { ...GIT_ENV }
-    if (!(await ghAuthed())) {
+    // A cached "not signed in" is re-asked here: publish is user-initiated, and the Source Control
+    // panel retries it right after running `gh auth login` in a terminal — trusting a 10-minute-old
+    // negative would make that retry fail for the rest of the TTL.
+    if (!(await ghAuthed({ recheckNegative: true }))) {
       const token = await githubTokenFromGitCredentials(cwd)
       if (!token) {
         return { ok: false, message: 'Sign in to GitHub to publish.', needsAuth: true }
@@ -801,11 +839,12 @@ export class GitService {
       env.GH_TOKEN = token
     }
     try {
-      await run(
-        gh,
-        ['repo', 'create', repo, isPrivate ? '--private' : '--public', '--source=.', '--push'],
-        { cwd, env, maxBuffer: 10 * 1024 * 1024 }
-      )
+      await run(invocation.executable, invocation.args, {
+        ...invocation.options,
+        cwd,
+        env,
+        maxBuffer: 10 * 1024 * 1024
+      })
       return { ok: true, message: 'Published to GitHub.' }
     } catch (e) {
       const err = e as { stderr?: string; message?: string }

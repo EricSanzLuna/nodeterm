@@ -16,18 +16,25 @@ import { promisify } from 'util'
 import { IPC } from '../shared/ipc'
 import {
   accountConfigDir,
+  expandTildeLinkedDir,
+  isUnderLinkedConfigDir,
   isSupportedClaudeVersion,
   normalizeLinkedConfigDir,
-  parseLoginCapture
+  parseLoginCapture,
+  sameLinkedConfigDir
 } from './claude-accounts-core'
 import {
   claudeAccountsSnapshot,
   claudeConfigDirFor,
   linkedClaudeConfigDirFor
 } from './claude-config-dir'
-import { installClaudeHooksInto, ensureClaudeFullscreenTuiInto } from './agents/hooks/claude'
+import { applySkillShare, EMPTY_SKILL_SHARE } from './claude-skill-share'
+import { currentIntegrationLifecycle } from './agent-integrations'
 import { findInLoginPath } from './pty-manager'
 import { platform } from './platform'
+import { copyClaudeSession, type ClaudeSessionCopyOutcome } from './claude-session-copy'
+import type { ClaudeSessionCopyResult } from '../shared/types'
+import { resolveTranscriptPath, transcriptRoot, SESSION_ID_RE } from './transcript-reader'
 
 const execFileP = promisify(execFile)
 const LOGIN_POLL_MS = 2000
@@ -51,16 +58,21 @@ export interface ClaudeAccountsRemote {
   ): Promise<{ configDir: string; versionSupported: boolean } | null>
   readLogin(projectId: string, id: string): Promise<string | null>
   remove(projectId: string, id: string): Promise<void>
+  /**
+   * Copy a conversation between two account dirs ON THE HOST (the SSH leg of `copySession`).
+   * `host` is each account's `ClaudeAccount.host` (undefined = the host's system `~/.claude`); the
+   * implementation refuses an account pinned to a different host than this project's connection.
+   * Optional: a shell without it (older wiring) answers `failed` for an SSH switch.
+   */
+  copySession?(
+    projectId: string,
+    sessionId: string,
+    source: { id?: string; host?: string },
+    target: { id?: string; host?: string }
+  ): Promise<ClaudeSessionCopyResult>
 }
 
 export interface ClaudeAccountsDeps {
-  /**
-   * Install the canvas-control skill into a freshly created account dir. Claude Code resolves
-   * skills relative to CLAUDE_CONFIG_DIR, so a managed account needs its own copy. DESKTOP ONLY:
-   * canvas control is not wired on the Server Edition at all (its hook server answers
-   * `control unavailable` by name), so there is nothing for a skill file to reach there.
-   */
-  installSkill?: (configDir: string) => void
   /**
    * Resolves the live remote legs, or undefined when SSH is not wired / not yet created. A THUNK
    * rather than a plain object because that is the fact the local fallback turns on: desktop
@@ -115,11 +127,9 @@ export function registerClaudeAccountsIpc(deps: ClaudeAccountsDeps = {}): void {
     // Install the managed hook (+ the canvas skill where the shell has one) up front so the very
     // first session in this account already reports status (badges/notifications/subagent viz)
     // and can control the canvas (Claude resolves both relative to CLAUDE_CONFIG_DIR, not ~/.claude).
-    installClaudeHooksInto(configDir)
-    deps.installSkill?.(configDir)
-    // Ensure fullscreen TUI in the new account dir (write-if-absent, version-gated). Best-effort,
-    // off the response path — the memoized probe + write both fail open.
-    void ensureClaudeFullscreenTuiInto(configDir)
+    // Hook + skills + fullscreen TUI, only when the user consented to the claude integration
+    // (issue #744); the consent lifecycle owns that decision.
+    currentIntegrationLifecycle()?.installIntoClaudeAccount(configDir)
     const versionSupported = await checkClaudeVersion()
     return { id, configDir, versionSupported }
   })
@@ -192,8 +202,11 @@ export function registerClaudeAccountsIpc(deps: ClaudeAccountsDeps = {}): void {
     // shell, so nothing else would ever expand it — and `~/.claude-2` is exactly how the user
     // refers to the dir their own shell function exports.
     const typed = rawDir.trim()
-    const expanded =
-      typed === '~' || typed.startsWith('~/') ? path.join(homedir(), typed.slice(1)) : typed
+    const expanded = expandTildeLinkedDir(
+      typed,
+      homedir(),
+      process.platform === 'win32' ? 'win32' : 'posix'
+    )
     const configDir = normalizeLinkedConfigDir(expanded)
     if (!configDir) {
       throw new Error(`Not an absolute path: ${typed}`)
@@ -203,7 +216,9 @@ export function registerClaudeAccountsIpc(deps: ClaudeAccountsDeps = {}): void {
     // path we should not be stat'ing, and refusing `~/.claude` needs to say so even on a machine
     // where the dir has not been created yet ("no such directory" would be a misleading answer to
     // "why can't I link my system account?").
-    if (configDir === normalizeLinkedConfigDir(path.join(homedir(), '.claude'))) {
+    // Compared by the filesystem's own rule (case-insensitive on Windows), not `===` — else
+    // `c:\users\x\.CLAUDE` slips past every refusal below and one dir gets two ids.
+    if (sameLinkedConfigDir(configDir, path.join(homedir(), '.claude'))) {
       throw new Error('That is the system Claude config dir — it is already the default account.')
     }
     const managedRoot = normalizeLinkedConfigDir(
@@ -212,13 +227,16 @@ export function registerClaudeAccountsIpc(deps: ClaudeAccountsDeps = {}): void {
     // Under the managed root ⇒ it is an account nodeterm created. Linking it would give one dir two
     // account ids, and the second one would be removable-without-delete while the first still
     // `rm -rf`s the same directory.
-    if (managedRoot && (configDir === managedRoot || configDir.startsWith(managedRoot + path.sep))) {
+    if (
+      managedRoot &&
+      (sameLinkedConfigDir(configDir, managedRoot) || isUnderLinkedConfigDir(configDir, managedRoot))
+    ) {
       throw new Error('That is a nodeterm-managed account directory — add it with Add account.')
     }
     // Duplicate by NORMALIZED path, not by the string typed: `~/.claude-2/` and `/home/u/.claude-2`
     // are the same dir, and two rows for one dir would show two chips for one identity.
     for (const a of claudeAccountsSnapshot()) {
-      if (!a.host && normalizeLinkedConfigDir(a.configDir) === configDir) {
+      if (!a.host && sameLinkedConfigDir(a.configDir, configDir)) {
         throw new Error(`That config dir is already linked (${a.label || a.email || a.id}).`)
       }
     }
@@ -244,43 +262,106 @@ export function registerClaudeAccountsIpc(deps: ClaudeAccountsDeps = {}): void {
     }
     // Same two writes an ADDED account gets, so a linked account reports agent status from its
     // very next session. `installClaudeHooksInto` MERGES into an existing settings.json and writes
-    // it back through `writeFileSync`, which follows a symlink — the two-profile layout where
+    // to its resolved target without replacing a symlink — the two-profile layout where
     // `<dir>/settings.json` is a symlink into `~/.claude/` keeps its symlink and the shared target
     // gains the managed hook (pinned by test).
-    installClaudeHooksInto(configDir)
-    void ensureClaudeFullscreenTuiInto(configDir)
+    currentIntegrationLifecycle()?.installIntoClaudeAccount(configDir)
     return { id: randomUUID(), configDir, email }
   })
+
+  /**
+   * Turn `~/.claude/skills` sharing on/off for one LOCAL account and reconcile now (issue #643).
+   * The renderer owns the settings flag; this is only the effect.
+   *
+   * **Local accounts only, by construction.** A REMOTE account's config dir lives on its host, so
+   * this would have to link that host's `~/.claude/skills` over the ControlMaster — a generated
+   * shell with its own "never delete through the link" proof obligation, and a separate change.
+   * Rather than silently reconciling the wrong machine's filesystem, an account with a `host`
+   * REFUSES here (the Settings switch is disabled with the reason, so this is the backstop for a
+   * hand-edited settings.json, not the message anyone normally sees).
+   */
+  platform().handle(IPC.claudeAccountsSetSkillSharing, async (id: string, enabled: boolean) => {
+    const remoteAccount = claudeAccountsSnapshot().some((a) => a.id === id && a.host)
+    if (remoteAccount) return { ...EMPTY_SKILL_SHARE, refused: 'remote-account' as const }
+    // `claudeConfigDirFor` validates the id alphabet AND resolves a LINKED account to the user's
+    // own dir — which is the right target: a linked account is an identity like any other, and its
+    // `skills/` is subject to the same isolation. The plan's realpath refusal is what keeps a
+    // hand-edited `configDir` of `~/.claude` from turning this into a self-link.
+    return applySkillShare(claudeConfigDirFor(id), enabled)
+  })
+
+  /**
+   * Copy a conversation into another LOCAL account so a switched node resumes it there (the
+   * running-node "Switch Claude account" menu). The renderer runs it between the CLI's exit and the
+   * pane recycle, so the source transcript is final; see `claude-session-copy.ts` for the
+   * never-overwrite-a-diverged-copy rule.
+   *
+   * The renderer is not the boundary: the target must be a settled LOCAL account from the live
+   * settings list (or `undefined` = the system `~/.claude`). A remote or pending account, or an id
+   * nothing lists, is refused — a switch onto a dir with no login would only trade one `/login`
+   * for another, and a remote account's dir is on another machine entirely.
+   */
+  platform().handle(
+    IPC.claudeAccountsCopySession,
+    async (
+      sessionId: unknown,
+      sourceAccountId: unknown,
+      targetAccountId: unknown,
+      ctx?: AccountCtx
+    ): Promise<ClaudeSessionCopyOutcome> => {
+      if (typeof sessionId !== 'string' || !SESSION_ID_RE.test(sessionId))
+        return { ok: false, reason: 'bad-request' }
+      const optId = (v: unknown): v is string | undefined =>
+        v === undefined || v === null || typeof v === 'string'
+      if (!optId(sourceAccountId) || !optId(targetAccountId)) return { ok: false, reason: 'bad-request' }
+      const source = sourceAccountId || undefined
+      const target = targetAccountId || undefined
+      if (source === target) return { ok: true, copied: false }
+      // SSH project: the transcripts and account dirs are on the host. Only REMOTE accounts (or the
+      // host's system dir) qualify; the shell's leg re-checks that each is pinned to THIS host.
+      // A projectId with no live remote leg (not connected, or the Server Edition, which has no SSH
+      // manager) is refused rather than answered from THIS machine's disk.
+      if (typeof ctx?.projectId === 'string' && ctx.projectId) {
+        const remote = remoteFor(ctx)
+        if (!remote?.r.copySession) return { ok: false, reason: 'failed' }
+        const accounts = claudeAccountsSnapshot()
+        const remoteAcct = (id: string | undefined, settled: boolean): { id?: string; host?: string } | null => {
+          if (id === undefined) return {}
+          const a = accounts.find((x) => x.id === id && x.host && (!settled || !x.pending))
+          return a ? { id: a.id, host: a.host } : null
+        }
+        const src = remoteAcct(source, false)
+        const tgt = remoteAcct(target, true)
+        if (!src || !tgt) return { ok: false, reason: 'unknown-account' }
+        return remote.r
+          .copySession(remote.projectId, sessionId, src, tgt)
+          .catch((): ClaudeSessionCopyOutcome => ({ ok: false, reason: 'failed' }))
+      }
+      const localSettled = (id: string): boolean =>
+        claudeAccountsSnapshot().some((a) => a.id === id && !a.host && !a.pending)
+      if (target !== undefined && !localSettled(target)) return { ok: false, reason: 'unknown-account' }
+      // A source that is not a local account (removed, remote) has no local transcript to move.
+      if (source !== undefined && !claudeAccountsSnapshot().some((a) => a.id === source && !a.host))
+        return { ok: false, reason: 'unknown-account' }
+      let sourceRoot: string
+      let targetRoot: string
+      try {
+        // Both resolve through the id-alphabet gate (`accountConfigDir`), which throws on a bad id.
+        sourceRoot = transcriptRoot(source)
+        targetRoot = transcriptRoot(target)
+      } catch {
+        return { ok: false, reason: 'bad-request' }
+      }
+      const sourceFile = await resolveTranscriptPath(sessionId, source)
+      if (!sourceFile) return { ok: false, reason: 'no-transcript' }
+      return copyClaudeSession({
+        sessionId,
+        sourceFile,
+        targetProjectsRoot: targetRoot,
+        sourceConfigDir: path.dirname(sourceRoot),
+        targetConfigDir: path.dirname(targetRoot)
+      })
+    }
+  )
 }
 
-/**
- * Install the managed hook + fullscreen-TUI setting into every LOCAL managed account dir. Managed
- * accounts each carry their own settings.json (Claude Code resolves it relative to
- * CLAUDE_CONFIG_DIR), so an app update's new hook version must reach them too. Best-effort per
- * account: one failing account must never block launch (matches installManagedAgentHooks'
- * fail-open). `extra` is the shell's per-account addition — desktop installs the canvas skill.
- *
- * LINKED accounts (`ClaudeAccount.configDir`) are covered by the same loop and need no branch:
- * they carry no `host`, and `claudeConfigDirFor` answers with the user's own dir — which is the
- * point, because an app update's new hook version has to reach `~/.claude-2` too or that identity
- * silently stops reporting agent status. The shells register the accounts source BEFORE calling
- * this, or the resolver would hand back a managed dir that does not exist for those rows.
- */
-export function installHooksIntoLocalAccounts(
-  accounts: readonly { id: string; host?: string }[],
-  extra?: (configDir: string) => void
-): void {
-  for (const acct of accounts) {
-    if (acct.host) continue // remote accounts live on another host; nothing to install locally
-    try {
-      const configDir = claudeConfigDirFor(acct.id)
-      installClaudeHooksInto(configDir)
-      extra?.(configDir)
-      // Off the critical path: it awaits the memoized CLI probe, then writes fail-open. (The
-      // system ~/.claude is handled by installManagedAgentHooks, which covers both shells.)
-      void ensureClaudeFullscreenTuiInto(configDir)
-    } catch (e) {
-      console.warn(`[agent-hooks] account ${acct.id} hook install failed`, e)
-    }
-  }
-}

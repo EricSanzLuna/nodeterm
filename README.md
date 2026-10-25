@@ -16,16 +16,15 @@ hidden tabs.
 [![License](https://img.shields.io/badge/license-BUSL--1.1-blue)](./LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/eneskirca/nodeterm?style=flat)](https://github.com/eneskirca/nodeterm/stargazers)
 [![Latest release](https://img.shields.io/github/v/release/eneskirca/nodeterm?include_prereleases&sort=semver)](https://github.com/eneskirca/nodeterm/releases)
-<!-- Installer downloads: .dmg + .AppImage + .deb + Setup .exe across every release, hand-written on purpose.
-     shields' github/downloads/…/total reads ~12× higher because electron-updater's own traffic
-     (latest-*.yml polls, mac .zip deltas, blockmaps) is counted as downloads there. Recount with:
-     gh api --paginate repos/eneskirca/nodeterm/releases --jq \
-       '[.[].assets[] | select(.name|test("\\.(dmg|AppImage|deb|exe)$")) | .download_count] | add' -->
-[![Downloads](https://img.shields.io/badge/downloads-1.2k-brightgreen)](https://github.com/eneskirca/nodeterm/releases)
+<!-- Installer downloads only (.dmg + .AppImage + .deb + .rpm + .exe across every release), kept live by
+     .github/workflows/download-badge.yml, which writes a shields endpoint JSON to the `badges` branch.
+     shields' github/downloads/…/total reads ~14× higher because electron-updater's own traffic
+     (latest-*.yml polls, mac .zip deltas, blockmaps) is counted as downloads there. -->
+[![Downloads](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Feneskirca%2Fnodeterm%2Fbadges%2Fdownloads.json)](https://github.com/eneskirca/nodeterm/releases)
 
 <a href="https://trendshift.io/repositories/103825?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-103825" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/103825" alt="eneskirca%2Fnodeterm | Trendshift" width="250" height="55"/></a>
 
-[Download](#-download) · [Docs](https://nodeterm.dev/docs) · [Features](#-features) · [Build from source](#-build-from-source) · [Architecture](#-architecture) · [License](#-license)
+[Download](#-download) · [Docs](https://nodeterm.dev/docs) · [Features](#-features) · [Build from source](#-build-from-source) · [Architecture](#-architecture) · [Sponsor](#sponsor) · [License](#-license)
 
 </div>
 
@@ -33,7 +32,7 @@ hidden tabs.
 
 <div align="center">
   <a href="docs/assets/hero-tour.mp4">
-    <img src="docs/assets/hero-tour.webp" alt="nodeterm in 30 seconds — canvas, agents, kanban board, three surfaces" width="900" />
+    <img src="docs/assets/hero-tour.webp" alt="nodeterm in 30 seconds — the canvas, sessions that survive a restart, agents and the notch, the kanban board, dictation, the iPhone" width="900" />
   </a>
   <br/>
   <sub>▶ <a href="docs/assets/hero-tour.mp4">Watch the 30-second tour with sound</a></sub>
@@ -66,7 +65,7 @@ persistent tmux session, next to **sticky notes** (link one to feed an agent con
 map. Quit the app, even **restart the machine** — every session comes back.
 
 </td>
-<td><img src="docs/assets/canvas-tour.webp" alt="The canvas — terminals, agents, notes, editors and diffs as nodes; sessions survive a full restart" /></td>
+<td><img src="docs/assets/canvas-tour.webp" alt="The canvas — right-click to add Claude Code, a terminal, a sticky note, an editor and a diff; link the note to Claude; restart, and every session comes back" /></td>
 </tr>
 <tr>
 <td width="42%" valign="middle">
@@ -79,7 +78,7 @@ notifications. Click the ping, answer the permission prompt right in the node, a
 told the moment the turn is **done**. On a MacBook, agents live in the **notch** too.
 
 </td>
-<td><img src="docs/assets/agents-tour.webp" alt="Agent status — NEEDS YOU flip, notification, answering a permission prompt, subagent fan-out" /></td>
+<td><img src="docs/assets/agents-tour.webp" alt="Agent status — subagent fan-out with a context meter; a permission prompt lights the notch and posts a macOS notification; Go jumps to the node; ✓ Approve in its header" /></td>
 </tr>
 <tr>
 <td width="42%" valign="middle">
@@ -93,7 +92,7 @@ assign teammates. Toggle with `⌘⇧B`.
 <br/><sub>▶ <a href="docs/assets/kanban-launch.mp4">Watch the board video with sound</a></sub>
 
 </td>
-<td><img src="docs/assets/kanban-launch.webp" alt="The kanban board — live session cards, drag between columns, the card modal with a live Claude Code session" /></td>
+<td><img src="docs/assets/kanban-launch.webp" alt="The kanban board — ⌘⇧B turns the canvas into cards, drag one to Done while it keeps running, the card modal with the live Claude Code session and comments" /></td>
 </tr>
 <tr>
 <td width="42%" valign="middle">
@@ -105,25 +104,26 @@ live session continues in your pocket**, E2E encrypted **over the relay, not jus
 LAN**. The same canvas also runs self-hosted in any browser (Server Edition).
 
 </td>
-<td><img src="docs/assets/remote-tour.webp" alt="Pair your phone — scan the QR, the same live session continues on the iPhone" /></td>
+<td><img src="docs/assets/remote-tour.webp" alt="Pair your phone — scan the QR, every session is one tap away, the real Claude Code on the iPhone, answer its permission prompt from there" /></td>
 </tr>
 <tr>
 <td width="42%" valign="middle">
 
 ### Talk to your terminal
 
-Hold `⌘⌥` and say it. On-device **Whisper** transcribes locally — review the text,
-then **Send** (nothing auto-submits). Your voice never leaves the machine.
+Hold `⌘⌥`, say it, let go. On-device **Whisper** transcribes it locally and types the
+text into the terminal's prompt — **you** press Enter (nothing auto-submits). Your voice
+never leaves the machine.
 
 </td>
-<td><img src="docs/assets/dictation-tour.webp" alt="Dictation — hold ⌘⌥, speak, review, send into the terminal" /></td>
+<td><img src="docs/assets/dictation-tour.webp" alt="Dictation — hold ⌘⌥ and speak, let go, local Whisper types the words into Claude Code's prompt, you press Enter" /></td>
 </tr>
 </table>
 
 ### Node kinds
 
-🖥 **Terminal** (xterm + tmux, AI naming) · 🤖 **Agent** (Claude Code / Codex / Gemini /
-GitHub Copilot / opencode / Grok / custom) · 📝 **Sticky note** (link to an agent as context) · 🗂 **Group**
+🖥 **Terminal** (xterm + tmux, AI naming) · 🤖 **Agent** (Claude Code / Codex / Antigravity /
+Gemini / GitHub Copilot / opencode / Grok / Cursor / custom) · 📝 **Sticky note** (link to an agent as context) · 🗂 **Group**
 (bind to a **git worktree** for agent-per-branch) · ✏️ **Editor** (Monaco, ⌘S) ·
 🔀 **Diff** · 🌐 **Web / Video**
 
@@ -152,7 +152,9 @@ GitHub Copilot / opencode / Grok / custom) · 📝 **Sticky note** (link to an a
   from your phone — plus push notifications and a mobile board view.
 - **Power & sleep** — while an agent is working, nodeterm keeps the machine from
   idle-sleeping, and lets go the moment it finishes (on by default; toggle in the setup
-  tour or Settings → Behavior). No app can hold a machine awake through a closed lid —
+  tour or Settings → Behavior). It lets the machine sleep anyway on battery below 5% or
+  when the machine runs critically hot. No app can hold a machine awake through a closed lid
+  (a Mac with the lid closed stays awake only while plugged in with an external display) —
   for overnight runs keep the laptop open and plugged in, or run the agents on a box
   that doesn't sleep via the [Server Edition](./docs/SERVER.md).
 - **Command palette** (⌘K), **file explorer** (⌘⇧E), **markdown view** (⌘M),
@@ -199,21 +201,23 @@ detects your platform. Everything is also listed at
 - **macOS** — `.dmg` for Apple Silicon and Intel (auto-updates), or **Homebrew**:
 
   ```bash
-  brew tap nodeterm/tap
-  brew trust nodeterm/tap        # Homebrew ≥6 refuses to load an untrusted tap
   brew install --cask nodeterm
   ```
 
-  Both first lines are required. On its own, `brew install --cask nodeterm` only searches
-  `homebrew/cask` and reports the cask as not found; without the trust grant, Homebrew ≥6
-  fails rather than prompting. The cask tracks each promoted release, and the app updates
-  itself (electron-updater), so `brew upgrade` is rarely needed for it.
-- **Linux (x64)** — self-updating **AppImage**, or a `.deb` for Debian/Ubuntu
-  (`sudo apt install ./nodeterm-*.deb`; updates are manual for `.deb`).
+  The cask is in the official `homebrew/cask`, so no tap is needed. The app updates itself
+  (electron-updater), so `brew upgrade` is rarely needed for it. If you installed from the
+  old `nodeterm/tap`, you can drop it with `brew untap nodeterm/tap`: the short name
+  `nodeterm` already resolves to the official cask.
+- **Linux (x64)** — self-updating **AppImage**, a `.deb` for Debian/Ubuntu
+  (`sudo apt install ./node-terminal_*.deb`), or an `.rpm` for Fedora/RHEL
+  (`sudo dnf install ./node-terminal-*.rpm`). Updates are manual for both packages: the app
+  tells you when a new version is out and links the download. The AppImage needs FUSE 2,
+  which Fedora does not install by default: `sudo dnf install fuse-libs` if it exits with
+  a `libfuse.so.2` error.
 - **Windows (x64) — beta** — `nodeterm-Setup-<version>.exe` (per-user installer) or a
   portable `-win.zip`. Early support, so know what you are getting: the installer is
   **unsigned** (SmartScreen will ask — *More info → Run anyway*), **updates are manual**
-  for now (grab the next build from the same page), and **session continuity across
+  for now (the app tells you when a new version is out and links the download), and **session continuity across
   restarts is still landing** — Windows has no tmux, so the standalone session host that
   replaces it is being packaged in [#579](https://github.com/eneskirca/nodeterm/pull/579).
   Everything else — canvas, agents, kanban, hooks — is the same app. Please
@@ -235,6 +239,43 @@ The full inventory of what nodeterm writes where (and what the script keeps, lik
 `.nodeterm/` canvas folders inside your own repos) is documented in
 [docs/uninstall.md](docs/uninstall.md).
 
+## Sponsor
+
+nodeterm is an indie project, built with Claude across several Claude accounts — about
+**$2,000 a month** to keep running. There are **10 Founding Sponsor spots** at $200/month:
+your logo goes in this grid and on [nodeterm.dev](https://nodeterm.dev), and your feature
+requests go first.
+
+<p align="center">
+  <b>0 of 10 spots taken</b> · <a href="https://buy.stripe.com/3cI6oJfveehDeIL90w7EQ04">Become a Founding Sponsor →</a>
+</p>
+
+<!-- Taking a spot: replace one open cell (in order, top-left first) with
+       <td align="center" width="20%"><a href="SPONSOR_URL"><img src="docs/assets/sponsors/SPONSOR.svg" alt="SPONSOR NAME" width="136" /></a></td>
+     The logo needs a transparent background that reads on GitHub's light AND dark themes (or wrap it in a <picture>
+     with a prefers-color-scheme: dark <source>). Bump the "N of 10 spots taken" line in the same edit. The spots are sold through a Stripe
+     payment link limited to 10 payments: it deactivates itself when the tenth is taken (existing subscriptions keep
+     renewing). If a sponsor cancels, raise the limit by one to reopen their spot. -->
+<table>
+  <tr>
+    <td align="center" width="20%"><a href="https://buy.stripe.com/3cI6oJfveehDeIL90w7EQ04"><img src="docs/assets/sponsors/open-spot.svg" alt="Open Founding Sponsor spot" width="136" /></a></td>
+    <td align="center" width="20%"><a href="https://buy.stripe.com/3cI6oJfveehDeIL90w7EQ04"><img src="docs/assets/sponsors/open-spot.svg" alt="Open Founding Sponsor spot" width="136" /></a></td>
+    <td align="center" width="20%"><a href="https://buy.stripe.com/3cI6oJfveehDeIL90w7EQ04"><img src="docs/assets/sponsors/open-spot.svg" alt="Open Founding Sponsor spot" width="136" /></a></td>
+    <td align="center" width="20%"><a href="https://buy.stripe.com/3cI6oJfveehDeIL90w7EQ04"><img src="docs/assets/sponsors/open-spot.svg" alt="Open Founding Sponsor spot" width="136" /></a></td>
+    <td align="center" width="20%"><a href="https://buy.stripe.com/3cI6oJfveehDeIL90w7EQ04"><img src="docs/assets/sponsors/open-spot.svg" alt="Open Founding Sponsor spot" width="136" /></a></td>
+  </tr>
+  <tr>
+    <td align="center" width="20%"><a href="https://buy.stripe.com/3cI6oJfveehDeIL90w7EQ04"><img src="docs/assets/sponsors/open-spot.svg" alt="Open Founding Sponsor spot" width="136" /></a></td>
+    <td align="center" width="20%"><a href="https://buy.stripe.com/3cI6oJfveehDeIL90w7EQ04"><img src="docs/assets/sponsors/open-spot.svg" alt="Open Founding Sponsor spot" width="136" /></a></td>
+    <td align="center" width="20%"><a href="https://buy.stripe.com/3cI6oJfveehDeIL90w7EQ04"><img src="docs/assets/sponsors/open-spot.svg" alt="Open Founding Sponsor spot" width="136" /></a></td>
+    <td align="center" width="20%"><a href="https://buy.stripe.com/3cI6oJfveehDeIL90w7EQ04"><img src="docs/assets/sponsors/open-spot.svg" alt="Open Founding Sponsor spot" width="136" /></a></td>
+    <td align="center" width="20%"><a href="https://buy.stripe.com/3cI6oJfveehDeIL90w7EQ04"><img src="docs/assets/sponsors/open-spot.svg" alt="Open Founding Sponsor spot" width="136" /></a></td>
+  </tr>
+</table>
+
+Prefer a smaller amount, need an invoice, or want a different arrangement? Write to
+support@nodeterm.dev — and a ⭐ helps too.
+
 ## 🛠 Build from source
 
 Requires Node.js 20+ on macOS or Linux (tmux recommended — it's what makes sessions
@@ -245,6 +286,18 @@ release job does this automatically), or just install tmux yourself. On **Window
 C++ build tools and Python 3 (needed to compile node-pty) and points you at the exact
 `winget` commands for anything missing, then runs `npm ci`.
 
+On **Fedora** (and any distro shipping GCC 14 or newer), export `CFLAGS=-D_GNU_SOURCE` for the
+install: smart-whisper's bundled whisper.cpp uses GNU-only CPU-affinity calls without asking for
+them, and GCC 14 turned that from a warning into an error, so a plain `npm install` fails while
+building it. Packaging additionally wants `rpm-build` (for the `.rpm` target) and
+`libxcrypt-compat` (electron-builder's bundled `fpm` runs a Ruby that still links
+`libcrypt.so.1`, without which both `.deb` and `.rpm` fail):
+
+```bash
+sudo dnf install -y rpm-build libxcrypt-compat
+CFLAGS=-D_GNU_SOURCE npm install
+```
+
 ```bash
 npm install        # deps + rebuilds node-pty against Electron's ABI (postinstall)
 npm run dev        # dev mode with renderer HMR
@@ -253,7 +306,7 @@ npm start          # preview the production build
 npm run typecheck  # fastest correctness gate
 npm test           # vitest unit + integration suite
 npm run dist       # local UNSIGNED .dmg into dist/ (smoke test)
-npm run dist:linux # AppImage + .deb into dist/ (on a Linux host)
+npm run dist:linux # AppImage + .deb + .rpm into dist/ (on a Linux host; .rpm needs rpmbuild)
 npm run dist:win   # unsigned NSIS installer + zip into dist/ (on a Windows host)
 npm run server:dev # build + run the browser Server Edition (needs Node 22 + tmux)
 ```
@@ -275,6 +328,16 @@ These are the defaults — every one of them is remappable in **Settings → Key
 | `⌘⇧E` | File explorer |
 | `⌘,` | Settings · `⌘/` Shortcuts |
 | `Right-click` | Actions menu (empty space or node) |
+
+**Pasting screenshots on macOS:** in a terminal, **Cmd+V** saves the image and pastes its
+file path. **Ctrl+V** sends a control key to the foreground program. A local agent with
+clipboard-image support, such as Claude Code, may attach the image directly at its input
+prompt; shells and editors give that key other meanings. nodeterm does not detect this
+capability or retry with the other route. Use Cmd+V for SSH sessions: the image is uploaded
+and its remote path is pasted. In Server Edition, image paste uploads to the terminal host
+and depends on browser clipboard access; Ctrl+V does not transfer the browser's clipboard
+to the host. This distinction also appears in **Keyboard shortcuts → Pasting screenshots
+on macOS** and applies to both canvas and kanban terminals.
 
 ## 🏗 Architecture
 

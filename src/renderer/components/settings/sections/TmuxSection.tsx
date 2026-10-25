@@ -1,24 +1,50 @@
+import {
+  persistenceDescription,
+  sessionBackendNote,
+  usePersistenceStatus
+} from '../../usePersistenceStatus'
 import { useSettings } from '../../../state/settings'
 import { SettingsSection } from '../SettingsSection'
 import { SearchableRow } from '../SearchableRow'
 import { FieldRow } from '../FieldRow'
 import { Switch } from '@renderer/ui/Switch'
 import { NumberField } from '@renderer/ui/NumberField'
+import { Select } from '@renderer/ui/Select'
+import { normalizeSessionBackend, ZELLIJ_BACKEND_GAPS } from '@shared/session-backend'
+import { XTERM_SCROLLBACK_MAX } from '@shared/scrollback'
 import {
   LEAD_PANE_WIDTH_DEFAULT,
   LEAD_PANE_WIDTH_MAX,
   LEAD_PANE_WIDTH_MIN
 } from '@shared/tmux-lead-pane'
+import {
+  PARK_MAX,
+  PARK_MAX_LIMIT,
+  PARK_MINUTES_DEFAULT,
+  PARK_MINUTES_MAX
+} from '@renderer/terminal/park-budget'
 
 const ROWS = {
   enabled: {
-    title: 'Persistent sessions (tmux)',
-    keywords: ['tmux', 'persistent', 'session', 'continuity']
+    title: 'Persistent sessions',
+    keywords: ['tmux', 'persistent', 'session', 'continuity', 'protection', 'host']
+  },
+  backend: {
+    title: 'Session backend',
+    keywords: ['tmux', 'zellij', 'backend', 'multiplexer', 'session', 'persistent']
   },
   scrollback: { title: 'Scrollback lines', keywords: ['tmux', 'scrollback', 'history', 'lines'] },
   leadPane: {
     title: 'Keep lead pane wide (agent teams)',
     keywords: ['lead', 'pane', 'width', 'agent', 'team', 'teammates', 'split', 'claude', 'resize']
+  },
+  parkMinutes: {
+    title: 'Keep switched-away terminals attached',
+    keywords: ['park', 'switch', 'project', 'ssh', 'fast', 'instant', 'reattach', 'minutes', 'memory']
+  },
+  parkMax: {
+    title: 'Max attached terminals in other projects',
+    keywords: ['park', 'cap', 'limit', 'switch', 'project', 'ssh', 'reattach', 'memory', 'ram']
   },
   offscreen: {
     title: 'Release offscreen terminals',
@@ -28,19 +54,21 @@ const ROWS = {
 const ENTRIES = Object.values(ROWS)
 
 export function TmuxSection({ isActive }: { isActive: boolean }): React.JSX.Element {
+  const status = usePersistenceStatus()
   const settings = useSettings((s) => s.settings)
   const update = useSettings((s) => s.update)
   return (
     <SettingsSection
       id="tmux"
-      title="tmux"
+      title="Session protection"
       description="Applies to new terminals / next launch."
       isActive={isActive}
       searchEntries={ENTRIES}
     >
       <SearchableRow {...ROWS.enabled}>
         <FieldRow
-          label="Persistent sessions (tmux)"
+          label="Persistent sessions"
+          description={persistenceDescription(status)}
           control={
             <Switch
               checked={settings.tmuxEnabled}
@@ -50,9 +78,36 @@ export function TmuxSection({ isActive }: { isActive: boolean }): React.JSX.Elem
           }
         />
       </SearchableRow>
+      {status?.zellij ? (
+        <SearchableRow {...ROWS.backend}>
+          <FieldRow
+            label="Session backend"
+            description={sessionBackendNote(status.zellij)}
+            note={
+              normalizeSessionBackend(settings.sessionBackend) === 'zellij'
+                ? `Not available with Zellij: ${ZELLIJ_BACKEND_GAPS.join(' ')}`
+                : undefined
+            }
+            control={
+              <Select
+                aria-label="Session backend"
+                value={normalizeSessionBackend(settings.sessionBackend)}
+                onChange={(e) => update({ sessionBackend: normalizeSessionBackend(e.target.value) })}
+              >
+                <option value="tmux">tmux</option>
+                <option value="zellij">Zellij</option>
+              </Select>
+            }
+          />
+        </SearchableRow>
+      ) : null}
       <SearchableRow {...ROWS.scrollback}>
         <FieldRow
           label="Scrollback lines"
+          description={
+            'tmux’s history-limit for each terminal. ' +
+            `Without tmux (Windows), history is capped at ${XTERM_SCROLLBACK_MAX.toLocaleString('en-US')} lines: the app holds it at full width in memory.`
+          }
           control={
             <NumberField
               value={settings.tmuxScrollback}
@@ -94,6 +149,54 @@ export function TmuxSection({ isActive }: { isActive: boolean }): React.JSX.Elem
                 ariaLabel="Keep lead pane wide"
               />
             </div>
+          }
+        />
+      </SearchableRow>
+      <SearchableRow {...ROWS.parkMinutes}>
+        <FieldRow
+          label="Keep switched-away terminals attached"
+          description={
+            'Minutes a project’s terminals stay attached after you switch to another project, so switching back is instant. ' +
+            'After that they reattach on return — seconds per project over SSH. 0 = until the app quits. ' +
+            `Default ${PARK_MINUTES_DEFAULT}. Applies from the next switch.`
+          }
+          control={
+            <NumberField
+              value={settings.terminalParkMinutes}
+              min={0}
+              max={PARK_MINUTES_MAX}
+              step={1}
+              ariaLabel="Park window (minutes)"
+              // A cleared field reads back as the DEFAULT, not 0: 0 means "keep forever", the
+              // memory-expensive end, and must only ever be typed on purpose.
+              onChange={(v) =>
+                update({
+                  terminalParkMinutes: Number.isFinite(v) ? Math.max(0, v) : PARK_MINUTES_DEFAULT
+                })
+              }
+            />
+          }
+        />
+      </SearchableRow>
+      <SearchableRow {...ROWS.parkMax}>
+        <FieldRow
+          label="Max attached terminals in other projects"
+          description={
+            'How many switched-away terminals stay attached in total. Beyond this the oldest are released early — local ones before SSH ones, which are slower to reattach. ' +
+            'Each costs about 2 MB with tmux (more without tmux: its scrollback lives in the app) and, over SSH, one local ssh client on the project’s connection. ' +
+            `Default ${PARK_MAX}.`
+          }
+          control={
+            <NumberField
+              value={settings.terminalParkMax}
+              min={1}
+              max={PARK_MAX_LIMIT}
+              step={1}
+              ariaLabel="Max parked terminals"
+              onChange={(v) =>
+                update({ terminalParkMax: Number.isFinite(v) && v >= 1 ? Math.floor(v) : PARK_MAX })
+              }
+            />
           }
         />
       </SearchableRow>

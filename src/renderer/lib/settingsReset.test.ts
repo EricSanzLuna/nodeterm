@@ -31,8 +31,24 @@ describe('reset key lists', () => {
 
   // Deliberate exclusion: the terminal renders with it, but it belongs to the tmux section, and
   // resetting a scrollback limit from an appearance button would be a surprise.
+  // Issue #1113: the note/frame backing sliders sit in the Appearance section, so its reset owns
+  // them — otherwise "Reset appearance" leaves an 80% backing behind and reads as pristine.
+  it('claims the sticky-note and group-frame backing', () => {
+    expect(APPEARANCE_RESET_KEYS).toContain('stickyNoteBacking')
+    expect(APPEARANCE_RESET_KEYS).toContain('groupFrameBacking')
+    const touched: Settings = { ...DEFAULT_SETTINGS, stickyNoteBacking: 80 }
+    expect(isPristine(APPEARANCE_RESET_KEYS, touched)).toBe(false)
+  })
+
   it('does not claim tmuxScrollback', () => {
     expect(TERMINAL_RESET_KEYS).not.toContain('tmuxScrollback')
+  })
+
+  // Issue #759: the toggle lives in the Terminal section beside word selection, so its reset
+  // button owns it too — resetting puts the clipboard back to explicit-copy only.
+  it('claims copyOnSelect, whose default is off', () => {
+    expect(TERMINAL_RESET_KEYS).toContain('copyOnSelect')
+    expect(resetPatch(['copyOnSelect'] as const)).toEqual({ copyOnSelect: false })
   })
 
   // A global "reset everything" would empty these; per-section lists must never reach them.

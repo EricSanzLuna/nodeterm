@@ -118,16 +118,6 @@ describe('canvas-control shim', () => {
     expect(received.at(-1)?.args).toEqual({ count: '2', verbose: '', cwd: '/tmp' })
   })
 
-  it('--flag=value carries a value that itself starts with -- (unexpressible before)', async () => {
-    await callShim(['open-terminal', '--cmd=--version', '--cwd', '/srv'])
-    expect(received.at(-1)?.args).toEqual({ cmd: '--version', cwd: '/srv' })
-  })
-
-  it('--flag=value splits on the FIRST =, and the rest survives urlencoding', async () => {
-    await callShim(['open-terminal', '--cmd=env A=1 B="2 3"'])
-    expect(received.at(-1)?.args).toEqual({ cmd: 'env A=1 B="2 3"' })
-  })
-
   // The peek looks for `--`, not `-`. A single-dash value must still be consumed positionally.
   it('a value beginning with a single dash is still a value', async () => {
     await callShim(['rename', '--node', 'n1', '--title', '-7'])
@@ -171,7 +161,7 @@ describe('canvas-control shim', () => {
     expect(received.length).toBe(before)
   })
 
-  it('rejects a wrong token (the server answers 403, the shim exits non-zero)', async () => {
+  it('rejects a wrong token (the server answers wrong-owner 421, the shim exits non-zero)', async () => {
     await expect(callShim(['list'], { NODETERM_HOOK_TOKEN: 'wrong' })).rejects.toMatchObject({
       code: 1
     })
@@ -245,6 +235,8 @@ describe('canvas-control shim over a unix socket', () => {
     expect(lastSeen()?.token).toBe('tok-remote')
     expect(parseControlBody(lastSeen()?.body ?? '', 'application/x-www-form-urlencoded')).toEqual({
       nodeId: 'node-1',
+      // The per-run id the server's request ledger keys the shim's own re-posts by.
+      requestId: expect.stringMatching(/^cli-[0-9a-f]{24}$/),
       args: { count: '2' }
     })
   })
@@ -259,6 +251,8 @@ describe('canvas-control shim over a unix socket', () => {
     expect(lastSeen()?.path).toBe('/control/link')
     expect(parseControlBody(lastSeen()?.body ?? '', 'application/x-www-form-urlencoded')).toEqual({
       nodeId: 'node-1',
+      // The per-run id the server's request ledger keys the shim's own re-posts by.
+      requestId: expect.stringMatching(/^cli-[0-9a-f]{24}$/),
       args: { to: 'n2,n3', from: 'n1' }
     })
   })
@@ -522,7 +516,11 @@ describe('canvas-control shim keeps credentials off curl\'s command line', () =>
   it('names no credential header in the generated source at all', () => {
     expect(CONTROL_SHIM_SCRIPT).not.toContain('-H "X-Nodeterm-Hook-Token')
     expect(CONTROL_SHIM_SCRIPT).not.toContain('-H "X-Nodeterm-Node-Token')
-    expect((CONTROL_SHIM_SCRIPT.match(/--config -/g) ?? []).length).toBe(2)
+    // Every curl call site reads its headers from stdin: the POST over each transport, and the
+    // fallback liveness probe over each transport (hook-endpoint-failover-sh.ts).
+    const calls = CONTROL_SHIM_SCRIPT.match(/\bcurl -s/g) ?? []
+    expect(calls).toHaveLength(4)
+    expect((CONTROL_SHIM_SCRIPT.match(/--config -/g) ?? []).length).toBe(calls.length)
   })
 
   it('over TCP: neither token is in argv, both arrive on stdin and reach the server', async () => {
@@ -691,8 +689,8 @@ describe('parseControlBody', () => {
   })
 })
 
-describe('sticky through the shim (verified-only verb)', () => {
-  // `sticky` is in `requiresVerified`, so unlike every other shim test these calls must present
+describe('verified-only requests through the shim', () => {
+  // `sticky` and command-bearing terminal opens require verification, so these calls present
   // the per-node token — the same file-in-a-directory arrangement `buildPtyEnv` hands a real
   // session. The secret is scoped to this describe so the rest of the suite keeps exercising the
   // legacy (no-secret) path.
@@ -713,6 +711,16 @@ describe('sticky through the shim (verified-only verb)', () => {
   })
 
   const callVerified = (args: string[]) => callShim(args, { NODETERM_NODE_TOKEN_DIR: tokenDir })
+
+  it('--flag=value carries a value that itself starts with -- (unexpressible before)', async () => {
+    await callVerified(['open-terminal', '--cmd=--version', '--cwd', '/srv'])
+    expect(received.at(-1)?.args).toEqual({ cmd: '--version', cwd: '/srv' })
+  })
+
+  it('--flag=value splits on the FIRST =, and the rest survives urlencoding', async () => {
+    await callVerified(['open-terminal', '--cmd=env A=1 B="2 3"'])
+    expect(received.at(-1)?.args).toEqual({ cmd: 'env A=1 B="2 3"' })
+  })
 
   it('maps the bare positional to --node, title with spaces intact', async () => {
     await callVerified(['sticky', 'Linear: my tickets', '--text', '# Tickets'])

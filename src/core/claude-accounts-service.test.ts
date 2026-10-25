@@ -7,17 +7,18 @@
  * (canvas control is not wired there) and no SSH manager, so a ctx carrying a projectId must still
  * take the local path.
  *
- * MUTATION: drop the `installSkill` call, or let `remoteFor` treat a projectId alone as remote →
- * the skill case and the local-fallback case redden.
+ * MUTATION: drop the consent lifecycle's `installIntoClaudeAccount` call, or let `remoteFor` treat
+ * a projectId alone as remote → the install case and the local-fallback case redden.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'fs'
 import os from 'os'
 import path from 'path'
 import { initPlatform, resetPlatformForTests } from './platform'
 import { fakePlatform, type FakePlatform } from './platform-fake'
 import { IPC } from '../shared/ipc'
-import { registerClaudeAccountsIpc, installHooksIntoLocalAccounts } from './claude-accounts-service'
+import { registerClaudeAccountsIpc } from './claude-accounts-service'
+import { registerIntegrationLifecycle, type IntegrationLifecycle } from './agent-integrations'
 import { accountConfigDir } from './claude-accounts-core'
 import {
   registerClaudeAccountsSource,
@@ -29,12 +30,26 @@ import type { ClaudeAccount } from '../shared/types'
 // and a real write would touch the account dir this file then asserts about.
 const installed: string[] = []
 const tui: string[] = []
-vi.mock('./agents/hooks/claude', () => ({
+vi.mock('./agents/hooks/claude', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./agents/hooks/claude')>()),
   installClaudeHooksInto: (dir: string) => {
     installed.push(dir)
   },
   ensureClaudeFullscreenTuiInto: async (dir: string) => {
     tui.push(dir)
+  }
+}))
+
+// Same reason as the hook writers above, with one addition: the real applier resolves the SYSTEM
+// skills dir from `os.homedir()`, so an unmocked sweep in this suite would read the developer's own
+// `~/.claude/skills`. Its behaviour is covered against a real filesystem in
+// `claude-skill-share.test.ts`; here we only assert the WIRING (issue #643).
+const shared: { dir: string; enabled: boolean }[] = []
+vi.mock('./claude-skill-share', () => ({
+  EMPTY_SKILL_SHARE: { linked: 0, unlinked: 0, shared: 0, occupied: 0, failed: 0 },
+  applySkillShare: async (dir: string, enabled: boolean) => {
+    shared.push({ dir, enabled })
+    return { linked: enabled ? 2 : 0, unlinked: 0, shared: enabled ? 2 : 0, occupied: 0, failed: 0 }
   }
 }))
 
@@ -47,6 +62,7 @@ const call = (channel: string, ...args: unknown[]): Promise<any> =>
 beforeEach(() => {
   installed.length = 0
   tui.length = 0
+  shared.length = 0
   userDataDir = mkdtempSync(path.join(os.tmpdir(), 'nt-accounts-'))
   fake = fakePlatform({ userDataDir })
   initPlatform(fake)
@@ -57,37 +73,43 @@ afterEach(() => {
   rmSync(userDataDir, { recursive: true, force: true })
 })
 
-describe('registerClaudeAccountsIpc — the five channels', () => {
-  it('registers exactly the five claude-accounts channels', () => {
+describe('registerClaudeAccountsIpc — the seven channels', () => {
+  it('registers exactly the seven claude-accounts channels', () => {
     registerClaudeAccountsIpc()
     expect(Object.keys(fake.handlers).sort()).toEqual(
       [
         IPC.claudeAccountsAdd,
         IPC.claudeAccountsCancelWait,
+        IPC.claudeAccountsCopySession,
         IPC.claudeAccountsLink,
         IPC.claudeAccountsRemove,
+        IPC.claudeAccountsSetSkillSharing,
         IPC.claudeAccountsWaitLogin
       ].sort()
     )
   })
 
-  it('add() creates the config dir under userData, installs the hook and returns the id', async () => {
-    const skilled: string[] = []
-    registerClaudeAccountsIpc({ installSkill: (d) => skilled.push(d) })
-    const res = await call(IPC.claudeAccountsAdd)
-    expect(res.id).toMatch(/^[A-Za-z0-9-]+$/)
-    expect(res.configDir).toBe(accountConfigDir(userDataDir, res.id))
-    expect(existsSync(res.configDir)).toBe(true)
-    expect(installed).toEqual([res.configDir])
-    expect(skilled).toEqual([res.configDir])
-    expect(tui).toEqual([res.configDir])
+  it('add() creates the config dir under userData, asks the consent lifecycle to install, and returns the id', async () => {
+    const asked: string[] = []
+    registerIntegrationLifecycle({ installIntoClaudeAccount: (d: string) => asked.push(d) } as unknown as IntegrationLifecycle)
+    try {
+      registerClaudeAccountsIpc()
+      const res = await call(IPC.claudeAccountsAdd)
+      expect(res.id).toMatch(/^[A-Za-z0-9-]+$/)
+      expect(res.configDir).toBe(accountConfigDir(userDataDir, res.id))
+      expect(existsSync(res.configDir)).toBe(true)
+      expect(asked).toEqual([res.configDir])
+    } finally {
+      registerIntegrationLifecycle(null)
+    }
   })
 
-  it('add() without an installSkill dep (the Server Edition) writes no skill', async () => {
+  it('add() with no consent lifecycle registered writes NO hook, skill or TUI setting (fail-closed, #744)', async () => {
     registerClaudeAccountsIpc()
     const res = await call(IPC.claudeAccountsAdd)
     expect(existsSync(res.configDir)).toBe(true)
-    expect(installed).toEqual([res.configDir])
+    expect(installed).toEqual([])
+    expect(tui).toEqual([])
   })
 
   it('waitLogin resolves once .claude.json carries an oauthAccount email', async () => {
@@ -163,28 +185,30 @@ describe('the remote leg is resolved lazily, and its absence falls back to LOCAL
   })
 })
 
-describe('installHooksIntoLocalAccounts', () => {
-  it('installs into every LOCAL account dir and skips host-scoped ones', () => {
-    const extra: string[] = []
-    installHooksIntoLocalAccounts(
-      [{ id: 'aaa' }, { id: 'bbb', host: 'user@example' }, { id: 'ccc' }],
-      (d) => extra.push(d)
-    )
-    const dirs = ['aaa', 'ccc'].map((id) => accountConfigDir(userDataDir, id))
-    expect(installed).toEqual(dirs)
-    expect(extra).toEqual(dirs)
-    expect(tui).toEqual(dirs)
+describe('claudeAccounts.setSkillSharing', () => {
+  it('reconciles the account dir and reports what happened', async () => {
+    registerClaudeAccountsIpc()
+    const res = await call(IPC.claudeAccountsSetSkillSharing, 'aaa', true)
+    expect(shared).toEqual([{ dir: accountConfigDir(userDataDir, 'aaa'), enabled: true }])
+    expect(res).toMatchObject({ linked: 2, shared: 2 })
   })
 
-  it('one failing account never stops the rest (boot must not be blocked)', () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    mkdirSync(path.join(userDataDir, 'claude-accounts'), { recursive: true })
-    installHooksIntoLocalAccounts([{ id: 'aaa' }, { id: '../evil' }, { id: 'ccc' }])
-    expect(installed).toEqual(
-      ['aaa', 'ccc'].map((id) => accountConfigDir(userDataDir, id))
-    )
-    expect(warn).toHaveBeenCalled()
-    warn.mockRestore()
+  // A remote account's config dir is on its HOST; reconciling the local one would link this
+  // machine's skills into a directory the session never reads. v1 refuses instead of guessing.
+  it('refuses a remote (SSH) account and touches no filesystem', async () => {
+    registerClaudeAccountsSource(() => [
+      { id: 'aaa', label: 'r', host: 'user@example', createdAt: 0 } as ClaudeAccount
+    ])
+    registerClaudeAccountsIpc()
+    const res = await call(IPC.claudeAccountsSetSkillSharing, 'aaa', true)
+    expect(res.refused).toBe('remote-account')
+    expect(shared).toEqual([])
+  })
+
+  it('refuses an id that could traverse out of the accounts root', async () => {
+    registerClaudeAccountsIpc()
+    await expect(call(IPC.claudeAccountsSetSkillSharing, '../evil', true)).rejects.toThrow()
+    expect(shared).toEqual([])
   })
 })
 
@@ -202,18 +226,23 @@ describe('claudeAccounts.link', () => {
   })
   afterEach(() => rmSync(linkDir, { recursive: true, force: true }))
 
-  it('links an existing dir: id + normalized path + email, hook and TUI installed into it', async () => {
+  it('links an existing dir: id + normalized path + email, and asks the consent lifecycle to install into it', async () => {
     writeFileSync(
       path.join(linkDir, '.claude.json'),
       JSON.stringify({ oauthAccount: { emailAddress: 'second@example.com' } })
     )
-    const res = await call(IPC.claudeAccountsLink, `${linkDir}/`)
-    expect(res.id).toMatch(/^[A-Za-z0-9-]+$/)
-    expect(res.configDir).toBe(linkDir) // trailing slash normalized away
-    expect(res.email).toBe('second@example.com')
-    // The same two writes an ADDED account gets — or the linked identity reports no agent status.
-    expect(installed).toEqual([linkDir])
-    expect(tui).toEqual([linkDir])
+    const asked: string[] = []
+    registerIntegrationLifecycle({ installIntoClaudeAccount: (d: string) => asked.push(d) } as unknown as IntegrationLifecycle)
+    try {
+      const res = await call(IPC.claudeAccountsLink, `${linkDir}/`)
+      expect(res.id).toMatch(/^[A-Za-z0-9-]+$/)
+      expect(res.configDir).toBe(linkDir) // trailing slash normalized away
+      expect(res.email).toBe('second@example.com')
+      // The same install an ADDED account gets — or the linked identity reports no agent status.
+      expect(asked).toEqual([linkDir])
+    } finally {
+      registerIntegrationLifecycle(null)
+    }
   })
 
   it('is email: null — not a failure — when the dir is not signed in yet', async () => {
@@ -319,12 +348,148 @@ describe('removing a LINKED account never deletes the directory', () => {
   })
 })
 
-describe('installHooksIntoLocalAccounts covers linked accounts', () => {
-  it('installs into the linked dir, not into a managed dir that does not exist', () => {
+// The running-node "Switch Claude account" copy. The renderer is not the boundary: core decides
+// which accounts are real targets, and it never copies into a pending/remote/unknown one.
+describe('claudeAccounts.copySession', () => {
+  const SID = '0123abcd-4567-89ef-0123-456789abcdef'
+  const acct = (id: string, extra: Partial<ClaudeAccount> = {}): ClaudeAccount => ({
+    id,
+    label: id,
+    createdAt: 0,
+    ...extra
+  })
+  const seed = (accountId: string, body: string): string => {
+    const dir = path.join(accountConfigDir(userDataDir, accountId), 'projects', '-work-repo')
+    mkdirSync(dir, { recursive: true })
+    const f = path.join(dir, `${SID}.jsonl`)
+    writeFileSync(f, body)
+    return f
+  }
+  const targetFile = (accountId: string): string =>
+    path.join(accountConfigDir(userDataDir, accountId), 'projects', '-work-repo', `${SID}.jsonl`)
+
+  it('copies the transcript into the target account under the same project dir', async () => {
+    registerClaudeAccountsSource(() => [acct('aaa'), acct('bbb')])
+    registerClaudeAccountsIpc()
+    seed('aaa', '{"a":1}\n')
+    expect(await call(IPC.claudeAccountsCopySession, SID, 'aaa', 'bbb')).toEqual({
+      ok: true,
+      copied: true
+    })
+    expect(readFileSync(targetFile('bbb'), 'utf8')).toBe('{"a":1}\n')
+  })
+
+  it('copies into the SYSTEM ~/.claude when the target is undefined', async () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'nt-home-'))
+    const prev = process.env.HOME
+    process.env.HOME = home
+    try {
+      registerClaudeAccountsSource(() => [acct('aaa')])
+      registerClaudeAccountsIpc()
+      seed('aaa', 'x\n')
+      expect(await call(IPC.claudeAccountsCopySession, SID, 'aaa', undefined)).toEqual({
+        ok: true,
+        copied: true
+      })
+      expect(
+        readFileSync(path.join(home, '.claude', 'projects', '-work-repo', `${SID}.jsonl`), 'utf8')
+      ).toBe('x\n')
+    } finally {
+      process.env.HOME = prev
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses a pending, remote or unlisted target — and copies nothing', async () => {
     registerClaudeAccountsSource(() => [
-      { id: 'linked', label: 'l', configDir: '/home/u/.claude-2', createdAt: 0 } as ClaudeAccount
+      acct('aaa'),
+      acct('pend', { pending: true }),
+      acct('rem', { host: 'u@h' })
     ])
-    installHooksIntoLocalAccounts([{ id: 'linked' }, { id: 'managed' }])
-    expect(installed).toEqual(['/home/u/.claude-2', accountConfigDir(userDataDir, 'managed')])
+    registerClaudeAccountsIpc()
+    seed('aaa', 'x\n')
+    for (const t of ['pend', 'rem', 'nope']) {
+      expect(await call(IPC.claudeAccountsCopySession, SID, 'aaa', t)).toEqual({
+        ok: false,
+        reason: 'unknown-account'
+      })
+      expect(existsSync(targetFile(t))).toBe(false)
+    }
+  })
+
+  it('refuses a malformed session id or account id', async () => {
+    registerClaudeAccountsSource(() => [acct('aaa'), acct('bbb')])
+    registerClaudeAccountsIpc()
+    expect(await call(IPC.claudeAccountsCopySession, '../../etc', 'aaa', 'bbb')).toEqual({
+      ok: false,
+      reason: 'bad-request'
+    })
+    expect(await call(IPC.claudeAccountsCopySession, SID, 42, 'bbb')).toEqual({
+      ok: false,
+      reason: 'bad-request'
+    })
+  })
+
+  it('answers no-transcript when the source account has no such conversation', async () => {
+    registerClaudeAccountsSource(() => [acct('aaa'), acct('bbb')])
+    registerClaudeAccountsIpc()
+    expect(await call(IPC.claudeAccountsCopySession, SID, 'aaa', 'bbb')).toEqual({
+      ok: false,
+      reason: 'no-transcript'
+    })
+  })
+})
+
+describe('claudeAccounts.copySession over SSH (ctx.projectId)', () => {
+  const SID = '0123abcd-4567-89ef-0123-456789abcdef'
+  const acct = (id: string, extra: Partial<ClaudeAccount> = {}): ClaudeAccount => ({
+    id,
+    label: id,
+    createdAt: 0,
+    ...extra
+  })
+  const remoteWith = (copySession?: unknown) => ({
+    remote: () => ({
+      add: async () => null,
+      readLogin: async () => null,
+      remove: async () => {},
+      ...(copySession ? { copySession } : {})
+    })
+  })
+
+  it('hands remote accounts (with their hosts) to the shell leg and never touches local disk', async () => {
+    const leg = vi.fn(async () => ({ ok: true as const, copied: true }))
+    registerClaudeAccountsSource(() => [acct('r1', { host: 'u@h' }), acct('r2', { host: 'u@h' })])
+    registerClaudeAccountsIpc(remoteWith(leg) as never)
+    expect(await call(IPC.claudeAccountsCopySession, SID, 'r1', 'r2', { projectId: 'p1' })).toEqual({
+      ok: true,
+      copied: true
+    })
+    expect(leg).toHaveBeenCalledWith('p1', SID, { id: 'r1', host: 'u@h' }, { id: 'r2', host: 'u@h' })
+    // The host's system ~/.claude is `{}` — no id, no host.
+    await call(IPC.claudeAccountsCopySession, SID, 'r1', undefined, { projectId: 'p1' })
+    expect(leg).toHaveBeenLastCalledWith('p1', SID, { id: 'r1', host: 'u@h' }, {})
+  })
+
+  it('refuses a LOCAL or pending account as an SSH target', async () => {
+    const leg = vi.fn()
+    registerClaudeAccountsSource(() => [acct('loc'), acct('pend', { host: 'u@h', pending: true })])
+    registerClaudeAccountsIpc(remoteWith(leg) as never)
+    for (const t of ['loc', 'pend']) {
+      expect(await call(IPC.claudeAccountsCopySession, SID, undefined, t, { projectId: 'p1' })).toEqual({
+        ok: false,
+        reason: 'unknown-account'
+      })
+    }
+    expect(leg).not.toHaveBeenCalled()
+  })
+
+  it('answers failed for an SSH ctx with no remote leg (the Server Edition) — not a local copy', async () => {
+    registerClaudeAccountsSource(() => [acct('r1', { host: 'u@h' })])
+    registerClaudeAccountsIpc()
+    expect(await call(IPC.claudeAccountsCopySession, SID, undefined, 'r1', { projectId: 'p1' })).toEqual({
+      ok: false,
+      reason: 'failed'
+    })
   })
 })

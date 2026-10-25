@@ -8,6 +8,7 @@
 //  - and every miss path (no ownerProjectId, no reader, a reader that throws, a reader that HANGS)
 //    spawns exactly the session it spawned before this feature existed.
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import path from 'path'
 import { initPlatform, resetPlatformForTests } from './platform'
 import { fakePlatform, type FakePlatform } from './platform-fake'
 import { setRemoteSessionEnvWriter } from './remote-ssh/session-env'
@@ -16,6 +17,8 @@ import { TMUX_SOCKET, sessionName } from './tmux-naming'
 import { DEFAULT_SETTINGS } from '../shared/types'
 import { AUTH_ENV_STRIP, isReservedSpawnEnvKey } from './claude-accounts-core'
 import { MODEL_GATEWAY_ENV_KEYS } from '../shared/agents/model-gateway'
+import { setCustomAgentBaseResolver } from '../shared/agents/config'
+import { remoteCodexHome } from './codex-accounts-core'
 import { hookServer } from './agents/hook-server'
 import type { ProjectSpawnOverrides } from './project-spawn-overrides'
 
@@ -49,6 +52,14 @@ vi.mock('node-pty', () => ({
   }
 }))
 
+// The fake pty never prints, so a slot on the process-wide remote spawn gate is only freed by its
+// 5 s settle timer; every spawn after the 4th on one ControlMaster waited it out. Pacing is not
+// under test here (pty-spawn-gate.test.ts covers it).
+vi.mock('./remote-ssh/pty-spawn-gate', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./remote-ssh/pty-spawn-gate')>()
+  return { ...actual, remotePtySpawnGate: new actual.PtySpawnGate(Infinity) }
+})
+
 // Never let the developer's own pty pressure refuse a spawn (see pty-typing.test.ts).
 vi.mock('./pty-devices', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./pty-devices')>()),
@@ -60,6 +71,14 @@ vi.mock('./exec-path', async (importOriginal) => ({
   findExecutableSync: (bin: string) => (bin === 'ssh' ? '/usr/bin/ssh' : null),
   shellPathNow: () => '/usr/bin:/bin',
   resolveShellPath: async () => '/usr/bin:/bin'
+}))
+
+const fakeAgy = vi.hoisted(() =>
+  process.platform === 'win32' ? 'C:\\vendor\\agy\\bin\\agy.exe' : '/vendor/agy/bin/agy'
+)
+vi.mock('./agents/hooks/antigravity', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./agents/hooks/antigravity')>()),
+  findAgy: () => fakeAgy
 }))
 
 // Every tmux/ssh side-call (the freshness probe, `set-option`) answers "fine" without a subprocess.
@@ -116,6 +135,18 @@ describe('project settings at the spawn — LOCAL leg', () => {
     expect(spawns[0].env.PROJECT_TOKEN).toBe('abc')
   })
 
+  it('puts the detected agy directory on only an Antigravity session PATH', async () => {
+    await manager(null)
+    await create({ persistKey: 'antigravity-node', agentId: 'antigravity' })
+    await create({ persistKey: 'plain-node' })
+
+    // APPENDED, never ahead of the user's own entries (see pathWithAgyDir).
+    expect(spawns[0].env.PATH?.split(path.delimiter).at(-1)).toBe(path.dirname(fakeAgy))
+    expect(spawns[0].env.PATH?.split(path.delimiter)[0]).toBe('/usr/bin')
+    expect(Object.keys(spawns[0].env).filter((key) => key.toUpperCase() === 'PATH')).toEqual(['PATH'])
+    expect(spawns[1].env.PATH).toBe('/usr/bin:/bin')
+  })
+
   it('asks the reader with the OWNING project id, once per spawn', async () => {
     const seen: string[] = []
     await manager(async (id) => {
@@ -124,6 +155,34 @@ describe('project settings at the spawn — LOCAL leg', () => {
     })
     await create({ persistKey: NODE, ownerProjectId: PROJECT })
     expect(seen).toEqual([PROJECT])
+  })
+
+  it('a burst of spawns for one project shares ONE in-flight read, and each gets its own copy', async () => {
+    // A project switch mounts every node at once; on an SSH project each read is an ssh round trip,
+    // and 41 of them spread the terminals over ~1.3 s (measured). Joining the in-flight read fixes it.
+    let calls = 0
+    let release!: (v: ProjectSpawnOverrides | null) => void
+    await manager(() => {
+      calls++
+      return new Promise((r) => (release = r))
+    })
+    const burst = ['n-a', 'n-b', 'n-c'].map((k) => create({ persistKey: k, ownerProjectId: PROJECT }))
+    await new Promise((r) => setTimeout(r, 0))
+    release({ env: { PROJECT_TOKEN: 'abc' } })
+    await Promise.all(burst)
+    expect(calls).toBe(1)
+    expect(spawns.map((s) => s.env.PROJECT_TOKEN)).toEqual(['abc', 'abc', 'abc'])
+  })
+
+  it('is not a cache: a spawn after the read settled reads again', async () => {
+    let calls = 0
+    await manager(async () => {
+      calls++
+      return null
+    })
+    await create({ persistKey: 'n-a', ownerProjectId: PROJECT })
+    await create({ persistKey: 'n-b', ownerProjectId: PROJECT })
+    expect(calls).toBe(2)
   })
 
   it('never asks — and changes nothing — when the pane has no proven owner', async () => {
@@ -358,6 +417,8 @@ describe('project settings at the spawn — SSH leg', () => {
   afterEach(() => {
     setRemoteSessionEnvWriter(null)
     resetPlatformForTests()
+    setCustomAgentBaseResolver(null)
+    vi.restoreAllMocks()
   })
 
   const sshRemote = {
@@ -369,6 +430,116 @@ describe('project settings at the spawn — SSH leg', () => {
 
   const create = async (options: Record<string, unknown>): Promise<unknown> =>
     fake.handlers[IPC.ptyCreate](1, { cols: 80, rows: 24, ...options })
+
+  it.each(['missing-account', '../unsafe'])(
+    'refuses remote managed Codex account %s before any spawn', async (accountId) => {
+      await manager(null)
+      const result = await create({ agentId: 'codex', accountId, persistKey: NODE, sshRemote })
+      expect(result).toMatchObject({ sessionId: '', fresh: false, unavailable: 'codex-account' })
+      expect(spawns).toHaveLength(0)
+      expect(staged).toHaveLength(0)
+    }
+  )
+
+  it('launches the remote login factory terminal under its managed Codex home', async () => {
+    const mgr = await manager(null)
+    mgr.init(() => ({ ...DEFAULT_SETTINGS, codexAccounts: [{ id: 'remote-account', label: 'Work', host: 'u@h' }] }))
+    // Matches createCodexAccountLoginNode(..., ssh): an agent-less terminal carrying
+    // accountId and remote cwd. workspace.test.ts pins that factory and its device-auth command.
+    const result = await create({ accountId: 'remote-account', cwd: '/srv/app', persistKey: NODE, sshRemote })
+    expect(result).not.toHaveProperty('unavailable')
+    expect(spawns).toHaveLength(1)
+    expect(spawns[0].file).toBe('/usr/bin/ssh')
+    expect(spawns[0].args.join(' ')).toContain(`CODEX_HOME=${remoteCodexHome('/home/u', 'remote-account')}`)
+    expect(spawns[0].args.join(' ')).toContain('NODETERM_CODEX_ACCOUNT_ID=remote-account')
+    expect(spawns[0].args.join(' ')).not.toContain('CLAUDE_CONFIG_DIR=')
+  })
+
+  it('refuses an agent-less login before remote home discovery', async () => {
+    const mgr = await manager(null)
+    mgr.init(() => ({ ...DEFAULT_SETTINGS, codexAccounts: [{ id: 'remote-account', label: 'Work', host: 'u@h' }] }))
+    const result = await create({ accountId: 'remote-account', persistKey: NODE, sshRemote: { ...sshRemote, remoteHome: undefined } })
+    expect(result).toMatchObject({ unavailable: 'codex-account' })
+    expect(spawns).toHaveLength(0)
+    expect(staged).toHaveLength(0)
+  })
+
+  it('refuses an unsafe id even if it appears in saved Codex accounts', async () => {
+    const mgr = await manager(null)
+    mgr.init(() => ({ ...DEFAULT_SETTINGS, codexAccounts: [{ id: '../unsafe', label: 'Invalid', host: 'u@h' }] }))
+    const result = await create({ accountId: '../unsafe', persistKey: NODE, sshRemote })
+    expect(result).toMatchObject({ unavailable: 'codex-account' })
+    expect(spawns).toHaveLength(0)
+    expect(staged).toHaveLength(0)
+  })
+
+  describe.each(['codex', 'custom:codex'])('%s remote scope', (agentId) => {
+    async function codexManager() {
+      const mgr = await manager(null)
+      mgr.init(() => ({
+        ...DEFAULT_SETTINGS,
+        codexAccounts: [{ id: 'remote-account', label: 'Work', host: 'u@h' }],
+        customAgents: [{ id: 'custom:codex', label: 'Codex wrapper', baseAgent: 'codex', launchCmd: 'codex' }]
+      }))
+      return mgr
+    }
+
+    it('launches a known managed account with its private remote scope', async () => {
+      await codexManager()
+      const result = await create({ agentId, accountId: 'remote-account', persistKey: NODE, sshRemote })
+      expect(result).not.toHaveProperty('unavailable')
+      expect(spawns).toHaveLength(1)
+      expect(spawns[0].file).toBe('/usr/bin/ssh')
+      expect(spawns[0].args.join(' ')).toContain(`CODEX_HOME=${remoteCodexHome('/home/u', 'remote-account')}`)
+      expect(spawns[0].args.join(' ')).toContain('NODETERM_CODEX_ACCOUNT_ID=remote-account')
+      expect(spawns[0].args.join(' ')).not.toContain('CLAUDE_CONFIG_DIR=')
+    })
+
+    it.each([undefined, '', 'relative/home', '/home/u\nunsafe', '/home/$(id)'])(
+      'refuses a known managed account with unsafe or unresolved home %s', async (remoteHome) => {
+        await codexManager()
+        const result = await create({ agentId, accountId: 'remote-account', persistKey: NODE, sshRemote: { ...sshRemote, remoteHome } })
+        expect(result).toMatchObject({ unavailable: 'codex-account' })
+        expect(spawns).toHaveLength(0)
+        expect(staged).toHaveLength(0)
+      }
+    )
+
+    it.each(['remote-account', 'missing-account', '../unsafe'])(
+      'refuses managed id %s even before home discovery', async (accountId) => {
+        await codexManager()
+        const result = await create({ agentId, accountId, persistKey: NODE, sshRemote: { ...sshRemote, remoteHome: undefined } })
+        expect(result).toMatchObject({ unavailable: 'codex-account' })
+        expect(spawns).toHaveLength(0)
+        expect(staged).toHaveLength(0)
+      }
+    )
+
+    it.each([undefined, '', 'relative/home', 'C:\\Users\\remote', '/home/u'])(
+      'allows system scope with home %s without overriding host credentials', async (remoteHome) => {
+        await codexManager()
+        const result = await create({ agentId, persistKey: NODE, sshRemote: { ...sshRemote, remoteHome } })
+        expect(result).not.toHaveProperty('unavailable')
+        expect(spawns).toHaveLength(1)
+        expect(spawns[0].file).toBe('/usr/bin/ssh')
+        const command = spawns[0].args.join(' ')
+        expect(command).not.toMatch(/(?:CODEX_HOME|HOME|NODETERM_CODEX_ACCOUNT_ID|CLAUDE_CONFIG_DIR)=/)
+        expect(staged).toHaveLength(0)
+      }
+    )
+
+    it('attaches a confirmed existing session before home discovery', async () => {
+      const mgr = await codexManager()
+      vi.spyOn(mgr as unknown as { remoteSessionVerdict: () => Promise<string> }, 'remoteSessionVerdict').mockResolvedValue('present')
+      const result = await create({ agentId, persistKey: NODE, requireRemote: true, sshRemote: { ...sshRemote, remoteHome: undefined } })
+      expect(result).toMatchObject({ fresh: false })
+      expect(result).not.toHaveProperty('unavailable')
+      expect(spawns).toHaveLength(1)
+      expect(spawns[0].file).toBe('/usr/bin/ssh')
+      expect(spawns[0].args.join(' ')).toContain(sessionName(NODE))
+      expect(spawns[0].args.join(' ')).not.toContain('CODEX_HOME=')
+    })
+  })
 
   it("stages the project's env in the 0600 file — never on the ssh argv", async () => {
     await manager(async () => ({ env: { PROJECT_TOKEN: 'sekrit' } }))

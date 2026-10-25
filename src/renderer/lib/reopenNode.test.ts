@@ -16,6 +16,31 @@ const baseCtx = () => ({
   permissionModeFor: () => undefined
 })
 
+describe('whiteboard reopen', () => {
+  const node = {
+    id: 'whiteboard-closed',
+    type: 'whiteboard' as const,
+    position: { x: 5, y: 6 },
+    width: 900,
+    height: 600,
+    data: { title: 'Board', color: '#64d2ff', group: null }
+  }
+
+  it('a snapshot remembers the closed board by id, so the rebuilt node can read its file', () => {
+    const snap = snapshotNode(node, [{ id: node.id, position: node.position }])
+    expect(snap?.data.whiteboardSource).toBe('whiteboard-closed')
+  })
+
+  it('rebuilds a whiteboard that reads the old board and does not jump into editing', () => {
+    const snap = snapshotNode(node, [{ id: node.id, position: node.position }]) as ReopenNodeSnapshot
+    const rebuilt = recreateNodeFromSnapshot(snap, baseCtx())
+    expect(rebuilt?.type).toBe('whiteboard')
+    expect(rebuilt?.id).not.toBe('whiteboard-closed')
+    expect(rebuilt?.data.whiteboardSource).toBe('whiteboard-closed')
+    expect(rebuilt?.data.autoEdit).toBeUndefined()
+  })
+})
+
 describe('snapshotNode', () => {
   it('captures a leaf node, resolving absolute position through its parent chain', () => {
     const all = [
@@ -115,6 +140,20 @@ describe('recreateNodeFromSnapshot', () => {
       baseCtx()
     )
     expect(node).toBeNull()
+  })
+
+  // ⇧⌘T used to bring a session back without its icon: `icon` was not a cosmetic key.
+  it('carries the node icon over, re-validated', () => {
+    const withIcon = (icon: unknown) =>
+      recreateNodeFromSnapshot(
+        snap({ type: 'terminal', data: { title: 'db', color: '#fff', group: null, icon: icon as never } }),
+        baseCtx()
+      )
+    expect(withIcon({ type: 'lucide', name: 'database' })!.data.icon).toEqual({
+      type: 'lucide',
+      name: 'database'
+    })
+    expect(withIcon({ type: 'lucide', name: 'nope' })!.data.icon).toBeUndefined()
   })
 
   it('recreates a dino node carrying its high score', () => {

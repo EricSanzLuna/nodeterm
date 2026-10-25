@@ -1,4 +1,8 @@
 import { getViewportForBounds, type Rect, type Viewport } from '@xyflow/system'
+import { rootPositionWith } from '@shared/root-position'
+
+import { NO_INSETS, measurePinnedInsets, type RectLike, type ScreenInsets } from './pinnedInsets'
+import { measureMaximizeInsets } from './maximizeInsets'
 
 /**
  * "Zoom to this node" geometry, computed without React Flow's `fitView`.
@@ -35,6 +39,26 @@ export interface FocusableNode {
   style?: { width?: number | string | null; height?: number | string | null }
 }
 
+/**
+ * Is this node currently MAXIMIZED — i.e. was it placed against the chrome-free rectangle rather
+ * than dropped somewhere by hand?
+ *
+ * `premaxRect` is the maximize MODE flag (`maximizeNodeToRect` writes it, `restoreMaximizedNode`
+ * clears it), which is what makes it the right key here: it is exactly the set of nodes whose
+ * position was chosen by `maximizeTargetRect`, and the fix below is about framing a node against
+ * the rectangle its own placement used.
+ *
+ * It survives things that make the node no longer free-area-sized — a manual resize, a window
+ * resize (maximize deliberately does not re-fit on those) — and that is acceptable in both
+ * directions: with no pinned panel the inset is zero and this decision is a no-op, and with one
+ * the worst case is a node framed clear of a panel it was already meant to clear. Unpinning the
+ * panel needs no special case at all: `fitMaximizedToUsableArea` re-fits every maximized node
+ * whenever the insets change, so the flag and the geometry re-converge on their own.
+ */
+export function isMaximized(node: { data?: { premaxRect?: unknown } } | null | undefined): boolean {
+  return !!node?.data?.premaxRect
+}
+
 /** Zoom/padding for framing a single node, shared by both framing paths here so the whole-pane
  *  and chrome-free-frame answers cannot drift apart: the clamp keeps a small node from filling the
  *  screen and a huge one from being fit microscopic. */
@@ -63,20 +87,7 @@ export function absolutePosition(
   node: FocusableNode,
   all: readonly FocusableNode[]
 ): { x: number; y: number } {
-  let x = node.position.x
-  let y = node.position.y
-  let parentId = node.parentId
-  const seen = new Set<string>([node.id])
-  for (let depth = 0; parentId && depth < MAX_PARENT_DEPTH; depth++) {
-    if (seen.has(parentId)) break
-    seen.add(parentId)
-    const parent = all.find((n) => n.id === parentId)
-    if (!parent) break
-    x += parent.position.x
-    y += parent.position.y
-    parentId = parent.parentId
-  }
-  return { x, y }
+  return rootPositionWith(node, (id) => all.find((n) => n.id === id), MAX_PARENT_DEPTH)
 }
 
 /**
@@ -93,13 +104,24 @@ export function nodeFitRect(node: FocusableNode, all: readonly FocusableNode[]):
  * The viewport that frames `rect` in a `containerWidth × containerHeight` pane, with the same
  * padding/zoom clamp `fitView` would have applied. Null when the container has no size yet.
  *
- * **Centred in the pane, and nothing else.** Framing a focused node against the chrome-free
- * rectangle instead — centred in it, or centred in the pane and then nudged clear of it — was tried
- * twice and is wrong both ways: the sessions sidebar is a 300px OVERLAY, so either rule pushes the
- * node right by most of its width, and "go to node" stops putting the node where the eye is. The
- * couple of dozen pixels of a node that end up behind the sidebar cost far less than that. The
- * free-rect solve stays where it earns its keep, in `fitAll`, which fits EVERY node and would
- * otherwise tuck them under the dock.
+ * **Centred in the pane, and nothing else — `insets` default to none.** Framing a focused node
+ * against the chrome-free rectangle instead — centred in it, or centred in the pane and then
+ * nudged clear of it — was tried twice and is wrong both ways: the sessions sidebar is a 300px
+ * OVERLAY, so either rule pushes the node right by most of its width, and "go to node" stops
+ * putting the node where the eye is. The couple of dozen pixels of a node that end up behind the
+ * sidebar cost far less than that. The free-rect solve stays where it earns its keep, in `fitAll`,
+ * which fits EVERY node and would otherwise tuck them under the dock.
+ *
+ * **The MAXIMIZED exception (issue #743), and why it is not a walk-back of that trade-off.** The
+ * trade-off above rests on one number: how much of the node ends up behind the panel. For an
+ * ordinary node that is a couple of dozen pixels (33px, measured by the reporter). For a maximized
+ * one the premise inverts by CONSTRUCTION, not by degree: `maximizeTargetRect` sized the node to
+ * be *exactly* as wide as the free area, so centring it in the wider pane buries half the inset
+ * less the margin — 137px in the reported layout, and it scales with the PANEL, not with the node.
+ * It cannot come out as a few dozen pixels. So a maximized node is framed against the same
+ * rectangle its own placement used, which — since the node is that rectangle minus two margins —
+ * reproduces exactly where maximize put it. Everything else still centres in the whole pane,
+ * because `insets` is `NO_INSETS` unless the caller says otherwise.
  *
  * `zoom` keeps the camera at a scale the caller already has (`settings.focusZoomToNode` off): the
  * node is centred exactly as it would be, at that zoom, so "go to" stays a pan. It is passed
@@ -110,25 +132,35 @@ export function viewportForRect(
   rect: Rect,
   containerWidth: number,
   containerHeight: number,
-  zoom?: number
+  zoom?: number,
+  insets: ScreenInsets = NO_INSETS
 ): Viewport | null {
   if (!(containerWidth > 0) || !(containerHeight > 0)) return null
+  // A pane narrower than the panels covering it is not a rectangle anything can be centred in —
+  // fall back to the whole pane rather than solving against a negative width.
+  const freeWidth = containerWidth - insets.left - insets.right
+  const originX = freeWidth > 0 ? insets.left : 0
+  const width = freeWidth > 0 ? freeWidth : containerWidth
+  const freeHeight = containerHeight - (insets.top ?? 0) - (insets.bottom ?? 0)
+  const originY = freeHeight > 0 ? (insets.top ?? 0) : 0
+  const height = freeHeight > 0 ? freeHeight : containerHeight
   if (zoom !== undefined) {
     if (!(zoom > 0)) return null
     return {
-      x: containerWidth / 2 - (rect.x + rect.width / 2) * zoom,
-      y: containerHeight / 2 - (rect.y + rect.height / 2) * zoom,
+      x: originX + width / 2 - (rect.x + rect.width / 2) * zoom,
+      y: originY + height / 2 - (rect.y + rect.height / 2) * zoom,
       zoom
     }
   }
-  return getViewportForBounds(
+  const fitted = getViewportForBounds(
     rect,
-    containerWidth,
-    containerHeight,
+    width,
+    height,
     FIT_NODE_OPTIONS.minZoom,
     FIT_NODE_OPTIONS.maxZoom,
     FIT_NODE_OPTIONS.padding
   )
+  return { ...fitted, x: fitted.x + originX, y: fitted.y + originY }
 }
 
 /** Whether React Flow already knows this node's on-screen size — i.e. whether `fitView` will
@@ -138,4 +170,73 @@ export function isMeasured(
   node: { measured?: { width?: number | null; height?: number | null } } | null | undefined
 ): boolean {
   return !!(numeric(node?.measured?.width) && numeric(node?.measured?.height))
+}
+
+/** Gap kept between a nudged node and the pinned panel it was moved clear of, room permitting. */
+const PINNED_CLEAR_GAP_PX = 12
+
+/**
+ * Keep a pane-centred node out from under a PINNED side panel (issue #854).
+ *
+ * Why this is not the rejected "nudge clear of the chrome" from 5e8abfe7: that one cleared the
+ * sessions sidebar as an OVERLAY — open, by definition, whenever "go to node" is clicked from it —
+ * so every jump moved right. This one only knows PINNED panels (`measurePinnedInsets`), which the
+ * user placed there to stay ("this one stays", see pinnedInsets.ts). With nothing pinned, or a
+ * node that already clears the panel, the viewport is returned untouched: centred in the pane.
+ *
+ * Otherwise, in order:
+ *  - the node fits the free area at this zoom → shift it just clear of the panel (plus a small gap
+ *    when there is room), not re-centred in the free area: the least movement that uncovers it;
+ *  - it does not fit, and the zoom was the caller's (`focusZoomToNode` off) → leave it centred: a
+ *    shift would only swap which edge is covered (the rule 5e8abfe7 already stated);
+ *  - it does not fit, and the zoom is ours to choose → fit it into the free area, the way a
+ *    maximized node is framed (#743).
+ * Vertical placement is never touched.
+ */
+export function clearOfPinnedPanels(
+  viewport: Viewport,
+  rect: Rect,
+  containerWidth: number,
+  containerHeight: number,
+  insets: ScreenInsets,
+  keepZoom?: number
+): Viewport {
+  if (!insets.left && !insets.right) return viewport
+  const freeLeft = insets.left
+  const freeRight = containerWidth - insets.right
+  const freeWidth = freeRight - freeLeft
+  if (!(freeWidth > 0)) return viewport
+  const left = viewport.x + rect.x * viewport.zoom
+  const width = rect.width * viewport.zoom
+  const right = left + width
+  if (left >= freeLeft && right <= freeRight) return viewport
+  if (width <= freeWidth) {
+    const gap = Math.min(PINNED_CLEAR_GAP_PX, (freeWidth - width) / 2)
+    const shift = left < freeLeft ? freeLeft + gap - left : freeRight - gap - right
+    return { ...viewport, x: viewport.x + shift }
+  }
+  if (keepZoom !== undefined) return viewport
+  return (
+    viewportForRect(rect, containerWidth, containerHeight, undefined, {
+      left: insets.left,
+      right: insets.right
+    }) ?? viewport
+  )
+}
+
+/** Shared Canvas focus policy. A maximized node is framed against its placement's chrome
+ * reservations (#743). Any other node is centred in the whole pane, then kept clear of a PINNED
+ * side panel it would otherwise land under (#854; see `clearOfPinnedPanels`). */
+export function viewportForNodeFocus(
+  node: { data?: { premaxRect?: unknown } },
+  rect: Rect,
+  box: RectLike & { width: number; height: number },
+  zoom?: number
+): Viewport | null {
+  if (isMaximized(node)) {
+    return viewportForRect(rect, box.width, box.height, zoom, measureMaximizeInsets(box))
+  }
+  const centred = viewportForRect(rect, box.width, box.height, zoom, NO_INSETS)
+  if (!centred) return null
+  return clearOfPinnedPanels(centred, rect, box.width, box.height, measurePinnedInsets(box), zoom)
 }

@@ -6,7 +6,10 @@ import { installCodexHooks, removeCodexHooks } from './codex'
 import { installGeminiHooks, removeGeminiHooks } from './gemini'
 import { installOpencodeHooks, removeOpencodeHooks } from './opencode'
 import { installGrokHooks, removeGrokHooks } from './grok'
+import { ensureGrokHomeProbed, grokHomeDir, grokHomeFallbackWasSilent } from '../grok-paths'
 import { installCopilotHooks, removeCopilotHooks } from './copilot'
+import { installAntigravityHooksWithProbe, removeAntigravityHooks } from './antigravity'
+import { installCursorHooks, removeCursorHooks } from './cursor'
 
 type HookInstaller = readonly [string, () => void]
 
@@ -16,7 +19,14 @@ export const MANAGED_HOOK_INSTALLERS: readonly HookInstaller[] = [
   ['gemini', installGeminiHooks],
   ['opencode', installOpencodeHooks],
   ['grok', installGrokHooks],
-  ['copilot', installCopilotHooks]
+  ['copilot', installCopilotHooks],
+  // Writes the GLOBAL ~/.gemini/config/hooks.json: a synchronous gate in front of every agy tool
+  // call on the machine. Only where agy is installed, decided in two passes around the login-shell
+  // PATH probe (the same shape as grok's $GROK_HOME re-install below); refuses on Windows while
+  // cmd.exe has an AutoRun (antigravity-autorun.ts).
+  ['antigravity', () => void installAntigravityHooksWithProbe()],
+  // Merges into the SHARED ~/.cursor/hooks.json (IDE + other tools), only where cursor-agent exists.
+  ['cursor', () => void installCursorHooks()]
 ]
 
 export const MANAGED_HOOK_REMOVERS: readonly HookInstaller[] = [
@@ -25,11 +35,49 @@ export const MANAGED_HOOK_REMOVERS: readonly HookInstaller[] = [
   ['gemini', removeGeminiHooks],
   ['opencode', removeOpencodeHooks],
   ['grok', removeGrokHooks],
-  ['copilot', removeCopilotHooks]
+  ['copilot', removeCopilotHooks],
+  ['antigravity', () => removeAntigravityHooks()],
+  ['cursor', () => removeCursorHooks()]
 ]
 
-export function installManagedAgentHooks(): void {
+/**
+ * Install (or refresh) the managed status hook for exactly the agents in `agents` — the ones the
+ * user consented to (issue #744, `core/agent-integrations.ts`). REQUIRED, so no caller can reach the
+ * global writes by omission.
+ */
+export function installManagedAgentHooks(agents: ReadonlySet<string>): void {
+  // Ask the login shell where grok lives BEFORE writing its hook file, and re-write it if the answer
+  // moves the target. A GUI app launched from Finder/Dock/`.desktop` never sourced the user's rc,
+  // while the grok CLI — started by the shell inside a tmux pane — did; for a user whose only
+  // `export GROK_HOME=…` lives there, we install into `~/.grok` and grok reads somewhere else. That
+  // failure is TOTAL and SILENT: no badge, no unread dot, no notification, no session name, ever.
+  //
+  // Fire-and-forget and fail-open, exactly like the claude TUI call below: the first install still
+  // happens synchronously against today's answer, so boot is never delayed and the pre-probe
+  // behaviour is preserved. When the probe lands somewhere else, the second install puts the file
+  // where grok will actually look — and when it lands nowhere, `grokHomeFallbackWasSilent` records
+  // that we fell back without evidence, which is the diagnostic this bug never had.
+  const grokHomeAtInstall = grokHomeDir()
+  if (agents.has('grok')) void ensureGrokHomeProbed().then(() => {
+    // The diagnostic the flag exists for. Without this line `grokHomeFallbackWasSilent` promised an
+    // explanation the user never saw, which is the very failure it was written to close.
+    if (grokHomeFallbackWasSilent()) {
+      console.warn(
+        `[agent-hooks] grok: could not confirm $GROK_HOME (the login-shell probe returned nothing), ` +
+          `so hooks were installed into the default ${grokHomeDir()}. If grok reads a different ` +
+          `GROK_HOME, its nodes will show no status, no session name and no notifications, silently. ` +
+          `Set GROK_HOME in the environment nodeterm itself is launched from to make this definite.`
+      )
+    }
+    if (grokHomeDir() === grokHomeAtInstall) return
+    try {
+      installGrokHooks()
+    } catch (e) {
+      console.warn('[agent-hooks] grok re-install after $GROK_HOME probe failed', e)
+    }
+  })
   for (const [agent, install] of MANAGED_HOOK_INSTALLERS) {
+    if (!agents.has(agent)) continue
     try {
       install()
     } catch (e) {
@@ -40,11 +88,14 @@ export function installManagedAgentHooks(): void {
   // version-gated) right after its hooks land. Fire-and-forget (it awaits the memoized CLI probe)
   // and fail-open, so it never blocks boot — and runs on BOTH desktop and Server Edition, which
   // both call this at launch. Managed account dirs are ensured by their own install call sites.
-  void ensureClaudeFullscreenTui()
+  if (agents.has('claude')) void ensureClaudeFullscreenTui()
 }
 
-export function removeManagedAgentHooks(): void {
+/** Remove the managed hook from the agents in `agents` (all of them when omitted — the uninstall
+ *  path). Exact-command matching: only OUR handler is stripped, a user's own hooks survive. */
+export function removeManagedAgentHooks(agents?: ReadonlySet<string>): void {
   for (const [agent, remove] of MANAGED_HOOK_REMOVERS) {
+    if (agents && !agents.has(agent)) continue
     try {
       remove()
     } catch (e) {

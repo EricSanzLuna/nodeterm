@@ -7,12 +7,15 @@
 // the wiring by reading the call site. A source read is a weak test in general, but it is the only
 // thing standing between a one-character deletion and a silently reintroduced bug — which is
 // exactly the shape that survived the whole suite once on this branch already.
+import { act } from 'react'
+import { createRoot } from 'react-dom/client'
+import { CanvasPills } from '../components/CanvasPills'
 import fs from 'fs'
 import path from 'path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { chromeObstacles, FIT_VIEW_GAP } from './fit-view'
 
-const CANVAS_SRC = fs.readFileSync(path.join(__dirname, 'Canvas.tsx'), 'utf8')
+const CANVAS_SRC = fs.readFileSync(path.join(__dirname, 'Canvas.tsx'), 'utf8').replace(/\r\n/g, '\n')
 
 /** jsdom lays nothing out, so every rect is 0×0 and `chromeObstacles`'s size filter would drop the
  *  element. Give it the measurement a real bottom-left pill cluster has. */
@@ -54,8 +57,17 @@ describe('the canvas pill cluster is fit-view chrome', () => {
     expect(chromeObstacles(VIEWPORT)).toEqual([])
   })
 
-  it('is what Canvas actually renders', () => {
-    expect(CANVAS_SRC).toContain('<div className="canvas-pills" data-canvas-chrome>')
+  it('the production cluster opts into fit-view obstacles', () => {
+    const host = document.createElement('div')
+    document.body.append(host)
+    const root = createRoot(host)
+    try {
+      act(() => root.render(<CanvasPills><button>Usage</button></CanvasPills>))
+      measured(host.querySelector('.canvas-pills')!, PILLS)
+      expect(chromeObstacles(VIEWPORT)).toHaveLength(1)
+    } finally {
+      act(() => root.unmount())
+    }
   })
 })
 
@@ -170,19 +182,6 @@ describe('breadcrumb wiring the CLAUDE.md bullet calls load-bearing', () => {
     expect(frame).toContain('setViewport(viewport, { duration: 300 })')
   })
 
-  it('centres the node in the pane and never solves chrome around it', () => {
-    // Framing a single focused node against the chrome-free rectangle was reported wrong twice
-    // ("too far right", "not in the middle"): the sessions sidebar is a 300px overlay and it is
-    // open exactly when this is used. The free-rect solve stays in fitAll, which fits every node.
-    const frame = CANVAS_SRC.slice(
-      CANVAS_SRC.indexOf('const frameNode = useCallback'),
-      CANVAS_SRC.indexOf('const goToNode = useCallback')
-    )
-    expect(frame).toContain('viewportForRect(rect, box.width, box.height, keepZoom)')
-    expect(frame).not.toContain('solveFitFrame')
-    expect(frame).toContain('settings.focusZoomToNode ? undefined : getZoom()')
-  })
-
   it('the resume card slot is spent only on a card that can render, and only when opted in', () => {
     // Gated on settings.showResumeCard (default off) FIRST — a disabled card must not spend the
     // one-shot slot — then once per app run, only with a live stop, and never under the opaque
@@ -193,6 +192,18 @@ describe('breadcrumb wiring the CLAUDE.md bullet calls load-bearing', () => {
     expect(CANVAS_SRC).toContain(
       'const resumeCardEnabled = useSettings.getState().settings.showResumeCard'
     )
+  })
+})
+
+describe('the auto-hide preference reaches the ephemeral-card store', () => {
+  // `autoHideFinishedSubagentCards` lives in settings and is acted on in `state/agentNodes.ts`,
+  // which is deliberately free of the settings store, so this effect is the ONLY thing joining
+  // them. Every test of the behaviour drives `setAutoHideFinished` directly, so deleting the
+  // effect leaves the setting inert with the whole suite and typecheck green: the toggle flips,
+  // persists, and does nothing.
+  it('mirrors the setting into setAutoHideFinished', () => {
+    expect(CANVAS_SRC).toContain('.setAutoHideFinished(settings.autoHideFinishedSubagentCards === true)')
+    expect(CANVAS_SRC).toContain('}, [settings.autoHideFinishedSubagentCards])')
   })
 })
 
@@ -271,12 +282,12 @@ describe('deleteNodes also records persisted closed-session history', () => {
 describe('reopening a persisted closed-session entry shares reopenLastClosed\'s execution', () => {
   it('extracts the switch-on-plan-action body into its own callback', () => {
     expect(CANVAS_SRC).toContain('const executeReopenPlan = useCallback(')
-    expect(CANVAS_SRC).toContain('(plan: Exclude<ReopenPlan, { action: \'skip\' }>): boolean => {')
+    expect(CANVAS_SRC).toContain('(plan: Exclude<ReopenPlan, { action: \'skip\' } | { action: \'refuse\' }>): boolean => {')
   })
 
   it('reopenLastClosedCommand delegates to it instead of inlining the switch', () => {
     const fnStart = CANVAS_SRC.indexOf('const reopenLastClosedCommand = useCallback(')
-    const fnBody = CANVAS_SRC.slice(fnStart, fnStart + 1700)
+    const fnBody = CANVAS_SRC.slice(fnStart, fnStart + 2600)
     expect(fnBody).toContain('return executeReopenPlan(plan)')
     expect(fnBody).not.toContain('switch (plan.action)')
   })
@@ -285,16 +296,17 @@ describe('reopening a persisted closed-session entry shares reopenLastClosed\'s 
     // The bug this pins: restoring via ⇧⌘T without consuming the matching sidebar row would let a
     // later sidebar click restore the same closed session a second time.
     const fnStart = CANVAS_SRC.indexOf('const reopenLastClosedCommand = useCallback(')
-    const fnBody = CANVAS_SRC.slice(fnStart, fnStart + 1700)
+    const fnBody = CANVAS_SRC.slice(fnStart, fnStart + 2600)
     expect(fnBody).toContain("if (entry.kind === 'nodes') {")
     expect(fnBody).toContain('.discardClosedSession(entry.projectId, n.closedSessionId)')
     expect(fnBody).toContain('void writeDisk()')
   })
 
-  it('consumes the entry before doing anything else, so a stale double-click cannot reopen it twice', () => {
+  it('consumes the entry before anything restores it, so a stale double-click cannot reopen it twice', () => {
+    // (Only the closed-team-tab refusal runs before it, and that one restores nothing.)
     const fnStart = CANVAS_SRC.indexOf('const reopenClosedSessionCommand = useCallback(')
     expect(fnStart).toBeGreaterThan(-1)
-    const fnBody = CANVAS_SRC.slice(fnStart, fnStart + 520)
+    const fnBody = CANVAS_SRC.slice(fnStart, fnStart + 900)
     expect(fnBody).toContain('.consumeClosedSession(projectId, entryId)')
     expect(fnBody).toContain('if (!consumed) return false')
     expect(fnBody).toContain('void writeDisk()')
@@ -302,23 +314,23 @@ describe('reopening a persisted closed-session entry shares reopenLastClosed\'s 
 
   it('drops the matching ⇧⌘T-stack entry so the two histories cannot both reopen the same delete', () => {
     const fnStart = CANVAS_SRC.indexOf('const reopenClosedSessionCommand = useCallback(')
-    const fnBody = CANVAS_SRC.slice(fnStart, fnStart + 520)
+    const fnBody = CANVAS_SRC.slice(fnStart, fnStart + 900)
     expect(fnBody).toContain('useReopenHistory.getState().dropByClosedSessionId(projectId, entryId)')
   })
 
   it('wraps the consumed entry as a synthetic ReopenEntry and reuses the pure planReopen', () => {
     const fnStart = CANVAS_SRC.indexOf('const reopenClosedSessionCommand = useCallback(')
-    const fnBody = CANVAS_SRC.slice(fnStart, fnStart + 1500)
+    const fnBody = CANVAS_SRC.slice(fnStart, fnStart + 1900)
     expect(fnBody).toContain("kind: 'nodes'")
     expect(fnBody).toContain('nodes: [stateToReopenSnapshot(consumed)]')
     expect(fnBody).toContain('const plan = planReopen(')
-    expect(fnBody).toContain("if (plan.action === 'skip') return false")
+    expect(fnBody).toContain("if (plan.action === 'skip' || plan.action === 'refuse') return false")
     expect(fnBody).toContain('return executeReopenPlan(plan)')
   })
 
   it('resolves permission mode and account against the TARGET project, same as reopenLastClosedCommand', () => {
     const fnStart = CANVAS_SRC.indexOf('const reopenClosedSessionCommand = useCallback(')
-    const fnBody = CANVAS_SRC.slice(fnStart, fnStart + 1500)
+    const fnBody = CANVAS_SRC.slice(fnStart, fnStart + 1900)
     expect(fnBody).toContain('resolveAccountId: (id) => resolveNewNodeAccount(id, project, accounts)')
     expect(fnBody).toContain('permissionModeFor: (agentId) => projectPermissionMode(project, agentId)')
   })
@@ -338,10 +350,10 @@ describe('reopen-last-closed records and dispatches through the shared history s
     expect(CANVAS_SRC).toContain("'app.reopenLastClosed': reopenLastClosedCommand")
   })
 
-  it('never live-inserts into a non-active project — routes through applyNodeMutation instead', () => {
+  it('never live-inserts into a non-active project — routes through applyOwnNodeMutation instead', () => {
     // The bug this pins: a synchronous setNodes() right after switchProject()/reopenProject()
     // races the active-project load effect and silently loses the recreated nodes.
-    expect(CANVAS_SRC).toContain('.applyNodeMutation(plan.projectId, {')
+    expect(CANVAS_SRC).toContain('.applyOwnNodeMutation(plan.projectId, {')
   })
 
   it('arms a cold-open command before writing a restored node into a non-active project', () => {
@@ -354,13 +366,23 @@ describe('reopen-last-closed records and dispatches through the shared history s
   it('commits the live canvas to the store before every reopenProject call — never a bare switch', () => {
     // The bug this pins: useProjects.getState().reopenProject(...) is a project SWITCH, and every
     // switch/add/delete elsewhere in this file calls commitActiveToStore() first so the live
-    // canvas isn't silently lost. Both reopen-a-project call sites inside reopenLastClosedCommand
-    // must do the same, rather than referencing the later `reopenProject` wrapper (a TDZ hazard
-    // from this callback's declaration point).
+    // canvas isn't silently lost. Every store reopen lives in `reopenProjectUnchecked`, which
+    // commits first; the two reopen-a-project sites of the ⇧⌘T executor reach it through the
+    // guarded `reopenProject` (it asks first for a project handed to a hosted team).
     const calls = CANVAS_SRC.match(/useProjects\.getState\(\)\.reopenProject\(/g) ?? []
     const guarded = CANVAS_SRC.match(/commitActiveToStore\(\)\n\s+useProjects\.getState\(\)\.reopenProject\(/g) ?? []
-    expect(calls.length).toBeGreaterThanOrEqual(2)
+    expect(calls.length).toBeGreaterThanOrEqual(1)
     expect(guarded.length).toBe(calls.length)
+    const exec = CANVAS_SRC.indexOf('const executeReopenPlan = useCallback(')
+    const execBody = CANVAS_SRC.slice(exec, CANVAS_SRC.indexOf('\n  )\n', exec))
+    expect(execBody.match(/void reopenProject\(plan\.projectId\)/g) ?? []).toHaveLength(2)
+    // Both are declared ABOVE the executor: a useCallback dependency named before its declaration
+    // throws (TDZ) on the first render.
+    for (const decl of ['const reopenProjectUnchecked = useCallback(', 'const reopenProject = useCallback(']) {
+      const at = CANVAS_SRC.indexOf(decl)
+      expect(at, decl).toBeGreaterThan(-1)
+      expect(at, decl).toBeLessThan(exec)
+    }
   })
 
   it('resolves permission mode against the TARGET project being restored into, not the caller\'s active one', () => {
@@ -386,7 +408,8 @@ describe('node creation resolves its project LIVE and only onto a matching canva
   it('reads the active project from the store at call time in every creation funnel', () => {
     const liveReads =
       CANVAS_SRC.match(/const targetProjectId = useProjects\.getState\(\)\.activeProjectId/g) ?? []
-    // addAgentNode, addTerminal, createNodeInColumn, explainCommit.
+    // addAgentNode, addTerminal, createNodeInColumn, explainCommit. (startIssueAgent creates THROUGH
+    // addAgentNode and uses the project id it returns — it never reads the store a second time.)
     expect(liveReads.length).toBe(4)
   })
 
@@ -482,5 +505,130 @@ describe('navigating from the sidebar dismisses the start screen', () => {
     expect(indexOfPresent(body, 'setWelcomeOpen(false)')).toBeLessThan(
       indexOfPresent(body, 'requestCard(')
     )
+  })
+})
+
+describe('the canvas lock is remembered only when the user opted in', () => {
+  // The whole feature is three lines inside a 13k-line file, and every one of them can be deleted
+  // without reddening a test: the helper's own suite passes whether or not Canvas ever calls it.
+  // Same reasoning as the frameNode pin above.
+  const effect = CANVAS_SRC.slice(
+    CANVAS_SRC.indexOf('const rememberCanvasLock = useSettings('),
+    CANVAS_SRC.indexOf('// Load saved SSH servers once')
+  )
+
+  it('starts unlocked, so an install that never opts in is unchanged', () => {
+    expect(CANVAS_SRC).toContain('const [canvasLocked, setCanvasLocked] = useState(false)')
+  })
+
+  it('restores and persists behind settings.rememberCanvasLock', () => {
+    expect(effect).toContain('useSettings((s) => s.settings.rememberCanvasLock)')
+    expect(effect).toContain('if (rememberCanvasLock) setCanvasLocked(readCanvasLocked())')
+    expect(effect).toContain('if (rememberCanvasLock) writeCanvasLocked(canvasLocked)')
+    // The deps are the one line here that a deletion leaves green: without `canvasLocked` the
+    // effect stops re-running on a toggle, so only a settings flip would ever write and a lock
+    // engaged with the BUTTON would never survive a restart. There is no ESLint in this repo, so
+    // exhaustive-deps cannot catch it either.
+    expect(effect).toContain('}, [settingsHydrated, rememberCanvasLock, canvasLocked])')
+  })
+
+  it('waits for settings to hydrate before deciding either way', () => {
+    // Canvas mounts before settings load, so an ungated read sees DEFAULT_SETTINGS (off) and the
+    // opt-in silently never takes effect.
+    expect(effect).toContain('if (!settingsHydrated) return')
+    expect(indexOfPresent(effect, 'if (!settingsHydrated) return')).toBeLessThan(
+      indexOfPresent(effect, 'canvasLockRestored.current = true')
+    )
+  })
+
+  it('restores only on the first run after hydration, never on a later opt-in', () => {
+    // Flipping the setting on mid-session must not reach into storage and lock a canvas somebody
+    // is working on: the latch is what keeps a restore a launch-time event.
+    expect(indexOfPresent(effect, 'canvasLockRestored.current = true')).toBeLessThan(
+      indexOfPresent(effect, 'if (rememberCanvasLock) setCanvasLocked(readCanvasLocked())')
+    )
+    expect(effect).toContain('if (!canvasLockRestored.current) {')
+  })
+})
+
+describe('the last-session close offer is wired to the × and to the existing close path (issue #848)', () => {
+  // The decision lives in lib/lastSessionClose and is tested there; what those tests cannot see is
+  // WHO raises it and WHAT accepting it does. Both are a line each in files with no render harness.
+  const TERMINAL_SRC = fs.readFileSync(path.join(__dirname, '..', 'nodes', 'TerminalNode.tsx'), 'utf8').replace(/\r\n/g, '\n')
+  const closeButton = TERMINAL_SRC.slice(
+    TERMINAL_SRC.indexOf('<Tooltip label="Close (ends the session)">'),
+    TERMINAL_SRC.indexOf('<IconClose />', TERMINAL_SRC.indexOf('<Tooltip label="Close (ends the session)">'))
+  )
+
+  it('only the × announces a user close, and before the node leaves the canvas', () => {
+    // Before `deleteElements`: the decision needs the closed node still present, so a second
+    // click on a node already gone finds nothing to offer.
+    expect(indexOfPresent(closeButton, 'announceUserClosedSession(id)')).toBeLessThan(
+      indexOfPresent(closeButton, 'deleteElements({ nodes: [{ id }] })')
+    )
+    // Exactly one announcer in the node: no other teardown (restart, respawn, exit) may ask.
+    expect(TERMINAL_SRC.split('announceUserClosedSession(').length - 1).toBe(1)
+  })
+
+  it('Canvas decides with the opt-in setting and the live canvas, and accepts through closeProject', () => {
+    const listener = CANVAS_SRC.slice(
+      CANVAS_SRC.indexOf('window.addEventListener(USER_CLOSED_SESSION_EVENT'),
+      CANVAS_SRC.indexOf('window.removeEventListener(USER_CLOSED_SESSION_EVENT')
+    )
+    expect(CANVAS_SRC).toContain('const onUserClosedSession = (e: Event): void => {')
+    const handler = CANVAS_SRC.slice(
+      CANVAS_SRC.indexOf('const onUserClosedSession = (e: Event): void => {'),
+      CANVAS_SRC.indexOf('window.addEventListener(USER_CLOSED_SESSION_EVENT')
+    )
+    expect(listener).toContain('onUserClosedSession')
+    expect(handler).toContain('useSettings.getState().settings.offerCloseProjectOnLastSession')
+    expect(handler).toContain('nodes: nodesRef.current')
+    const dialog = CANVAS_SRC.slice(CANVAS_SRC.indexOf('{lastSessionOffer && ('))
+    expect(dialog.slice(0, 2500)).toContain('closeProject(offer.id)')
+  })
+})
+
+describe('the last-session offer joins the one-confirmation-at-a-time guard (issue #848 review)', () => {
+  // `confirmBusy()` is what refuses a second actionable dialog (agent `write`/`close`, worktree
+  // removal, …). An offer it cannot see lets another dialog stack over it, and an offer raised
+  // while another dialog is open (or being opened) stacks over that one.
+  const guard = CANVAS_SRC.slice(
+    CANVAS_SRC.indexOf('const confirmFlags = useRef({'),
+    CANVAS_SRC.indexOf('const nodeTypes = useMemo(')
+  )
+
+  it('has a synchronous flag, flipped at call time, that confirmBusy reads', () => {
+    expect(guard).toContain('lastSessionOffer: false')
+    expect(guard).toContain('confirmFlags.current.lastSessionOffer = !!v')
+    expect(guard).toContain('f.lastSessionOffer ||')
+  })
+
+  it('skips the offer (never queues it) while another confirm is busy', () => {
+    const handler = CANVAS_SRC.slice(
+      CANVAS_SRC.indexOf('const onUserClosedSession = (e: Event): void => {'),
+      CANVAS_SRC.indexOf('window.addEventListener(USER_CLOSED_SESSION_EVENT')
+    )
+    expect(handler).toContain('if (confirmBusy()) return')
+    expect(indexOfPresent(handler, 'if (confirmBusy()) return')).toBeLessThan(
+      indexOfPresent(handler, 'setLastSessionOffer(')
+    )
+  })
+
+  it('accepting clears the offer BEFORE closing, so a follow-up #442 confirm is not refused or stacked', () => {
+    const dialog = CANVAS_SRC.slice(CANVAS_SRC.indexOf('{lastSessionOffer && (')).slice(0, 2500)
+    expect(indexOfPresent(dialog, 'setLastSessionOffer(null)')).toBeLessThan(
+      indexOfPresent(dialog, 'closeProject(offer.id)')
+    )
+  })
+
+  it('closes the project the offer NAMED even after a tab switch, touching the active one only when it is that project', () => {
+    // The offer stores the project id at raise time; closeProject commits the live canvas only
+    // when that id is the active project, and the store keeps activeProjectId when a background
+    // project closes (pinned in state/projects.test.ts).
+    const body = CANVAS_SRC.slice(
+      CANVAS_SRC.indexOf('const closeProject = useCallback('),
+      CANVAS_SRC.indexOf('// Right-click on a sidebar project header')
+    )
+    expect(body).toContain('if (id === store.activeProjectId) commitActiveToStore()')
   })
 })

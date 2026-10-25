@@ -88,6 +88,71 @@ describe('save → load round trip (v3)', () => {
     expect(loaded.projects[0].breadcrumbs).toEqual(breadcrumbs)
   })
 
+  // A canvas layout is shared CONTENT (it describes the nodes the file already carries), while the
+  // camera the author had per layout is one person's, exactly like `breadcrumbs`.
+  it('keeps layouts in the shared file and their cameras machine-local', async () => {
+    const layouts = [{
+      id: 'lay-1', name: 'Ultrawide', createdAt: 1_700_000_000_000, updatedAt: 1_700_000_000_000,
+      window: { width: 3440, height: 1440 },
+      nodes: [{ id: 'term-1', x: 40, y: 60, width: 800, height: 600 }]
+    }]
+    const layoutViewports = { 'lay-1': { x: 5, y: 6, zoom: 1.5 } }
+    await new WorkspaceStore().save(ws([project({ cwd: projRoot, layouts, layoutViewports })]))
+
+    const fileRaw = await fs.readFile(path.join(projRoot, '.nodeterm/project.json'), 'utf-8')
+    expect(JSON.parse(fileRaw).layouts).toEqual(layouts)
+    expect(fileRaw).not.toContain('layoutViewports')
+    const index = JSON.parse(await fs.readFile(path.join(userData, 'workspace.json'), 'utf-8'))
+    expect(index.entries[0].layoutViewports).toEqual(layoutViewports)
+
+    const loaded = await new WorkspaceStore().load()
+    expect(loaded.projects[0].layouts).toEqual(layouts)
+    expect(loaded.projects[0].layoutViewports).toEqual(layoutViewports)
+  })
+
+  it('drops a hand-edited layout and prunes the camera it left behind', async () => {
+    const layouts = [{
+      id: 'lay-1', name: 'Ultrawide', createdAt: 1, updatedAt: 2,
+      nodes: [{ id: 'term-1', x: 0, y: 0, width: 10, height: 10 }]
+    }]
+    await new WorkspaceStore().save(ws([project({ cwd: projRoot, layouts, layoutViewports: { 'lay-1': { x: 1, y: 2, zoom: 1 } } })]))
+
+    // A `null` coordinate is what `JSON.stringify` writes for a NaN, so this is the shape a
+    // corrupted file really arrives in - and unguarded it reaches React Flow's adoptUserNodes.
+    const file = path.join(projRoot, '.nodeterm/project.json')
+    const parsed = JSON.parse(await fs.readFile(file, 'utf-8'))
+    parsed.layouts[0].nodes[0].x = null
+    await fs.writeFile(file, JSON.stringify(parsed, null, 2))
+
+    const loaded = await new WorkspaceStore().load()
+    expect(loaded.projects[0].nodes[0].id).toBe('term-1') // the rest of the file still loaded
+    expect(loaded.projects[0].layouts).toBeUndefined()
+    expect(loaded.projects[0].layoutViewports).toBeUndefined()
+  })
+
+  it('sanitizes an inline project\'s embedded layouts, which never pass through fileToProject', async () => {
+    const index = {
+      version: 3,
+      activeProjectId: 'p2',
+      entries: [{
+        id: 'p2', name: 'inline', color: '#fff',
+        project: {
+          ...project({ id: 'p2', name: 'inline' }),
+          layouts: [
+            { id: 'lay-ok', name: 'Laptop', createdAt: 1, updatedAt: 2, nodes: [] },
+            { id: 'lay-bad', name: 'Broken', createdAt: 1, updatedAt: 2, nodes: [{ id: 'term-1', x: null, y: 0, width: 1, height: 1 }] }
+          ],
+          layoutViewports: { 'lay-ok': { x: 1, y: 2, zoom: 1 }, 'lay-bad': { x: 0, y: 0, zoom: 1 } }
+        }
+      }]
+    }
+    await fs.writeFile(path.join(userData, 'workspace.json'), JSON.stringify(index))
+
+    const loaded = await new WorkspaceStore().load()
+    expect(loaded.projects[0].layouts?.map((l) => l.id)).toEqual(['lay-ok'])
+    expect(loaded.projects[0].layoutViewports).toEqual({ 'lay-ok': { x: 1, y: 2, zoom: 1 } })
+  })
+
   it('does not rewrite (or bump rev of) an unchanged project file', async () => {
     const store = new WorkspaceStore()
     const w = ws([project({ cwd: projRoot })])
@@ -167,6 +232,18 @@ describe('inline (cwd-less) project kanban shape guard', () => {
     await writeInlineIndex(board)
     const loaded = await new WorkspaceStore().load()
     expect(loaded.projects[0].kanban).toEqual(board)
+  })
+
+  it('sanitizes an inline board like a file one (the inline branch bypasses fileToProject)', async () => {
+    await writeInlineIndex({
+      columns: [null, { id: 'kcol-a', title: 'To Do', color: '#0a84ff', category: 5 }],
+      assignments: [{ nodeId: 3 }]
+    })
+    const loaded = await new WorkspaceStore().load()
+    expect(loaded.projects[0].kanban).toEqual({
+      columns: [{ id: 'kcol-a', title: 'To Do', color: '#0a84ff' }],
+      assignments: []
+    })
   })
 })
 
@@ -803,6 +880,150 @@ describe('ssh mirror guarantee (unmirrored retry)', () => {
   })
 })
 
+// "Share with team": once an SSH project is handed over to the nodeterm-server on its host, the
+// server core is the only writer of its project.json. A desktop that kept mirroring, reconciling or
+// polling it would push its stale cache over the file the server now owns.
+describe('handedOffTo — a project shared to a hosted team is never written again', () => {
+  const sshConn = { server: { host: 'h', user: 'u' } as any, remoteCwd: '~/app' }
+  const handed = { hostId: 'h1', projectId: 'project-9', at: 1 }
+
+  /** A healthy connection that counts every read and write, and records which project each was for. */
+  const countingIO = () => {
+    const state = { reads: 0, writes: 0, readIds: [] as string[], writeIds: [] as string[], remote: {} as Record<string, string> }
+    const io = {
+      read: async (id: string) => {
+        state.reads++
+        state.readIds.push(id)
+        return state.remote[id] != null
+          ? { status: 'ok' as const, content: state.remote[id] }
+          : { status: 'absent' as const }
+      },
+      write: async (id: string, _s: any, c: string) => {
+        state.writes++
+        state.writeIds.push(id)
+        state.remote[id] = c
+        return true
+      }
+    }
+    return { state, io }
+  }
+  const changedNode = { id: 'term-2', kind: 'terminal' as const, position: { x: 9, y: 9 }, size: { width: 1, height: 1 }, title: 'new', color: '#fff', group: null }
+
+  it('a changed canvas is saved without a mirror write, even when the mirror was re-owed', async () => {
+    const { state, io } = countingIO()
+    const store = new WorkspaceStore(io)
+    const p = project({ id: 'ps', ssh: sshConn, cwd: undefined })
+    await store.save(ws([p])) // the ordinary pre-handover mirror
+    expect(state.writes).toBe(1)
+    const before = { ...state }
+
+    const handedOff = { ...p, handedOffTo: handed, nodes: [...p.nodes, changedNode] }
+    await store.save(ws([handedOff]))
+    expect(state.writes).toBe(before.writes)
+    expect(state.reads).toBe(before.reads)
+
+    store.markUnmirrored('ps') // a dropped trailing write reporting back must not force it either
+    await store.save(ws([{ ...handedOff, nodes: [...handedOff.nodes, { ...changedNode, id: 'term-3' }] }]))
+    expect(state.writes).toBe(before.writes)
+    expect(state.reads).toBe(before.reads)
+    // The save itself still lands locally.
+    const index = JSON.parse(await fs.readFile(path.join(userData, 'workspace.json'), 'utf-8'))
+    expect(index.entries[0].handedOffTo).toEqual(handed)
+    expect(index.entries[0].cache.nodes.map((n: { id: string }) => n.id)).toEqual(['term-1', 'term-2', 'term-3'])
+  })
+
+  it('refreshSshProject resolves null without reading or writing the server file', async () => {
+    const { state, io } = countingIO()
+    const store = new WorkspaceStore(io)
+    // Handed off from its first save: not even the never-blind-write first reconcile may run.
+    await store.save(ws([project({ id: 'ps', ssh: sshConn, cwd: undefined, handedOffTo: handed })]))
+    expect(state.reads).toBe(0)
+    expect(state.writes).toBe(0)
+    expect(await store.refreshSshProject('ps')).toBeNull()
+    expect(await store.refreshSshProject('ps', { pushIfStanding: false })).toBeNull()
+    expect(state.reads).toBe(0)
+    expect(state.writes).toBe(0)
+  })
+
+  it('pollableSshProjectIds() leaves it out of the poll; sshProjectIds() still names it as remote', async () => {
+    const { io } = countingIO()
+    const store = new WorkspaceStore(io)
+    await store.save(ws([
+      project({ id: 'ps', ssh: sshConn, cwd: undefined, handedOffTo: handed }),
+      project({ id: 'other', ssh: { ...sshConn, remoteCwd: '~/other' }, cwd: undefined }),
+      project({ id: 'local', cwd: projRoot })
+    ]))
+    expect(store.pollableSshProjectIds()).toEqual(['other'])
+    // IDENTITY, not liveness: a handed-off project still runs on someone else's machine, and the
+    // session-memory / dev-ports scope checks read this list to know it.
+    expect(store.sshProjectIds()).toEqual(['ps', 'other'])
+  })
+
+  it('survives a restart: load() returns it, and the reloaded store still never touches the file', async () => {
+    const { state, io } = countingIO()
+    await new WorkspaceStore(io).save(ws([
+      project({ id: 'ps', ssh: sshConn, cwd: undefined, handedOffTo: handed }),
+      project({ id: 'other', ssh: { ...sshConn, remoteCwd: '~/other' }, cwd: undefined })
+    ]))
+    const restarted = new WorkspaceStore(io)
+    const loaded = await restarted.load()
+    expect(loaded.projects.find((p) => p.id === 'ps')!.handedOffTo).toEqual(handed)
+    expect(loaded.projects.find((p) => p.id === 'other')!.handedOffTo).toBeUndefined()
+    expect(restarted.pollableSshProjectIds()).toEqual(['other'])
+    expect(await restarted.refreshSshProject('ps')).toBeNull()
+    await restarted.save(loaded)
+    // The other SSH project is reconciled and mirrored as usual; the handed-off one never is.
+    expect(state.readIds).toContain('other')
+    expect(state.readIds).not.toContain('ps')
+    expect(state.writeIds).not.toContain('ps')
+  })
+
+  // Every remote write funnels through `mirrorSshCache` or `reconcileSsh`; both refuse a handed-off
+  // entry on their own, so a future caller that forgets its own guard still cannot write the file.
+  it('mirrorSshCache itself refuses a handed-off entry, whoever calls it', async () => {
+    const { state, io } = countingIO()
+    const store = new WorkspaceStore(io)
+    await store.save(ws([project({ id: 'ps', ssh: sshConn, cwd: undefined, handedOffTo: handed })]))
+    const internals = store as unknown as {
+      index: { entries: { id: string }[] }
+      mirrorSshCache(e: unknown): Promise<void>
+    }
+    const entry = internals.index.entries.find((x) => x.id === 'ps')
+    await internals.mirrorSshCache(entry)
+    expect(state.reads).toBe(0)
+    expect(state.writes).toBe(0)
+  })
+
+  it('an unreadable (cache-less) handed-off entry keeps the record through its placeholder', async () => {
+    await fs.writeFile(path.join(userData, 'workspace.json'), JSON.stringify({
+      version: 3, activeProjectId: 'ps',
+      entries: [{ id: 'ps', name: 'foo', color: '#7aa2f7', ssh: sshConn, handedOffTo: handed }]
+    }))
+    const store = new WorkspaceStore(countingIO().io)
+    const loaded = await store.load()
+    expect(loaded.projects[0]).toMatchObject({ id: 'ps', unavailable: true, handedOffTo: handed })
+    await store.save(loaded)
+    const index = JSON.parse(await fs.readFile(path.join(userData, 'workspace.json'), 'utf-8'))
+    expect(index.entries[0].handedOffTo).toEqual(handed)
+  })
+
+  it('a hand-edited record is validated on load (workspace.json is hand-editable input)', async () => {
+    await fs.writeFile(path.join(userData, 'workspace.json'), JSON.stringify({
+      version: 3, activeProjectId: 'ps',
+      entries: [
+        { id: 'ps', name: 'foo', color: '#7aa2f7', ssh: sshConn, handedOffTo: { hostId: 'h'.repeat(200), at: 5 } },
+        { id: 'junk', name: 'bar', color: '#7aa2f7', ssh: { ...sshConn, remoteCwd: '~/bar' }, handedOffTo: { hostId: 'h1' } }
+      ]
+    }))
+    const store = new WorkspaceStore(countingIO().io)
+    const loaded = await store.load()
+    expect(loaded.projects.find((p) => p.id === 'ps')!.handedOffTo).toEqual({ at: 5 })
+    // No timestamp: not a record at all, so the project is an ordinary SSH project again.
+    expect('handedOffTo' in loaded.projects.find((p) => p.id === 'junk')!).toBe(false)
+    expect(store.pollableSshProjectIds()).toEqual(['junk'])
+  })
+})
+
 // THE reset bug (field report: 12 fresh project ids for one server folder in two weeks, 45 orphaned
 // tmux sessions). Re-adding a folder via the SSH dialog minted a fresh project id with an empty
 // canvas; its first mirror write clobbered the server's populated .nodeterm/project.json, and rev
@@ -1163,6 +1384,99 @@ describe('ssh reconcile self-write recognition (the spurious conflict bar)', () 
     remote['~/app'] = JSON.stringify(f)
     const adopted = await store.refreshSshProject('ps', { pushIfStanding: false })
     expect(adopted).toMatchObject({ id: 'ps', name: 'renamed-elsewhere' })
+  })
+})
+
+// Autosave runs 800 ms after every edit or camera move. It must not re-parse every folder project's
+// last-written bytes, nor rewrite an index whose bytes it already wrote — but a write another
+// writer made on disk since then must still be answered with ours.
+describe('autosave skips unchanged work', () => {
+  const indexPath = () => path.join(userData, 'workspace.json')
+  const readIndex = async () =>
+    JSON.parse((await fs.readFile(indexPath(), 'utf-8')).replace(/\r\n/g, '\n'))
+  const tick = () => new Promise((r) => setTimeout(r, 20))
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('a second identical save does not rewrite workspace.json', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project({ cwd: projRoot })]))
+    const first = (await fs.stat(indexPath())).mtimeMs
+    await tick()
+    await store.save(ws([project({ cwd: projRoot })]))
+    expect((await fs.stat(indexPath())).mtimeMs).toBe(first)
+  })
+
+  it('rewrites workspace.json when another writer changed it on disk, even if our index is unchanged', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project({ cwd: projRoot })]))
+    await fs.writeFile(indexPath(), '{"version":3,"entries":[]}') // another instance
+    await store.save(ws([project({ cwd: projRoot })]))
+    expect((await readIndex()).entries.length).toBeGreaterThan(0)
+  })
+
+  // A coarse-mtime filesystem (whole seconds) cannot tell a same-size rewrite inside the same
+  // second from no write at all. Every writer publishes by rename, so the inode can.
+  it('rewrites after a same-size, same-mtime rewrite on a coarse-mtime filesystem (new inode)', async () => {
+    const realStat = fs.stat.bind(fs)
+    vi.spyOn(fs, 'stat').mockImplementation((async (p: string) => {
+      const st = await realStat(p)
+      return Object.assign(st, { mtimeMs: Math.floor(st.mtimeMs / 1000) * 1000 })
+    }) as typeof fs.stat)
+    const store = new WorkspaceStore()
+    await store.save(ws([project({ cwd: projRoot })]))
+    const ours = await realStat(indexPath())
+    // Another instance rewrites the SAME bytes via rename (new inode), same second.
+    const tmp = indexPath() + '.other'
+    await fs.writeFile(tmp, await fs.readFile(indexPath()))
+    await fs.utimes(tmp, ours.atime, ours.mtime)
+    await fs.rename(tmp, indexPath())
+    const theirs = await realStat(indexPath())
+    expect(theirs.ino).not.toBe(ours.ino)
+    expect(theirs.size).toBe(ours.size)
+    await store.save(ws([project({ cwd: projRoot })]))
+    expect((await realStat(indexPath())).ino).not.toBe(theirs.ino) // we wrote ours back
+  })
+
+  it('a changed index is still written', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project({ cwd: projRoot })]))
+    await store.save(ws([project({ cwd: projRoot, name: 'renamed' })]))
+    expect((await readIndex()).entries[0].name).toBe('renamed')
+  })
+
+  it('the first save of a store instance always writes, even when the bytes on disk already match', async () => {
+    await new WorkspaceStore().save(ws([project({ cwd: projRoot })]))
+    const again = new WorkspaceStore()
+    const loaded = await again.load()
+    const before = (await fs.stat(indexPath())).mtimeMs
+    await tick()
+    await again.save(loaded)
+    expect((await fs.stat(indexPath())).mtimeMs).not.toBe(before)
+  })
+
+  it('steady-state autosaves do not re-parse the project file last written', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project({ cwd: projRoot })]))
+    await store.save(ws([project({ cwd: projRoot })])) // parses the last write once
+    const raw = await fs.readFile(path.join(projRoot, '.nodeterm/project.json'), 'utf-8')
+    const parse = vi.spyOn(JSON, 'parse')
+    await store.save(ws([project({ cwd: projRoot })]))
+    expect(parse.mock.calls.some(([text]) => text === raw)).toBe(false)
+  })
+
+  it('compares against the NEWEST write: A → B → A writes the project file every time', async () => {
+    const store = new WorkspaceStore()
+    const file = path.join(projRoot, '.nodeterm/project.json')
+    await store.save(ws([project({ cwd: projRoot, name: 'a' })]))
+    await store.save(ws([project({ cwd: projRoot, name: 'b' })]))
+    expect(JSON.parse(await fs.readFile(file, 'utf-8')).name).toBe('b')
+    await store.save(ws([project({ cwd: projRoot, name: 'a' })]))
+    const back = JSON.parse(await fs.readFile(file, 'utf-8'))
+    expect(back.name).toBe('a')
+    expect(back.rev).toBe(3)
   })
 })
 
@@ -1952,5 +2266,286 @@ describe('projectMetaFor (issue #338 PR 1) — target exists / is SSH, from the 
     expect(store.projectMetaFor('p-b')).toEqual({ ssh: false })
     await store.save(ws([project({ id: 'p-a', cwd: projRoot })]))
     expect(store.projectMetaFor('p-b')).toBeUndefined()
+  })
+})
+
+// Field bug (enes, 2026-09-06, SSH project on a SLOW link): 16 terminals deleted, and all 16 came
+// straight back with "16 new sessions registered from another device (your phone, or another
+// machine)". No phone and no second machine were involved — the only other writer was OUR OWN
+// stale server file.
+//
+// The chain: a save records the nodes it dropped in `clearedNodes`, which is the ONLY thing that
+// tells the mirror's re-read "we deleted this, do not rescue it". `mirrorSshCache` used to drop
+// that record the moment the write was ACKED — but the real remote IO acks the 5 s throttle's
+// TRAILING write optimistically, before it is on the wire. When that trailing write is later
+// dropped, `markUnmirrored` re-owes the mirror but could not restore the tombstones, so the next
+// mirror write re-read a server file that still listed all 16 nodes, had nothing left to filter
+// with, and "rescued" every one of them back onto the canvas.
+describe('ssh mirror: an optimistically-acked write that never lands must not resurrect deletions', () => {
+  const sshConn = { server: { host: 'h', user: 'u' } as any, remoteCwd: '~/app' }
+  const node = (id: string, title: string) => ({
+    id, kind: 'terminal' as const, position: { x: 0, y: 0 }, size: { width: 1, height: 1 },
+    title, color: '#fff', group: null
+  })
+
+  /** The real remote IO's throttle, modelled exactly: while `hold` is on the write returns TRUE
+   *  (the optimistic ack for a trailing run) but the server content does not change. */
+  const throttleIO = () => {
+    const files: Record<string, string> = {}
+    const state = { hold: false }
+    const io = {
+      read: async (_id: string, ssh: any) =>
+        files[ssh.remoteCwd] != null
+          ? { status: 'ok' as const, content: files[ssh.remoteCwd] }
+          : { status: 'absent' as const },
+      write: async (_id: string, ssh: any, c: string) => {
+        if (!state.hold) files[ssh.remoteCwd] = c
+        return true // acked either way — "the trailing write will land"
+      }
+    }
+    return { files, state, io }
+  }
+
+  const idsOn = (files: Record<string, string>): string[] =>
+    JSON.parse(files['~/app']).nodes.map((n: any) => n.id)
+
+  it('keeps deletions dead across a dropped trailing write — while a genuine phone append is still rescued', async () => {
+    const { files, state, io } = throttleIO()
+    const store = new WorkspaceStore(io)
+    const p = (nodes: ReturnType<typeof node>[]) =>
+      ws([project({ id: 'ps', ssh: sshConn, cwd: undefined, nodes })])
+
+    const keep = node('term-keep', 'kept')
+    const a = node('term-a', 'closed by the user')
+    const b = node('term-b', 'closed by the user')
+    await store.save(p([keep, a, b])) // rev 1, mirrored: the server holds all three
+    expect(idsOn(files).sort()).toEqual(['term-a', 'term-b', 'term-keep'])
+
+    // The phone appends a session it just started, straight into the server file (its own SSH path).
+    const phone = node('term-phone-1', 'Mobile')
+    const f = JSON.parse(files['~/app'])
+    files['~/app'] = JSON.stringify({ ...f, rev: f.rev + 1, nodes: [...f.nodes, phone] })
+
+    // The user closes term-a and term-b. The mirror write is ACKED (throttle) but never lands.
+    state.hold = true
+    fake.sent.length = 0
+    await store.save(p([keep]))
+    // The phone's node IS foreign — it must be rescued and announced, fix or no fix.
+    const rescueMsg = fake.sent.find((m) => m.channel === 'workspace:external-change')
+    expect((rescueMsg!.args[0] as Project).nodes.map((n) => n.id)).toContain('term-phone-1')
+    expect((rescueMsg!.args[0] as Project).nodes.map((n) => n.id)).not.toContain('term-a')
+
+    // …and the connection dies inside the throttle window, so the trailing write is dropped.
+    store.markUnmirrored('ps')
+
+    // The next save retries the owed mirror. Its re-read still sees term-a/term-b on the server.
+    state.hold = false
+    fake.sent.length = 0
+    await store.save(p([keep, phone])) // the renderer adopted the phone node above
+
+    expect(idsOn(files).sort()).toEqual(['term-keep', 'term-phone-1']) // the deletions travelled
+    const resurrected = fake.sent
+      .filter((m) => m.channel === 'workspace:external-change')
+      .flatMap((m) => (m.args[0] as Project).nodes.map((n) => n.id))
+    expect(resurrected).not.toContain('term-a')
+    expect(resurrected).not.toContain('term-b')
+  })
+
+  // When the tombstones are GARBAGE-COLLECTED: on the first READ that shows the server no longer
+  // lists the id — positive confirmation, taken from a read the store already makes (the mirror's
+  // re-read, the 15 s poll, the connect-time refresh), so it costs no extra round-trip. It
+  // therefore lags the landed write by one read, which is the price of not trusting the ack: a
+  // tombstone that outlives its usefulness by a few seconds only suppresses a rescue of a node we
+  // deliberately deleted. After the confirmation the id is an ordinary unknown one again — if it
+  // comes back on the server it is a genuine foreign addition (another machine restored it, a git
+  // checkout) and is rescued like any other.
+  // BOTH reading sites confirm, and each is covered: the mirror write's own re-read (which runs on
+  // every changed save, so it is the usual one) and `reconcileSsh` (the 15 s poll / connect-time
+  // refresh). Wiring only one of them leaves the other's tombstones alive for the whole run.
+  const confirmingReads: [string, (store: WorkspaceStore, save: () => Promise<unknown>) => Promise<unknown>][] = [
+    ["the mirror write's own re-read", (_store, save) => save()],
+    ['the 15 s poll', (store) => store.refreshSshProject('ps', { pushIfStanding: false })]
+  ]
+  for (const [label, confirm] of confirmingReads) {
+    it(`drops a tombstone once ${label} shows the deletion travelled, so a later re-appearance is rescued again`, async () => {
+      const { files, io } = throttleIO()
+      const store = new WorkspaceStore(io)
+      const p = (nodes: ReturnType<typeof node>[]) =>
+        ws([project({ id: 'ps', ssh: sshConn, cwd: undefined, nodes })])
+      const keep = node('term-keep', 'kept')
+      const a = node('term-a', 'closed by the user')
+
+      await store.save(p([keep, a]))
+      await store.save(p([keep])) // the deletion lands: the server no longer lists term-a
+      expect(idsOn(files)).toEqual(['term-keep'])
+
+      // …and something reads the server back, seeing term-a gone: our deletion HAS travelled.
+      await confirm(store, () => store.save(p([keep, node('term-confirm', 'an ordinary edit')])))
+
+      // Only NOW does another machine put a node with that id back into the server file.
+      const f = JSON.parse(files['~/app'])
+      files['~/app'] = JSON.stringify({ ...f, rev: f.rev + 1, nodes: [...f.nodes, node('term-a', 'restored')] })
+      fake.sent.length = 0
+      await store.save(p([keep, node('term-2', 'new here')])) // an ordinary local edit mirrors
+
+      expect(idsOn(files)).toContain('term-a') // rescued: the tombstone was already retired
+      const msg = fake.sent.find((m) => m.channel === 'workspace:external-change')
+      expect((msg!.args[0] as Project).nodes.map((n) => n.id)).toContain('term-a')
+    })
+  }
+})
+
+describe('localOnly save (the launch write-ahead barrier)', () => {
+  const sshConn = { server: { host: 'h', user: 'u' } as any, remoteCwd: '~/app' }
+  const makeIo = () => {
+    const remote: Record<string, string> = {}
+    const calls: string[] = []
+    const io = {
+      read: async (id: string) => (calls.push(`read:${id}`),
+        remote[id] != null ? { status: 'ok' as const, content: remote[id] } : { status: 'absent' as const }),
+      write: async (id: string, _s: any, c: string) => (calls.push(`write:${id}`), (remote[id] = c), true)
+    }
+    return { io, remote, calls }
+  }
+  const withNodes = (ids: string[]) => project({
+    id: 'ps', ssh: sshConn, cwd: undefined,
+    nodes: ids.map((id) => ({ id, kind: 'terminal' as const, position: { x: 0, y: 0 }, size: { width: 1, height: 1 }, title: 't', color: '#fff', group: null }))
+  })
+
+  it('touches no ssh host, persists the cache to the local index, and the next ordinary save mirrors it', async () => {
+    const { io, remote, calls } = makeIo()
+    const store = new WorkspaceStore(io)
+    await store.save(ws([withNodes(['term-1'])])) // reconciled + mirrored
+    calls.length = 0
+
+    await store.save(ws([withNodes(['term-1', 'term-2'])]), { localOnly: true })
+    expect(calls).toEqual([])
+    const index = JSON.parse(await fs.readFile(path.join(userData, 'workspace.json'), 'utf-8'))
+    const entry = index.entries.find((e: { id: string }) => e.id === 'ps')
+    expect(entry.cache.nodes.map((n: { id: string }) => n.id)).toEqual(['term-1', 'term-2'])
+    expect(JSON.parse(remote['ps']).nodes.map((n: { id: string }) => n.id)).toEqual(['term-1'])
+
+    // Unchanged content — only the owed mirror can make this save write.
+    await store.save(ws([withNodes(['term-1', 'term-2'])]))
+    expect(calls.some((c) => c === 'write:ps')).toBe(true)
+    expect(JSON.parse(remote['ps']).nodes.map((n: { id: string }) => n.id)).toEqual(['term-1', 'term-2'])
+  })
+
+  it('never blind-writes an unreconciled entry: it is left for the next ordinary save to read first', async () => {
+    const { io, calls } = makeIo()
+    const store = new WorkspaceStore(io)
+    await store.save(ws([withNodes(['term-1'])]), { localOnly: true })
+    expect(calls).toEqual([])
+    await store.save(ws([withNodes(['term-1'])]))
+    expect(calls[0]).toBe('read:ps')
+  })
+})
+
+// The phone Chat verbs resolve a node HOST-side (main/remote/host-chat.ts): the node's cwd must be
+// the ABSOLUTE path the canvas uses, not the portable "./sub" form a local ref's project.json stores
+// — the cwd is what the transcript resolver keys on.
+describe('getNodeResolved — a node with its cwd as the canvas sees it', () => {
+  const termAt = (id: string, cwd: string | undefined) => ({
+    id, kind: 'terminal' as const, position: { x: 0, y: 0 }, size: { width: 1, height: 1 },
+    title: id, color: '#fff', group: null, cwd, agentId: 'claude'
+  })
+  it('resolves a local ref\'s portable cwd against the project root', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project({ id: 'p-local', cwd: projRoot, nodes: [termAt('n-sub', path.join(projRoot, 'sub')), termAt('n-root', projRoot)] })]))
+    expect(store.getNodeResolved('n-sub')?.cwd).toBe(path.join(projRoot, 'sub'))
+    expect(store.getNodeResolved('n-root')?.cwd).toBe(projRoot)
+    expect(store.getNodeResolved('n-sub')?.agentId).toBe('claude')
+    // getNode keeps the stored (portable) form — its existing callers are unchanged.
+    expect(store.getNode('n-sub')?.cwd).toBe('./sub')
+  })
+  it('passes inline / absolute cwds through and answers undefined for an unknown node', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project({ id: 'p-inline', cwd: undefined, nodes: [termAt('n-abs', '/elsewhere')] })]))
+    expect(store.getNodeResolved('n-abs')?.cwd).toBe('/elsewhere')
+    expect(store.getNodeResolved('nope')).toBeUndefined()
+  })
+})
+
+// The agent-status mirror keeps an IDENTITY-ONLY entry past its 6 h state expiry and drops it once
+// its node no longer exists in any project. Dropping on a guess would cost the phone a session id,
+// so the store answers `undefined` whenever it cannot see every project's nodes.
+describe('knownNodeIds — every node id in every project, or undefined when it cannot know', () => {
+  it('is undefined before the index is loaded', () => {
+    expect(new WorkspaceStore().knownNodeIds()).toBeUndefined()
+  })
+  it('lists the nodes of local-ref and inline projects, closed ones included', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([
+      project({ id: 'p-local', cwd: projRoot }),
+      project({ id: 'p-inline', cwd: undefined, closed: true, nodes: [
+        { id: 'term-2', kind: 'terminal', position: { x: 0, y: 0 }, size: { width: 1, height: 1 }, title: 't', color: '#fff', group: null }
+      ] })
+    ]))
+    expect([...(store.knownNodeIds() ?? [])].sort()).toEqual(['term-1', 'term-2'])
+  })
+  it('is undefined when a local ref has no readable content this run', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project({ id: 'p-local', cwd: projRoot })]))
+    await fs.rm(path.join(projRoot, '.nodeterm'), { recursive: true, force: true })
+    const fresh = new WorkspaceStore()
+    await fresh.load()
+    expect(fresh.knownNodeIds()).toBeUndefined()
+  })
+  // R44: a lost workspace.json is rebuilt from nothing — the renderer's boot save writes an EMPTY
+  // index while every project.json still holds its nodes. Read as complete, it said every node was
+  // gone (a live link revoked a second after launch). The STRICT accessor (live links) answers unknown
+  // for the rest of such a run…
+  it('the strict accessor stays undefined for the rest of a run whose index was lost or corrupt, whatever is saved after', async () => {
+    await new WorkspaceStore().save(ws([project({ id: 'p-local', cwd: projRoot })]))
+    for (const lose of ['corrupt', 'deleted'] as const) {
+      const index = path.join(userData, 'workspace.json')
+      if (lose === 'corrupt') await fs.writeFile(index, '{nope')
+      else await fs.rm(index, { force: true })
+      const store = new WorkspaceStore()
+      await store.load()
+      await store.save(ws([]))
+      expect(store.knownNodeIdsStrict()).toBeUndefined()
+      await store.save(ws([project({ id: 'p-local', cwd: projRoot })]))
+      expect(store.knownNodeIdsStrict()).toBeUndefined()
+      // The next run reads a readable index again, and answers.
+      const next = new WorkspaceStore()
+      await next.load()
+      expect([...(next.knownNodeIdsStrict() ?? [])]).toEqual(['term-1'])
+    }
+  })
+  // …while the agent-status MIRROR's accessor keeps its behaviour from before live links (R64/M2):
+  // pruning an identity against a rebuilt index costs one hook event, and the flag lasts the whole
+  // process — a Server Edition started on a fresh data dir runs for weeks.
+  it("the mirror's accessor answers in such a run, exactly as before (it never reads the rebuild flag)", async () => {
+    await new WorkspaceStore().save(ws([project({ id: 'p-local', cwd: projRoot })]))
+    for (const lose of ['corrupt', 'deleted'] as const) {
+      const index = path.join(userData, 'workspace.json')
+      if (lose === 'corrupt') await fs.writeFile(index, '{nope')
+      else await fs.rm(index, { force: true })
+      const store = new WorkspaceStore()
+      await store.load()
+      // Before any save there is no index in memory: unknown, as it always was.
+      expect(store.knownNodeIds()).toBeUndefined()
+      await store.save(ws([]))
+      expect(store.knownNodeIds()).toEqual(new Set())
+      await store.save(ws([project({ id: 'p-local', cwd: projRoot })]))
+      expect([...(store.knownNodeIds() ?? [])]).toEqual(['term-1'])
+    }
+  })
+  // Re-review NEW-1: an index of the right version that cannot be BUILT (loadV3 throws: a `cwd` that
+  // is not a string) keeps rejecting as before, and marks the run like any other unreadable index.
+  it('a v3 index whose build throws still rejects the load, and marks the run (strict only)', async () => {
+    await fs.writeFile(path.join(userData, 'workspace.json'), JSON.stringify({ version: 3, entries: [{ id: 'p1', name: 'x', color: '#fff', cwd: 5 }] }))
+    const store = new WorkspaceStore()
+    await expect(store.load()).rejects.toThrow()
+    await store.save(ws([]))
+    expect(store.knownNodeIdsStrict()).toBeUndefined()
+    expect(store.knownNodeIds()).toEqual(new Set())
+  })
+  it('a readable index: the two accessors agree', async () => {
+    const store = new WorkspaceStore()
+    await store.save(ws([project({ id: 'p-local', cwd: projRoot })]))
+    expect(store.knownNodeIdsStrict()).toEqual(store.knownNodeIds())
+    expect(new WorkspaceStore().knownNodeIdsStrict()).toBeUndefined() // not loaded: unknown to both
   })
 })

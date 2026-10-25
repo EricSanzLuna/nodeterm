@@ -18,39 +18,50 @@ import { readFileSync } from 'node:fs'
  */
 const src = readFileSync(new URL('./Canvas.tsx', import.meta.url), 'utf8').replace(/\r\n/g, '\n')
 
-/** The cold-open block: from its `if (canColdOpen(verb))` guard to the travel call it stands in
- *  front of. */
+/** The cold-open block: from its `if (canColdOpen(verb))` guard to the off-canvas guard that
+ *  follows it. Bounded by that guard rather than by the travel call further down, so the pins
+ *  below judge THIS block and never inherit a passing verdict from the one after it — the two are
+ *  separate branches with separate contracts (`control-off-canvas.source.test.ts`). */
+const OFF_CANVAS_GUARD = 'if (answersOffCanvas(verb) || answersFromStoredNodes(verb)) {'
 function coldOpenBody(): string {
   const start = src.indexOf('if (canColdOpen(verb)) {')
   expect(start, 'the cold-open guard').toBeGreaterThan(-1)
-  const end = src.indexOf('travelToProjectRef.current(route.projectId)', start)
-  expect(end, 'the travel call after the block').toBeGreaterThan(start)
+  const end = src.indexOf(OFF_CANVAS_GUARD, start)
+  expect(end, 'the off-canvas guard after the block').toBeGreaterThan(start)
   return src.slice(start, end)
 }
 
 describe('the cold-open dispatch block (source pins)', () => {
-  it('stands IN FRONT of the travel call — an open verb never reaches it', () => {
-    // The travel call is what moved the user's screen. Scoped to the dispatch's source-routing
-    // block (Canvas has one other, unrelated travel for the browser-verb guest lookup), the
-    // cold-open guard must precede the single travel in it, or the block is dead code sitting
-    // behind the very thing it replaces.
+  it('stands IN FRONT of the off-screen refusal — an open verb never reaches it', () => {
+    // The travel call this block was written to stand in front of is GONE: nothing in the
+    // agent-control dispatch may activate a project tab, so the fall-through is now a refusal
+    // (`offScreenRefusal`). The cold-open guard must still precede it, or the block is dead code
+    // sitting behind the very thing it replaces — and an `open-claude` from a background agent
+    // would be refused instead of queued.
     const from = src.indexOf('routeControlSource(projects, activeId, sourceNodeId)')
     expect(from, 'the source-routing lookup').toBeGreaterThan(-1)
     const to = src.indexOf('waitForCanvasNode(', from)
     expect(to, 'the post-routing canvas wait').toBeGreaterThan(from)
     const routing = src.slice(from, to)
-    expect(routing.match(/travelToProjectRef\.current\(route\.projectId\)/g)?.length).toBe(1)
+    expect(routing).not.toContain('travelToProjectRef')
     const guard = routing.indexOf('if (canColdOpen(verb)) {')
-    const travel = routing.indexOf('travelToProjectRef.current(route.projectId)')
+    const refusal = routing.indexOf('reply({ ok: false, error: offScreenRefusal(verb,')
     expect(guard, 'the cold-open guard inside the routing block').toBeGreaterThan(-1)
-    expect(guard).toBeLessThan(travel)
-    // …and it RETURNS, so control cannot fall through to the travel after writing the node.
-    expect(coldOpenBody()).toMatch(/queuedIds: coldIds\s*\}\s*\}\)\s*return\s*\}/)
+    expect(refusal, 'the off-screen refusal').toBeGreaterThan(guard)
+    // …and it RETURNS, so control cannot fall through to the refusal after writing the node —
+    // which would answer an agent "nothing was changed" about a node it just queued. Both exits
+    // return: the plain cold-open reply, and the `--run-now` reply built from it (#925).
+    const body = coldOpenBody()
+    expect(body).toMatch(/queuedIds: coldIds\s*\}\s*as Record<string, unknown>\s*\}/)
+    expect(body).toMatch(
+      /reply\(mergeRunNow\(coldReply, await startNodesHeadlessRef\.current\(owner, held\)\)\)\s*return\s*\}/
+    )
+    expect(body).toMatch(/reply\(coldReply\)\s*return\s*\}/)
   })
 
-  it('the guard polarity is not inverted — a NON-cold verb must still travel', () => {
+  it('the guard polarity is not inverted — a NON-cold verb must not be cold-written', () => {
     // `if (!canColdOpen(verb))` would cold-write `write`/`close`/`group` into a serialized project
-    // (silently doing nothing useful) and travel for every open — the exact swap of the fix.
+    // (silently doing nothing useful) and refuse every open — the exact swap of the fix.
     expect(src).toContain('if (canColdOpen(verb)) {')
     expect(src).not.toContain('if (!canColdOpen(verb))')
   })
@@ -75,9 +86,9 @@ describe('the cold-open dispatch block (source pins)', () => {
     expect(body).not.toContain('addAndConnect')
   })
 
-  it('writes through the store: applyNodeMutation for nodes, appendCanvasLinks for edges', () => {
+  it('writes through the store: applyOwnNodeMutation for nodes, appendCanvasLinks for edges', () => {
     const body = coldOpenBody()
-    expect(body).toContain('applyNodeMutation(owner.id, {')
+    expect(body).toContain('applyOwnNodeMutation(owner.id, {')
     expect(body).toContain('appendCanvasLinks(owner.id,')
     expect(body).toContain('writeDisk()')
   })
@@ -86,7 +97,7 @@ describe('the cold-open dispatch block (source pins)', () => {
     // `flowToNodeStates` drops `initialCommand` by design, so a node upserted without moving its
     // command into `pendingLaunch` is the silent-never-starts mutation.
     const body = coldOpenBody()
-    expect(body).toMatch(/const armed = armForColdOpen\(built\)/)
+    expect(body).toMatch(/const armed = withLaunchBrief\(armForColdOpen\(built\), openPrompt\.promptFile\)/)
     expect(body).toMatch(/flowToNodeStates\(\[node\]\)\[0\]/)
     // `--after` rides that same held launch rather than a second mechanism.
     expect(body).toMatch(/pendingLaunch: \{ \.\.\.held, after: coldAfterIds \}/)
@@ -95,7 +106,7 @@ describe('the cold-open dispatch block (source pins)', () => {
   it('refusal-before-write: every refusal precedes the first store write', () => {
     const body = coldOpenBody()
     const firstWrite = Math.min(
-      ...['applyNodeMutation', 'appendCanvasLinks'].map((s) => {
+      ...['applyOwnNodeMutation', 'appendCanvasLinks'].map((s) => {
         const i = body.indexOf(s)
         return i === -1 ? body.length : i
       })

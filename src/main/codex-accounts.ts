@@ -19,6 +19,7 @@ import { ipcMain, type WebContents } from 'electron'
 import { IPC } from '../shared/ipc'
 import {
   assertCodexAccountId,
+  codexAppServerReachable,
   commitCodexRolloutExposure,
   codexAccountHome,
   codexHomeForAccount,
@@ -29,9 +30,14 @@ import {
   migrateLegacyCodexAccountHome,
   migrateLegacyCodexAccountHomes,
   planCodexRolloutExposure,
+  readCodexAuthEmail,
+  systemCodexHome,
   type CodexRolloutExposurePlan
 } from '../core/codex-accounts-core'
 import { readCodexAccountAt, readCodexThreadAt } from '../core/codex-session-name'
+import { directExecutableInvocation } from '../core/exec-path'
+import { linkSharedEntry } from '../core/shared-entry-link'
+import { readRegularFileNoFollow } from '../core/read-regular-file'
 import { ensureCodexRelayRoot } from './codex-relay-daemon'
 import { platform } from '../core/platform'
 import { findInLoginPath } from '../core/pty-manager'
@@ -95,6 +101,12 @@ export function localCodexSocket(accountId?: string): string {
   return codexSocketForAccount(platform().userDataDir, accountId)
 }
 
+/** The host OS the app-server legs branch on — a seam so the Windows leg is testable on Linux. */
+let hostPlatform = (): NodeJS.Platform => process.platform
+export function setCodexAccountsHostPlatformForTests(p: NodeJS.Platform | null): void {
+  hostPlatform = p ? () => p : () => process.platform
+}
+
 /**
  * Reuse the account's shared app-server if it is already answering on its control socket, else boot
  * one exactly once (§2.2). The managed home is migrated to its short form first so the app-server
@@ -102,6 +114,12 @@ export function localCodexSocket(accountId?: string): string {
  * device-verification owed; the control flow (probe → start-once) is pure and tested via injection.
  */
 export async function ensureCodexAccountDaemon(accountId?: string): Promise<void> {
+  // No `ws+unix` app-server on Windows (`codexAppServerReachable`): starting one could only spawn a
+  // daemon nothing can dial and then time out (15 s) — say so at once instead. Identity no longer
+  // comes through here on Windows; this is what the conversation switch / transfer legs hit.
+  if (!codexAppServerReachable(hostPlatform())) {
+    throw new Error('The Codex app-server is not reachable on Windows yet')
+  }
   if (accountId) migrateLegacyCodexAccountHome(platform().userDataDir, accountId)
   const socket = localCodexSocket(accountId)
   await ensureSharedCodexDaemon(
@@ -109,7 +127,10 @@ export async function ensureCodexAccountDaemon(accountId?: string): Promise<void
     async () => {
       const codex = await findInLoginPath('codex')
       if (!codex) throw new Error('Codex CLI unavailable')
-      await execFileP(codex, ['app-server', 'daemon', 'start'], {
+      const invocation = directExecutableInvocation(codex, ['app-server', 'daemon', 'start'])
+      if (!invocation) throw new Error('Codex CLI has no safe Windows entry point')
+      await execFileP(invocation.executable, invocation.args, {
+        ...invocation.options,
         cwd: os.homedir(),
         env: { ...process.env, ...codexSessionEnv(platform().userDataDir, accountId) },
         timeout: 15_000,
@@ -120,9 +141,10 @@ export async function ensureCodexAccountDaemon(accountId?: string): Promise<void
 }
 
 /**
- * Create a managed account's private home (0700) and symlink the shared, NON-secret runtime assets
- * from the system home in. Credentials (`auth.json`) and the thread DB are never shared — only
- * installation assets. A missing source asset is skipped; an existing target link is left as-is.
+ * Create a managed account's private home (0700) and link the shared, NON-secret runtime assets
+ * from the system home in (`linkSharedEntry` — symlinks on POSIX). Credentials (`auth.json`) and
+ * the thread DB are never shared — only installation assets. A missing source asset is skipped; an
+ * existing target link is left as-is.
  */
 async function initializeAccountHome(id: string): Promise<string> {
   migrateLegacyCodexAccountHome(platform().userDataDir, id)
@@ -132,21 +154,32 @@ async function initializeAccountHome(id: string): Promise<string> {
   const sourceHome = process.env.CODEX_HOME?.trim() || path.join(os.homedir(), '.codex')
   for (const name of SHARED_ENTRIES) {
     const source = path.join(sourceHome, name)
-    const target = path.join(home, name)
-    try {
-      await fs.lstat(source)
-      await fs.symlink(source, target)
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code
-      if (code !== 'ENOENT' && code !== 'EEXIST') throw error
-    }
+    // POSIX: a plain symlink. Windows: junction / hardlink / copy, never a blocking EPERM.
+    await linkSharedEntry(source, path.join(home, name))
   }
   return home
 }
 
 async function accountIdentity(accountId?: string): Promise<{ email: string | null } | null> {
+  if (!codexAppServerReachable(hostPlatform())) return authFileIdentity(accountId)
   await ensureCodexAccountDaemon(accountId)
   return readCodexAccountAt(localCodexSocket(accountId), 5000)
+}
+
+/**
+ * The identity on a host with no reachable app-server (Windows): NO daemon start — it could only
+ * time out on every poll — just the account's own `auth.json`, under the same gate as the login
+ * wait (a REAL file, never a symlink; absent ⇒ `null`). The email is the id_token's claim, a display
+ * label only (`readCodexAuthEmail`); a credential with no readable email is still a login.
+ */
+async function authFileIdentity(accountId?: string): Promise<{ email: string | null } | null> {
+  const home = accountId ? localCodexAccountHome(accountId) : systemCodexHome()
+  const file = path.join(home, 'auth.json')
+  // The gate and the read share ONE descriptor (no lstat-then-read on the name — a swap in between
+  // could hand the read a symlink the gate never saw): a link, FIFO, directory or absent file is null.
+  const text = await readRegularFileNoFollow(file)
+  if (text === null) return null
+  return { email: readCodexAuthEmail(text) }
 }
 
 /**
@@ -199,19 +232,56 @@ export function initCodexAccounts(getSshManager?: () => SshProjectManager | unde
   // very first spawn.
   migrateLegacyCodexAccountHomes(platform().userDataDir)
 
-  ipcMain.handle(IPC.codexAccountsAdd, async () => {
+  /**
+   * The SSH leg of every account verb: a `{ projectId }` ctx names a CONNECTED SSH project, and the
+   * account's home lives on that host. Resolved here, once, so each handler either takes the remote
+   * path or the local one — never both, and never the local one for a ctx it could not resolve
+   * (that would mint, poll or delete a home on the wrong machine).
+   */
+  const remoteFor = (ctx?: { projectId?: string }): { mgr: SshProjectManager; projectId: string } | null => {
+    const projectId = typeof ctx?.projectId === 'string' && ctx.projectId ? ctx.projectId : undefined
+    if (!projectId) return null
+    const mgr = getSshManager?.()
+    if (!mgr) throw new Error('SSH is not available in this build')
+    return { mgr, projectId }
+  }
+
+  ipcMain.handle(IPC.codexAccountsAdd, async (_event, ctx?: { projectId?: string }) => {
     const id = randomUUID()
+    const remote = remoteFor(ctx)
+    if (remote) {
+      // Creates the isolated home ON the host (umask 077, shared non-secret assets symlinked in).
+      // The credential is written there by the device login the renderer opens next — it never
+      // travels. Throws with the failed phase, which the Settings row shows.
+      const res = await remote.mgr.remoteCodexAccountAdd(remote.projectId, id)
+      if (!res) throw new Error('The SSH project is not connected')
+      return { id, home: res.home }
+    }
     return { id, home: await initializeAccountHome(id) }
   })
 
-  ipcMain.handle(IPC.codexAccountsWaitLogin, async (_event, id: string) => {
+  ipcMain.handle(IPC.codexAccountsWaitLogin, async (_event, id: string, ctx?: { projectId?: string }) => {
     assertCodexAccountId(id)
+    const remote = remoteFor(ctx)
     const home = localCodexAccountHome(id)
     const waiter = { cancelled: false }
     waiters.set(id, waiter)
     const deadline = Date.now() + LOGIN_TIMEOUT_MS
     try {
       while (!waiter.cancelled && Date.now() < deadline) {
+        if (remote) {
+          // Same gate as locally (a real, non-symlink auth.json), asked ON the host. The email comes
+          // from the account's own app-server; a host that cannot run one (no node/curl for the
+          // relay) still completes the login, just without an email to name the row by.
+          if (await remote.mgr.remoteCodexAuthPresent(remote.projectId, id)) {
+            const identity = await remote.mgr
+              .remoteCodexAccountIdentity(remote.projectId, id)
+              .catch(() => null)
+            return identity ?? { email: null }
+          }
+          await new Promise((resolve) => setTimeout(resolve, LOGIN_POLL_MS))
+          continue
+        }
         try {
           // The login gate: a REAL file, never a symlink. A device login writes auth.json into the
           // managed home; a symlink here would mean the account is riding the system credential.
@@ -236,20 +306,47 @@ export function initCodexAccounts(getSshManager?: () => SshProjectManager | unde
     if (waiter) waiter.cancelled = true
   })
 
-  ipcMain.handle(IPC.codexAccountsIdentity, (_event, id: string) => existingManagedIdentity(id))
+  // The two READS fail closed to `null` when a remote ctx cannot be served (no SSH manager): an
+  // unknown identity is an answer, and it must never be THIS Mac's.
+  const remoteForRead = (ctx?: { projectId?: string }): ReturnType<typeof remoteFor> | 'unservable' => {
+    try {
+      return remoteFor(ctx)
+    } catch {
+      return 'unservable'
+    }
+  }
 
-  // No ctx ⇒ this Mac's system identity. A `{ projectId }` ctx asks for a remote HOST's system
-  // identity, which this build does not yet resolve — fail closed to `null` rather than returning
-  // THIS Mac's login, so a remote machine panel never fabricates/borrows a local identity
-  // (§5 "system-account discovery must not fabricate an account"). Remote resolution is a follow-up.
-  ipcMain.handle(
-    IPC.codexAccountsSystemIdentity,
-    (_event, ctx?: { projectId?: string }) =>
-      ctx?.projectId ? Promise.resolve(null) : accountIdentity()
-  )
+  ipcMain.handle(IPC.codexAccountsIdentity, async (_event, id: string, ctx?: { projectId?: string }) => {
+    const remote = remoteForRead(ctx)
+    if (remote === 'unservable') return null
+    if (!remote) return existingManagedIdentity(id)
+    // `remoteCodexAccountIdentity` refuses (null) a home with no REAL auth.json of its own, so a
+    // not-yet-logged-in remote account never reports the host's system identity.
+    return remote.mgr.remoteCodexAccountIdentity(remote.projectId, id).catch(() => null)
+  })
 
-  ipcMain.handle(IPC.codexAccountsRemove, async (_event, id: string) => {
+  // No ctx ⇒ this Mac's system identity. A `{ projectId }` ctx asks the connected HOST's own
+  // `~/.codex`, through its app-server. Every failure is `null` — a remote machine panel shows no
+  // email rather than borrowing this Mac's login (§5 "system-account discovery must not fabricate").
+  ipcMain.handle(IPC.codexAccountsSystemIdentity, async (_event, ctx?: { projectId?: string }) => {
+    const remote = remoteForRead(ctx)
+    if (remote === 'unservable') return null
+    if (!remote) return accountIdentity()
+    return remote.mgr.remoteCodexAccountIdentity(remote.projectId, undefined).catch(() => null)
+  })
+
+  ipcMain.handle(IPC.codexAccountsRemove, async (_event, id: string, ctx?: { projectId?: string }) => {
     assertCodexAccountId(id)
+    const remote = remoteFor(ctx)
+    if (remote) {
+      const waiter = waiters.get(id)
+      if (waiter) waiter.cancelled = true
+      // Stops the account's app-server and deletes its home ON the host (credential included).
+      if (!(await remote.mgr.remoteCodexAccountRemove(remote.projectId, id))) {
+        throw new Error('Could not remove the Codex account on the SSH host — is it connected?')
+      }
+      return
+    }
     // Property 10 — race/use-safe removal. Refuse while a switch reservation holds this account, or
     // while a concurrent removal is already in flight.
     if (
@@ -267,7 +364,10 @@ export function initCodexAccounts(getSshManager?: () => SshProjectManager | unde
       try {
         const codex = await findInLoginPath('codex')
         if (codex) {
-          await execFileP(codex, ['app-server', 'daemon', 'stop'], {
+          const invocation = directExecutableInvocation(codex, ['app-server', 'daemon', 'stop'])
+          if (!invocation) throw new Error('Codex CLI has no safe Windows entry point')
+          await execFileP(invocation.executable, invocation.args, {
+            ...invocation.options,
             cwd: os.homedir(),
             env: { ...process.env, CODEX_HOME: localCodexAccountHome(id) },
             timeout: 10_000,
@@ -285,6 +385,45 @@ export function initCodexAccounts(getSshManager?: () => SshProjectManager | unde
       removingCodexAccounts.delete(id)
     }
   })
+
+  // ---- The SSH switch: one host-side exposure --------------------------------------------------
+  // A node on an SSH host keeps its conversation in that host's account homes, so the three-phase
+  // LOCAL reservation below has nothing to plan. The host primitive is already atomic and
+  // self-verifying (hardlink + discover-or-roll-back), and the credentials never move: only the
+  // rollout's directory entry does. Refused while this build is removing either account.
+  ipcMain.handle(
+    IPC.codexAccountsSwitchThreadRemote,
+    async (
+      _event,
+      threadId: string,
+      targetAccountId: string | undefined,
+      hostAccountIds: unknown,
+      ctx?: { projectId?: string }
+    ) => {
+      if (typeof threadId !== 'string' || !SAFE_THREAD_ID.test(threadId)) {
+        throw new Error('Invalid Codex account switch request')
+      }
+      if (targetAccountId) assertCodexAccountId(targetAccountId)
+      if (!Array.isArray(hostAccountIds) || hostAccountIds.some((id) => typeof id !== 'string')) {
+        throw new Error('Invalid Codex account switch request')
+      }
+      for (const id of hostAccountIds as string[]) assertCodexAccountId(id)
+      if (targetAccountId && !(hostAccountIds as string[]).includes(targetAccountId)) {
+        throw new Error('The target Codex account is not on this host')
+      }
+      if (targetAccountId && removingCodexAccounts.has(targetAccountId)) {
+        throw new Error('Codex account removal is in progress')
+      }
+      const remote = remoteFor(ctx)
+      if (!remote) throw new Error('An SSH project is required for a remote Codex switch')
+      await remote.mgr.remoteCodexSwitchThread(
+        remote.projectId,
+        threadId,
+        targetAccountId,
+        hostAccountIds as string[]
+      )
+    }
+  )
 
   // ---- The three-phase, owner-authorized, TTL-bounded switch (§4.1 / Properties 5, 10) ----------
 

@@ -21,19 +21,18 @@ import {
   type MirrorFile
 } from '../core/agent-status-mirror'
 import type { NormalizedAgentEvent } from '../shared/agents/normalize'
-import { createHudModel, type HudModel } from './notch-hud-model'
-import { hudGeometry, type HudGeometry } from './notch-hud-geometry'
+import { createHudModel, type HudModel, type HudContextUpdate } from './notch-hud-model'
+import { hudGeometry, hudPlacement, type HudGeometry } from './notch-hud-geometry'
+import {
+  sanitizeNotchAlign,
+  sanitizeNotchOffsetY,
+  sanitizeNotchWidth,
+  type NotchAlign
+} from '../shared/notch-hud'
 
-/**
- * Assumed physical notch WIDTH (px). Electron exposes no `auxiliaryTopLeftArea`, so we assume a
- * centered notch of this width, and the capsule butts against its LEFT edge. Field-tuned to 168 px
- * (200 left a visible gap — the capsule sat too far left). TUNE ON A MAC: raise it to push the
- * capsule LEFT, lower it to slide the capsule RIGHT toward the notch.
- */
-const NOTCH_WIDTH = 168
-/** Bounds for the user-tunable notch width (settings.notchWidth). */
-export const NOTCH_WIDTH_MIN = 100
-export const NOTCH_WIDTH_MAX = 320
+// The notch-width constants + `sanitizeNotchWidth` moved to src/shared/notch-hud.ts (2026-09) so
+// Settings → Notch reads the same bounds it clamps against; re-exported for existing importers.
+export { NOTCH_WIDTH_MIN, NOTCH_WIDTH_MAX } from '../shared/notch-hud'
 /** Debounce for coalescing feed changes into one push to the HUD renderer. */
 const PUSH_DEBOUNCE_MS = 150
 /** Low-frequency sweep so stale (gone + idle > 6h) nodes drop even with no live events. */
@@ -90,16 +89,18 @@ export interface NotchHudTunables {
   enabled: boolean
   /** Assumed physical notch width in px — the knob that makes the capsule sit flush. */
   notchWidth: number
+  /** Which side of the primary display the capsule sits on (settings.notchAlign). */
+  align: NotchAlign
+  /** Vertical offset from the capsule's resting place, px, positive = down (settings.notchOffsetY). */
+  offsetY: number
   /** Expand the panel on hover (else click-only). */
   hoverExpand: boolean
   /** settings.usagePercentMode — how the rows' context percentages render ("42% used" / "58% left"). */
   percentMode: 'used' | 'remaining' | 'tokens'
 }
 
-/** Clamp a hand-editable width to something that can't push the capsule off the display. */
-function sanitizeNotchWidth(px: number): number {
-  return Number.isFinite(px) ? Math.max(NOTCH_WIDTH_MIN, Math.min(NOTCH_WIDTH_MAX, Math.round(px))) : NOTCH_WIDTH
-}
+/** Everything but `enabled` — the values a RUNNING controller can take live. */
+type LiveTunables = Omit<NotchHudTunables, 'enabled'>
 
 class NotchHudController {
   private model: HudModel = createHudModel()
@@ -115,7 +116,7 @@ class NotchHudController {
 
   constructor(
     private deps: NotchHudDeps,
-    private tunables: { notchWidth: number; hoverExpand: boolean; percentMode: 'used' | 'remaining' | 'tokens' }
+    private tunables: LiveTunables
   ) {
     this.onSetIgnoreMouse = (_e, ignore) => {
       // Ignore-mouse ON = click-through (the strip is transparent to the app beneath); OFF while the
@@ -200,7 +201,7 @@ class NotchHudController {
   }
 
   /** Feed a context-update {sessionId, model, usedPercent} (the model name). */
-  onContextUpdate(p: { sessionId?: string; model?: string; usedPercent?: number }): void {
+  onContextUpdate(p: HudContextUpdate): void {
     this.onModelChange(() => this.model.applyContextUpdate(p))
   }
 
@@ -232,20 +233,37 @@ class NotchHudController {
     this.ipcBound = false
   }
 
-  /** Apply live tunables and re-push, so a slider drag moves the capsule as you drag. */
-  setTunables(t: { notchWidth: number; hoverExpand: boolean; percentMode: 'used' | 'remaining' | 'tokens' }): void {
-    this.tunables = { notchWidth: t.notchWidth, hoverExpand: t.hoverExpand, percentMode: t.percentMode }
-    this.schedulePush()
+  /** Apply live tunables and re-push, so a slider drag moves the capsule as you drag. Goes through
+   *  `reposition` rather than a bare push because the vertical offset changes the window HEIGHT
+   *  (a lowered panel needs room below it) — `setBounds` with unchanged bounds is a no-op. */
+  setTunables(t: LiveTunables): void {
+    this.tunables = {
+      notchWidth: t.notchWidth,
+      align: t.align,
+      offsetY: t.offsetY,
+      hoverExpand: t.hoverExpand,
+      percentMode: t.percentMode
+    }
+    this.reposition()
+  }
+
+  /** The placement settings, re-validated HERE at the point of use (settings.json is hand-editable;
+   *  the type is compile-time only): an unknown side → center, a bad offset → 0 / the nearest bound. */
+  private placementSettings(): { align: NotchAlign; offsetY: number } {
+    return { align: sanitizeNotchAlign(this.tunables.align), offsetY: sanitizeNotchOffsetY(this.tunables.offsetY) }
   }
 
   private geometry(): HudGeometry {
+    // Always the PRIMARY display's live bounds — never a cached rect — so a display change (or a
+    // resolution change under a placement edit) is answered from what the screen reports now.
     const d = screen.getPrimaryDisplay()
     return hudGeometry({
       bounds: d.bounds,
       workArea: d.workArea,
       // `internal` is what keeps an external monitor at a low resolution from reading as notched.
       internal: d.internal === true,
-      notchWidth: sanitizeNotchWidth(this.tunables.notchWidth)
+      notchWidth: sanitizeNotchWidth(this.tunables.notchWidth),
+      offsetY: this.placementSettings().offsetY
     })
   }
 
@@ -346,6 +364,17 @@ class NotchHudController {
     // fused top strip would only make the capsule a tall detached box — the exact field bug. Tell
     // the renderer so it drops the reserved strip and draws a compact pill instead.
     const clamped = w.getBounds().y > g.y
+    // Where the capsule and its panel sit, from the user's side + offset. Fed the SAME hasNotch the
+    // renderer used to key its shape on (detection AND the clamp check), so "fused" can never be
+    // claimed for a window that cannot paint over the notch.
+    const p = hudPlacement({
+      width: g.width,
+      bar: g.bar,
+      notchWidth: g.notchWidth,
+      notchCenterX: g.notchCenterX,
+      hasNotch: g.hasNotch && !clamped,
+      ...this.placementSettings()
+    })
     w.webContents.send(IPC.hudRows, {
       rows,
       bar: g.bar,
@@ -354,7 +383,12 @@ class NotchHudController {
       hoverExpand: this.tunables.hoverExpand,
       percentMode: this.tunables.percentMode,
       notchCenterX: g.notchCenterX,
-      hasNotch: g.hasNotch && !clamped
+      fused: p.fused,
+      anchor: p.anchor,
+      capsuleX: p.capsuleX,
+      capsuleTop: p.capsuleTop,
+      panelLeft: p.panelLeft,
+      panelWidth: p.panelWidth
     })
   }
 }
@@ -383,8 +417,8 @@ export function initNotchHud(deps: NotchHudDeps, t: NotchHudTunables): void {
 
 /**
  * Live settings apply: create/destroy the window on the enable toggle, and push the geometry
- * tunables (notch width, hover-expand) straight through to a running HUD — no restart, so the
- * width slider can be dragged while watching the capsule move.
+ * tunables (notch width, side, vertical offset, hover-expand) straight through to a running HUD —
+ * no restart, so the width / offset sliders can be dragged while watching the capsule move.
  */
 export function applyNotchHudSettings(t: NotchHudTunables): void {
   if (!supported()) return
@@ -412,10 +446,6 @@ export function destroyNotchHud(): void {
 export function notchHudOnAgentEvent(ev: NormalizedAgentEvent): void {
   controller?.onAgentEvent(ev)
 }
-export function notchHudOnContextUpdate(p: {
-  sessionId?: string
-  model?: string
-  usedPercent?: number
-}): void {
+export function notchHudOnContextUpdate(p: HudContextUpdate): void {
   controller?.onContextUpdate(p)
 }

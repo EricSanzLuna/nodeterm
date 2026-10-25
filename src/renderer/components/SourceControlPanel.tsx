@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { IconClose, IconMore, IconSparkle, IconUndo } from './icons'
 import { createPortal } from 'react-dom'
 import type { FsApi, GitFileChange, GitResult, GitStatus } from '@shared/types'
 import { gitignoreAdd } from '@shared/gitignore'
@@ -9,6 +10,7 @@ import { useProjects } from '../state/projects'
 import { useSettings } from '../state/settings'
 import { useSshConn } from '../state/sshConn'
 import { useScmDraft } from '../state/scmDraft'
+import { readBranchStatus } from '../state/gitBranches'
 import { useScmCache } from '../state/scmCache'
 import { useSession } from '../session/session'
 import { GitHistoryPanel } from './git-history/GitHistoryPanel'
@@ -19,6 +21,9 @@ import { defaultScmScope, type ScmScope } from '@shared/scm-scope'
 import { chipFor, effectiveBindings } from '../lib/keybindingOverrides'
 import { matchesShortcut } from '@shared/shortcut'
 import { isMacPlatform } from '@shared/platform-utils'
+import { localRevealPath, osRevealLabel } from '../lib/osReveal'
+import { gitStatusColor } from '../lib/gitStatusColors'
+import { pendingPublish, publishOutcome, startPublishRetry, type PendingPublish } from '../lib/publishFallback'
 
 export interface SourceControlPanelProps {
   onClose: () => void
@@ -41,14 +46,6 @@ const AUTO_FETCH_MS = 180_000
 
 /** Which physical modifier the registry's abstract `Cmd` resolves to for the commit chord. */
 const isMac = isMacPlatform()
-
-const STATUS_COLOR: Record<string, string> = {
-  M: '#ffd60a',
-  A: '#32d74b',
-  D: '#ff453a',
-  R: '#bf5af2',
-  U: '#6ac4dc'
-}
 
 function DiffStat({ added, deleted }: { added: number; deleted: number }) {
   if (!added && !deleted) return null
@@ -131,6 +128,10 @@ export function SourceControlPanel({
     null
   )
   const [publishOpen, setPublishOpen] = useState(false)
+  // A Publish waiting for `gh auth login` in a terminal and retrying in-process (see
+  // lib/publishFallback). The retry outlives this drawer — the user closes it to reach the terminal
+  // — so a reopened panel picks the pending one up and shows it.
+  const [publishWait, setPublishWait] = useState<PendingPublish | null>(null)
   const [moreMenu, setMoreMenu] = useState<{ x: number; y: number } | null>(null)
   const [branchPick, setBranchPick] = useState<{
     x: number
@@ -165,11 +166,12 @@ export function SourceControlPanel({
     })
 
   const refresh = useCallback(async () => {
-    setStatus(cwd ? await git.status(cwd) : null)
+    if (isSsh && !sshControlPath) return
+    setStatus(cwd ? await readBranchStatus(git, cwd, isSsh ? project?.id : undefined) : null)
     // `sshControlPath` is a dep so an SSH project whose master finishes connecting after the panel
     // opened re-fetches once the connection is live (instead of staying "no repo"/empty).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cwd, git, sshControlPath])
+  }, [cwd, git, sshControlPath, isSsh, project?.id])
 
   const autoFetchOn = useSettings((s) => s.settings.gitAutoFetch)
 
@@ -224,6 +226,21 @@ export function SourceControlPanel({
       refreshingRef.current = false
     }
   }, [])
+  // Pick up a Publish retry still waiting for gh login (started before this drawer reopened).
+  useEffect(() => {
+    const p = cwd ? pendingPublish(cwd) : undefined
+    setPublishWait(p ?? null)
+    if (!p) return
+    let live = true
+    void p.done.then((r) => {
+      if (!live) return
+      setPublishWait(null)
+      if (r.kind === 'published') void requestRefreshAll()
+    })
+    return () => {
+      live = false
+    }
+  }, [cwd, requestRefreshAll])
 
   // Auto-fetch while the panel is open so ahead/behind ("Synced") stays accurate — git's ahead/
   // behind is computed against the local remote-tracking ref, which only updates on `git fetch`.
@@ -291,7 +308,7 @@ export function SourceControlPanel({
             setFileMenu({ x: e.clientX, y: e.clientY, path: f.path })
           }}
         >
-          <span className="scm-letter" style={{ color: STATUS_COLOR[f.status] ?? 'rgba(255,255,255,0.85)' }}>
+          <span className="scm-letter" style={{ color: gitStatusColor(f.status) }}>
             {f.status}
           </span>
           <button
@@ -305,7 +322,7 @@ export function SourceControlPanel({
           <span className="scm-row-actions">
             {!staged && (
               <button className="scm-iconbtn" title="Discard changes" onClick={() => discard(f)}>
-                ↩
+                <IconUndo />
               </button>
             )}
             <button
@@ -419,8 +436,8 @@ export function SourceControlPanel({
       <aside className="drawer scm" onClick={(e) => e.stopPropagation()}>
         <div className="drawer__head">
           <h2>Source Control</h2>
-          <button className="drawer__close" onClick={onClose}>
-            ×
+          <button className="drawer__close" aria-label="Close" onClick={onClose}>
+            <IconClose />
           </button>
         </div>
 
@@ -480,7 +497,7 @@ export function SourceControlPanel({
                   setMoreMenu({ x: r.right - 200, y: r.bottom + 4 })
                 }}
               >
-                ⋯
+                <IconMore />
               </button>
             </div>
 
@@ -488,6 +505,25 @@ export function SourceControlPanel({
               {/* Surface git action errors (e.g. a branch switch blocked by local changes)
                   at the top, right under the repo/branch bar, so the user sees why the
                   action they just triggered failed instead of missing it at the bottom. */}
+              {publishWait && (
+                <div className="scm-error scm-error--info" role="status">
+                  <pre className="scm-error__msg">
+                    Finish signing in to GitHub in the terminal — the repository is created and pushed as soon as
+                    you are signed in.
+                  </pre>
+                  <button
+                    className="scm-error__dismiss"
+                    title="Stop waiting"
+                    aria-label="Stop waiting for GitHub sign-in"
+                    onClick={() => {
+                      publishWait.abort()
+                      setPublishWait(null)
+                    }}
+                  >
+                    <IconClose />
+                  </button>
+                </div>
+              )}
               {(error || genError) && (
                 <div className="scm-error" role="alert">
                   <pre className="scm-error__msg">{error || genError}</pre>
@@ -500,7 +536,7 @@ export function SourceControlPanel({
                       useScmDraft.getState().clearError(draftKey)
                     }}
                   >
-                    ×
+                    <IconClose />
                   </button>
                 </div>
               )}
@@ -537,7 +573,7 @@ export function SourceControlPanel({
                     aria-label="Generate commit message"
                     onClick={generate}
                   >
-                    ✦
+                    <IconSparkle />
                   </button>
                 </div>
                 <button
@@ -785,11 +821,11 @@ export function SourceControlPanel({
               <button
                 className="ctx-item"
                 onClick={() => {
-                  window.nodeTerminal.shell.reveal(`${cwd}/${fileMenu.path}`)
+                  window.nodeTerminal.shell.reveal(localRevealPath(cwd, fileMenu.path))
                   setFileMenu(null)
                 }}
               >
-                Reveal in Finder
+                {osRevealLabel()}
               </button>
             </div>
           </>,
@@ -922,25 +958,38 @@ export function SourceControlPanel({
             // Always try in-app: publish() reuses gh's login OR the user's existing git
             // HTTPS token, so an already-authenticated user never sees a terminal.
             setBusy(true)
-            const r = await git.publish(cwd!, name, isPrivate)
+            const publishCwd = cwd!
+            const first = publishOutcome(await git.publish(publishCwd, name, isPrivate))
             setBusy(false)
-            if (r.ok) {
+            if (first.kind === 'published') {
               setError('')
               await requestRefreshAll()
               return
             }
-            if (r.needsAuth) {
-              // No usable credential (e.g. SSH-only): fall back to an interactive gh
-              // login chained straight into creating + pushing the chosen repo.
-              const safe = name.replace(/'/g, `'\\''`)
-              onRunInTerminal(
-                `gh auth login && gh repo create '${safe}' ${isPrivate ? '--private' : '--public'} --source=. --push`,
-                cwd!
-              )
-              onClose()
+            if (first.kind === 'error') {
+              setError(first.message)
               return
             }
-            setError(r.message)
+            // No usable credential (e.g. SSH-only): run ONLY `gh auth login` in a terminal — a bare
+            // command every shell parses the same, PowerShell and cmd included — and retry the
+            // create + push in-process once the login lands (the repo name never meets a shell).
+            // Errors surface as a toast: by then this drawer is usually closed.
+            onRunInTerminal(first.terminalCmd, publishCwd)
+            startPublishRetry(
+              publishCwd,
+              () => git.publish(publishCwd, name, isPrivate),
+              (r) => {
+                const message =
+                  r.kind === 'error'
+                    ? `Publish to GitHub failed: ${r.message}`
+                    : r.kind === 'timeout'
+                      ? 'Still not signed in to GitHub. Finish `gh auth login`, then choose Publish to GitHub again.'
+                      : null
+                if (message) window.dispatchEvent(new CustomEvent('nodeterm:toast', { detail: { kind: 'error', message } }))
+              }
+            )
+            setError('')
+            onClose()
           }}
         />
       )}

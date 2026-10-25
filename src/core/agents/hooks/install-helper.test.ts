@@ -6,11 +6,13 @@ import { join } from 'node:path'
 import {
   buildManagedHookCommand,
   mergeManagedHook,
+  stripManagedHook,
+  syncWindowsShLauncher,
   writeManagedHookConfig,
   writeManagedHookFileAtomic,
   type HookSettings
 } from './install-helper'
-import { CLAUDE_HOOK_EVENTS } from '@shared/agents/hook-events'
+import { CLAUDE_HOOK_EVENTS, managedEventName } from '@shared/agents/hook-events'
 
 const cmd = buildManagedHookCommand('/remote/.nodeterm/agent-hooks/claude.sh')
 
@@ -170,6 +172,21 @@ describe('mergeManagedHook — matcher support is opt-in per event', () => {
  * These run on any OS: the win32-ness that matters is the SEPARATOR inside the stored command,
  * which `path.win32` gives us without a Windows runner.
  */
+describe('mergeManagedHook — claude PermissionRequest carries an explicit timeout', () => {
+  it('writes timeout: 600 on the held PermissionRequest handler only, and never a matcher', () => {
+    const out = mergeManagedHook({}, 'CMD', CLAUDE_HOOK_EVENTS)
+    expect(out.hooks!.PermissionRequest).toEqual([{ hooks: [{ type: 'command', command: 'CMD', timeout: 600 }] }])
+    expect(out.hooks!.Stop).toEqual([{ hooks: [{ type: 'command', command: 'CMD' }] }])
+  })
+  it('updates an EXISTING install (the old timeout-less entry is replaced, not duplicated)', () => {
+    const CMD = buildManagedHookCommand('/home/u/.nodeterm/agent-hooks/claude.sh')
+    const old = { hooks: { PermissionRequest: [{ hooks: [{ type: 'command', command: CMD }] }] } }
+    const out = mergeManagedHook(old, CMD, CLAUDE_HOOK_EVENTS)
+    expect(out.hooks!.PermissionRequest).toEqual([{ hooks: [{ type: 'command', command: CMD, timeout: 600 }] }])
+    expect(mergeManagedHook(out, CMD, CLAUDE_HOOK_EVENTS)).toEqual(out) // idempotent
+  })
+})
+
 describe('mergeManagedHook — Windows path separators (issue #558)', () => {
   const winScript = path.win32.join('C:\\Users\\u', '.nodeterm', 'agent-hooks', 'claude.sh')
   const winCmd = buildManagedHookCommand(winScript)
@@ -189,10 +206,11 @@ describe('mergeManagedHook — Windows path separators (issue #558)', () => {
     // The reported state, rebuilt: nine byte-identical definitions on every managed event.
     const dup = { hooks: [{ type: 'command', command: winCmd }] }
     const hooks: Record<string, typeof dup[]> = {}
-    for (const ev of CLAUDE_HOOK_EVENTS) hooks[ev as string] = Array.from({ length: 9 }, () => ({ ...dup }))
+    for (const ev of CLAUDE_HOOK_EVENTS.map(managedEventName)) hooks[ev] = Array.from({ length: 9 }, () => ({ ...dup }))
     const out = mergeManagedHook({ hooks }, winCmd, CLAUDE_HOOK_EVENTS)
-    for (const ev of CLAUDE_HOOK_EVENTS) {
-      expect(out.hooks![ev as string], ev as string).toEqual([{ hooks: [{ type: 'command', command: winCmd }] }])
+    for (const ev of CLAUDE_HOOK_EVENTS.map(managedEventName)) {
+      // One definition, one handler, OUR command (PermissionRequest's also carries its timeout).
+      expect(out.hooks![ev]?.map((d) => d.hooks?.map((h) => h.command)), ev).toEqual([[winCmd]])
     }
   })
 
@@ -241,3 +259,79 @@ describe('mergeManagedHook — only OUR handler is removed from a shared definit
     expect(mergeManagedHook(before, cmd, ['Stop']).hooks!.SubagentStop).toBe('nonsense')
   })
 })
+
+describe('buildManagedHookCommand — Windows wrapper (gemini / grok / copilot)', () => {
+  const CMD = 'C:\\WINDOWS\\System32\\cmd.exe'
+  const winScript = 'C:\\Users\\u\\.nodeterm\\agent-hooks\\gemini.sh'
+
+  it('win32: runs the agent wrapper through the measured cmd.exe invocation', () => {
+    expect(buildManagedHookCommand(winScript, {}, 'win32', CMD)).toBe(
+      `${CMD} /d /c call "C:\\Users\\u\\.nodeterm\\agent-hooks\\gemini-hook.cmd "`
+    )
+  })
+
+  it('the default and every non-win32 platform stay byte-identical to the POSIX line', () => {
+    const posix =
+      "if [ -r '/h/.nodeterm/agent-hooks/gemini.sh' ]; then sh '/h/.nodeterm/agent-hooks/gemini.sh'; else cat >/dev/null 2>&1 || :; fi"
+    expect(buildManagedHookCommand('/h/.nodeterm/agent-hooks/gemini.sh')).toBe(posix)
+    expect(buildManagedHookCommand('/h/.nodeterm/agent-hooks/gemini.sh', {}, 'linux', CMD)).toBe(posix)
+    expect(buildManagedHookCommand('/h/.nodeterm/agent-hooks/gemini.sh', {}, 'darwin', CMD)).toBe(posix)
+  })
+
+  it('refuses antigravity-only options on win32 instead of dropping them', () => {
+    expect(() => buildManagedHookCommand(winScript, { env: { A: 'b' } }, 'win32', CMD)).toThrow()
+    expect(() => buildManagedHookCommand(winScript, { fallbackStdout: '{}' }, 'win32', CMD)).toThrow()
+  })
+
+  it('an upgrade REPLACES the POSIX entry with the .cmd one (one handler per event, not two)', () => {
+    const posixCmd = buildManagedHookCommand(winScript)
+    const winCmd = buildManagedHookCommand(winScript, {}, 'win32', CMD)
+    const foreign = { hooks: [{ type: 'command', command: 'echo mine' }] }
+    const before = { hooks: { AfterTool: [foreign, { hooks: [{ type: 'command', command: posixCmd }] }] } }
+    const out = mergeManagedHook(before, winCmd, ['AfterTool'])
+    expect(out.hooks!.AfterTool).toEqual([foreign, { hooks: [{ type: 'command', command: winCmd }] }])
+    // Both spellings present at once (a half-upgraded file) still collapse to one.
+    const both = { hooks: { AfterTool: [{ hooks: [{ type: 'command', command: posixCmd }] }, { hooks: [{ type: 'command', command: winCmd }] }] } }
+    expect(mergeManagedHook(both, winCmd, ['AfterTool']).hooks!.AfterTool).toEqual([
+      { hooks: [{ type: 'command', command: winCmd }] }
+    ])
+  })
+
+  it('uninstall strips both spellings and no other agent\'s entry', () => {
+    const posixCmd = buildManagedHookCommand(winScript)
+    const winCmd = buildManagedHookCommand(winScript, {}, 'win32', CMD)
+    const claudeWin = buildManagedHookCommand('C:\\Users\\u\\.nodeterm\\agent-hooks\\claude.sh')
+    const cfg = {
+      hooks: {
+        Stop: [
+          { hooks: [{ type: 'command', command: posixCmd }] },
+          { hooks: [{ type: 'command', command: winCmd }] },
+          { hooks: [{ type: 'command', command: claudeWin }] }
+        ]
+      }
+    }
+    expect(stripManagedHook(cfg, 'gemini.sh', ['Stop']).hooks!.Stop).toEqual([
+      { hooks: [{ type: 'command', command: claudeWin }] }
+    ])
+  })
+})
+
+describe('syncWindowsShLauncher — the .cmd beside a CLI shim', () => {
+  it('win32 writes nodeterm.cmd running nodeterm.sh; another platform removes a stray copy', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'nt-launcher-'))
+    try {
+      syncWindowsShLauncher(dir, 'nodeterm.sh', 'win32')
+      const text = readFileSync(join(dir, 'nodeterm.cmd'), 'utf8')
+      expect(text).toContain('set "NT_SCRIPT=%~dp0nodeterm.sh"')
+      expect(text).toContain('"%NT_SH%" "%NT_ARG%" %*')
+      expect(text).not.toContain(dir) // no baked absolute path
+      syncWindowsShLauncher(dir, 'nodeterm.sh', 'linux')
+      expect(readdirSync(dir)).toEqual([])
+      // Removing what is not there is not an error.
+      syncWindowsShLauncher(dir, 'context.sh', 'darwin')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+

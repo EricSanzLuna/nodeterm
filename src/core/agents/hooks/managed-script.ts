@@ -89,6 +89,17 @@ import { codexThreadIdentityRoot } from '../../codex-identity-proxy'
 import { HOOK_CURL_HEADERS_SH } from '../hook-curl-config-sh'
 import { NODE_TOKEN_READ_SH } from '../node-token-sh'
 import { HOOK_ENDPOINT_FALLBACK_SH } from '../hook-endpoint-failover-sh'
+import { ANTIGRAVITY_EVENT_ENV, antigravityDecisionCaseSh } from './antigravity-decision'
+import {
+  PERMISSION_DECISION_MAX_BYTES,
+  PERMISSION_DECISION_PREFIX,
+  PERM_WAIT_SECS_INTERACTIVE
+} from '../permission-decision'
+import {
+  ASK_USER_QUESTION_TOOL,
+  EXIT_PLAN_MODE_TOOL,
+  INTERACTIVE_HOLD_TOOLS
+} from '../../../shared/agents/permission-answer'
 
 /**
  * Bumped by hand whenever this script's CONTRACT with the server changes. Not a git sha and not a
@@ -109,13 +120,146 @@ import { HOOK_ENDPOINT_FALLBACK_SH } from '../hook-endpoint-failover-sh'
  *     and any session the PHONE spawns on that host, which runs the host's installed script — stay
  *     `legacy` until the project reconnects.
  */
-export const MANAGED_SCRIPT_REVISION = 4
+export const MANAGED_SCRIPT_REVISION = 5
 /** The first revision that reads NODETERM_NODE_TOKEN_DIR and sends the node token (PR #195). */
 export const MIN_TOKEN_AWARE_REVISION = 3
 /* rev 4 (issue #384): the token read moved to the shared resolver in `node-token-sh.ts`, which
  * falls back to the standard token dirs when the endpoint file advertises none. The floor stays 3
  * on purpose — rev 3 CAN read a token, which is the only question `MIN_TOKEN_AWARE_REVISION`
- * answers; calling it stale would tell a working session to reconnect for nothing. */
+ * answers; calling it stale would tell a working session to reconnect for nothing.
+ * rev 5: the answer file may carry a core-built JSON decision (plans/questions), a plain allow on
+ * ExitPlanMode maps to `updatedInput:{}`, and those two tools hold 540 s. The server gates
+ * structured answers on it (`MIN_STRUCTURED_ANSWER_REVISION`, permission-decision.ts) — an older
+ * script would silently ignore them while the write reported success. */
+
+/**
+ * Which tool the held PermissionRequest is about, and how long to hold it (claude only; spliced
+ * into the arm branch). Structured answers are docs/hook-reply-approvals.md § "Plans and questions".
+ *
+ * `nt_tool` is read with parameter expansion (no subprocess, nothing on an argv) from the FIRST
+ * `"tool_name":` in the payload. A JSON string cannot contain an unescaped `"tool_name":"` — its
+ * quotes would be `\"` — so the only way to match an earlier one is a NESTED KEY inside an object
+ * value, i.e. inside `tool_input`. Claude Code writes `tool_name` before `tool_input` (hook input
+ * builder, research §1), so the first match is the top-level one; and if that order ever flips, the
+ * `"tool_input"`-in-the-head check leaves `nt_tool` EMPTY rather than trusting a nested key. Empty is
+ * the safe direction: the default hold and today's bare allow. The value is then held to a plain
+ * identifier and only ever compared against two literals.
+ *
+ * `nt_wait`: ExitPlanMode / AskUserQuestion are read by a person for minutes, so they hold
+ * PERM_WAIT_SECS_INTERACTIVE (< the 600 s command-hook timeout our installers
+ * write with an explicit `timeout: 600`, see CLAUDE_HOOK_EVENTS). EXCEPT for a subagent's request
+ * (payload names an `agent_id`): Claude awaits a subagent's automated checks BEFORE painting its
+ * dialog (research §1), so a long hold there would hide the prompt for minutes. Evidence that the
+ * key is the right signal (claude 2.1.283 bundle, verified by the review): the hook base input is
+ * `session_id…,permission_mode:r,agent_id:s?.agentId,agent_type:g,…` — `agentId` is undefined on
+ * the main thread, so JSON.stringify drops the key there and it appears only for a subagent. A
+ * nested `"agent_id":` inside tool_input merely shortens the hold — the safe direction.
+ */
+const HELD_TOOL_SH: readonly string[] = [
+  '      nt_tool=""',
+  '      nt_head=${payload%%\'"tool_name":\'*}',
+  '      if [ "$nt_head" != "$payload" ]; then',
+  '        case "$nt_head" in',
+  '          *\'"tool_input"\'*) ;;',
+  '          *)',
+  '            nt_rest=${payload#*\'"tool_name":\'}',
+  '            nt_rest=${nt_rest# }',
+  '            case "$nt_rest" in \'"\'*) nt_rest=${nt_rest#\'"\'}; nt_tool=${nt_rest%%\'"\'*} ;; esac',
+  '            ;;',
+  '        esac',
+  '      fi',
+  '      case "$nt_tool" in \'\'|*[!A-Za-z0-9_.:-]*) nt_tool="" ;; esac',
+  '      nt_wait="$NODETERM_PERM_WAIT_SECS"',
+  '      case "$nt_tool" in',
+  `        ${INTERACTIVE_HOLD_TOOLS.join('|')})`,
+  '          case "$payload" in',
+  '            *\'"agent_id":\'*) ;;',
+  `            *) nt_wait=${PERM_WAIT_SECS_INTERACTIVE} ;;`,
+  '          esac',
+  '          ;;',
+  '      esac'
+]
+
+/**
+ * Decode one answer file into `nt_verb` (allow | deny | hold | empty) and `nt_out` (the exact line
+ * to print, or empty). The script prints ONLY:
+ *   - a fixed decision for the legacy words `allow` / `deny` (a plain `allow` on ExitPlanMode maps
+ *     to `updatedInput:{}` — Claude DROPS a bare allow on that tool, so the phone's and the header
+ *     button's Approve were silent no-ops; `{}` restores the pre-plan mode, like the dialog's own
+ *     default); or
+ *   - a JSON decision core built (core/agents/permission-decision.ts), printed verbatim only after
+ *     the same bound `isBoundedAnswerContent` applies: the exact prefix + a "allow"/"deny" behavior,
+ *     a closing brace, <= PERMISSION_DECISION_MAX_BYTES, no control bytes (so exactly one line).
+ * A plain `allow` on AskUserQuestion is `hold`: Claude would drop it (a question needs answers),
+ * so printing it would close the hook for nothing — the loop consumes the file and KEEPS HOLDING,
+ * leaving the chat-view answer path open while the TUI dialog works as always. Anything else
+ * (garbage, a hostile file, an over-long or multi-line JSON) prints nothing and falls through to
+ * the TUI, exactly as every build before this one did for an unknown answer.
+ *
+ * An OLD script (an SSH host keeps the script it got at connect) reads a JSON answer as neither
+ * `allow` nor `deny`, so it prints nothing and exits — the TUI still answers. Safe degrade.
+ */
+const ANSWER_DECODE_SH: readonly string[] = [
+  '      nt_verb=""',
+  '      nt_out=""',
+  '      case "$nt_decision" in',
+  '        allow)',
+  '          case "$nt_tool" in',
+  `            ${ASK_USER_QUESTION_TOOL}) nt_verb=hold ;;`,
+  `            ${EXIT_PLAN_MODE_TOOL}) nt_verb=allow; nt_out='${PERMISSION_DECISION_PREFIX}"allow","updatedInput":{}}}}' ;;`,
+  `            *) nt_verb=allow; nt_out='${PERMISSION_DECISION_PREFIX}"allow"}}}' ;;`,
+  '          esac',
+  '          ;;',
+  `        deny) nt_verb=deny; nt_out='${PERMISSION_DECISION_PREFIX}"deny","message":"Denied from nodeterm."}}}' ;;`,
+  `        '${PERMISSION_DECISION_PREFIX}"allow"'*) nt_verb=allow; nt_out="$nt_decision" ;;`,
+  `        '${PERMISSION_DECISION_PREFIX}"deny"'*) nt_verb=deny; nt_out="$nt_decision" ;;`,
+  '      esac',
+  '      # Shape-check a core-built JSON answer before it can reach Claude\'s stdout. The size is the',
+  '      # FILE\'s byte count (wc -c), not ${#…}: that counts characters under bash, bytes under dash.',
+  '      if [ -n "$nt_out" ] && [ "$nt_out" = "$nt_decision" ]; then',
+  '        case "$nt_out" in *\'}\') ;; *) nt_out="" ;; esac',
+  '        # Fail CLOSED: an empty/odd size (wc failed) makes the test error, which also clears nt_out.',
+  `        if ! [ "$nt_size" -le ${PERMISSION_DECISION_MAX_BYTES} ] 2>/dev/null; then nt_out=""; fi`,
+  "        if [ -n \"$nt_out\" ] && [ \"$(printf '%s' \"$nt_out\" | tr -d '\\000-\\037')\" != \"$nt_out\" ]; then nt_out=\"\"; fi",
+  '        [ -n "$nt_out" ] || nt_verb=""',
+  '      fi'
+]
+
+/**
+ * CLAUDE ONLY: which claude process ran this hook, and is it the foreground of its terminal
+ * (issues #1112, #1153 — the rule and the measurement are in core/agents/claude-pane-origin.ts).
+ *
+ * Read HERE, synchronously, before the POST is backgrounded: claude waits on its hook, so
+ * `$CLAUDE_PID` is alive for this one `ps` even on `SessionEnd`; a read in the server could land
+ * after the process exited. `$CLAUDE_PID` is exported to hooks by Claude Code itself (measured on
+ * 2.1.301; present in the binary from at least 2.1.220). One `ps`, BSD- and procps-compatible:
+ * `stat`'s `+` means "in the foreground process group of its controlling terminal" on both, and
+ * one `-o` per keyword for the reason PS_FOREGROUND_FLAGS gives. Every way this can fail — no
+ * `$CLAUDE_PID` (an older claude), a `ps` without `-o`/`-p` (Git Bash, BusyBox), a process already
+ * gone — leaves all three EMPTY, which the server reads as "unknown" and delivers as before. Git
+ * Bash is skipped outright: its `ps` cannot answer and a fork there is expensive.
+ */
+const CLAUDE_ORIGIN_SH: readonly string[] = [
+  'nt_claude_pid=""',
+  'nt_claude_fg=""',
+  'nt_claude_tty=""',
+  'if [ -z "$nt_msys" ]; then',
+  '  case "$CLAUDE_PID" in',
+  "    ''|*[!0-9]*) ;;",
+  '    *)',
+  '      nt_ps=$(ps -o stat= -o tty= -p "$CLAUDE_PID" 2>/dev/null) || nt_ps=""',
+  '      set -f',
+  '      set -- $nt_ps',
+  '      set +f',
+  '      if [ "$#" -ge 1 ]; then',
+  '        nt_claude_pid="$CLAUDE_PID"',
+  `        case "$1" in *+*) nt_claude_fg=1 ;; *) nt_claude_fg=0 ;; esac`,
+  `        case "$2" in ''|'?'|'??'|-|*[!A-Za-z0-9/._-]*) ;; *) nt_claude_tty="$2" ;; esac`,
+  '      fi',
+  '      ;;',
+  '  esac',
+  'fi'
+]
 
 function safeIdentityRoot(): string | null {
   try {
@@ -125,13 +269,71 @@ function safeIdentityRoot(): string | null {
   }
 }
 
+/**
+ * ANTIGRAVITY ONLY, emitted at BUILD time (every other agent's script is byte-identical without
+ * it). `agy` reads a hook's stdout as a DECISION and our hook sits in front of every tool call of
+ * every `agy` on the machine, so the answer is the FIRST thing the script does — before the codex
+ * prelude, before the NODETERM_NODE_ID gate (a user's own terminal gets the same answer), before
+ * stdin is read, before the endpoint file is sourced. The table is `antigravity-decision.ts`.
+ *
+ * Then stdout AND stderr go to /dev/null for the rest of the run. That is a stronger guarantee than
+ * auditing every line below: a stray byte (a curl message, a sourced file's echo, a shell warning)
+ * would become "non-JSON → DENY", and on `PreInvocation` it could be injected into the user's
+ * conversation (`injectSteps`). `command exec` rather than a bare `exec`: a redirection failure on
+ * a SPECIAL builtin exits a POSIX shell non-zero, and a non-zero exit is DENY; through `command` it
+ * is an ordinary failure, and `|| :` absorbs it.
+ */
+function antigravityAnswerFirst(): string[] {
+  return [
+    '# ANSWER FIRST (antigravity): agy reads this stdout as a decision — see antigravity-decision.ts.',
+    antigravityDecisionCaseSh(),
+    '# Nothing after the answer may reach stdout or stderr (a stray byte is a DENY, or a message',
+    '# injected into the conversation).',
+    'command exec >/dev/null 2>&1 || :'
+  ]
+}
+
 export function buildManagedScript(
   agentId: string,
   identityRoot: string | null = safeIdentityRoot()
 ): string {
+  const antigravity = agentId === 'antigravity'
+  // The codex hook reads its payload BEFORE the identity prelude: the payload's session_id is the
+  // only thread id a hook under the shared app-server has (#1150/#1175, codex-thread-identity-sh.ts).
+  const codexPayloadFirst = agentId === 'codex' && !!identityRoot
+  // The event name rides the POST for antigravity only — its payload never carries one.
+  // Which claude ran this hook (claude-pane-origin.ts) — claude only, like the event field above.
+  const originFields =
+    agentId === 'claude'
+      ? [
+          '      --data-urlencode "nodeterm_claude_pid=${nt_claude_pid}" \\',
+          '      --data-urlencode "nodeterm_claude_fg=${nt_claude_fg}" \\',
+          '      --data-urlencode "nodeterm_claude_tty=${nt_claude_tty}" \\'
+        ]
+      : []
+  const eventField = antigravity
+    ? [`      --data-urlencode "nodeterm_hook_event=\${${ANTIGRAVITY_EVENT_ENV}}" \\`]
+    : []
   return [
     '#!/bin/sh',
-    ...(identityRoot ? [codexThreadIdentityResolverSh(identityRoot)] : []),
+    ...(antigravity ? antigravityAnswerFirst() : []),
+    ...(codexPayloadFirst
+      ? [
+          '# Payload first (codex only): its leading session_id is this event\'s thread. Parsed with',
+          '# builtins, anchored at the first byte, so a nested "session_id" in tool input never matches.',
+          'nt_pre_payload=$(cat)',
+          'nt_hook_thread=\'\'',
+          'case "$nt_pre_payload" in',
+          '  \'{"session_id":"\'*)',
+          '    nt_hook_thread=${nt_pre_payload#\'{"session_id":"\'}',
+          '    nt_hook_thread=${nt_hook_thread%%\'"\'*}',
+          '    ;;',
+          'esac'
+        ]
+      : []),
+    ...(identityRoot
+      ? [codexThreadIdentityResolverSh(identityRoot, { hookPayloadThread: codexPayloadFirst })]
+      : []),
     '# GATE FIRST, and drain stdin before bailing (issues #186/#187). Order is load-bearing twice:',
     '#  - The codex thread-identity prelude above may DERIVE the node id (and endpoint) from its',
     '#    thread id, so the gate cannot move above it — but nothing below needs to run for a',
@@ -184,9 +386,25 @@ export function buildManagedScript(
     NODE_TOKEN_READ_SH,
     'nt_read_node_token',
     HOOK_CURL_HEADERS_SH,
-    'payload=$(cat)',
+    // Report the effective Claude process env, including env from --settings. Always send
+    // an empty value too: removing an override must invalidate a prior observation.
+    ...(agentId === 'claude'
+      ? [
+          'nt_context_window="$CLAUDE_CODE_MAX_CONTEXT_TOKENS"',
+          'case "$nt_context_window" in *[!0-9]*) nt_context_window="" ;; esac',
+          '[ "${#nt_context_window}" -le 16 ] || nt_context_window=""'
+        ]
+      : ['nt_context_window=""']),
+    codexPayloadFirst ? 'payload=$nt_pre_payload' : 'payload=$(cat)',
     'if [ -z "$payload" ]; then',
-    '  exit 0',
+    ...(antigravity
+      ? [
+          // agy can fire a hook with NO stdin. The answer is already out; still report the event —
+          // a Stop with no body is still the end of the turn (the normalizer reads a missing
+          // fullyIdle as finished), and dropping it would leave the badge on RUNNING.
+          "  payload='{}'"
+        ]
+      : ['  exit 0']),
     'fi',
     '# Keep the payload OFF curl\'s argv. `--data-urlencode "payload=$payload"` puts the full hook',
     '# body (Edit/Write tool_input, the submitted prompt, the last assistant message) into',
@@ -196,7 +414,10 @@ export function buildManagedScript(
     '# event is dropped SILENTLY (a lost Stop leaves the node stuck RUNNING). A 0600 temp file read',
     '# back with `payload@file` fixes both; it is deleted by whichever POST last reads it (below).',
     'nt_payload_file="$HOME/.nodeterm/pending/payload-$$.tmp"',
-    '(umask 077; mkdir -p "$HOME/.nodeterm/pending") 2>/dev/null || :',
+    '# `mkdir -p` on a directory that exists changes nothing — not even its mode — so the test is',
+    '# the same outcome without the subshell and the mkdir: two processes on every event after the',
+    '# first one this host ever ran.',
+    '[ -d "$HOME/.nodeterm/pending" ] || (umask 077; mkdir -p "$HOME/.nodeterm/pending") 2>/dev/null || :',
     '(umask 077; printf %s "$payload" > "$nt_payload_file") 2>/dev/null || :',
     '# ...but hand curl a path IT can open. Under Git Bash / MSYS this script runs in a POSIX shell',
     '# while `curl` is a NATIVE Windows binary (System32, or the one shipped with git), so `$HOME`',
@@ -213,15 +434,18 @@ export function buildManagedScript(
     '# environment itself rather than inherited, so it still holds when a caller replaces the env',
     '# (which is exactly what the hook tests in this repo do). CYGWIN* is deliberately outside the',
     '# gate: Cygwin ships its own curl, and that one takes POSIX paths.',
+    ...(agentId === 'claude' ? ['nt_msys=""'] : []),
     'nt_payload_arg="$nt_payload_file"',
     'case "$(uname -s 2>/dev/null)" in',
     '  MINGW*|MSYS*)',
+    ...(agentId === 'claude' ? ['    nt_msys=1'] : []),
     '    if command -v cygpath >/dev/null 2>&1; then',
     '      nt_payload_arg=$(cygpath -w "$nt_payload_file" 2>/dev/null) || nt_payload_arg="$nt_payload_file"',
     '      [ -n "$nt_payload_arg" ] || nt_payload_arg="$nt_payload_file"',
     '    fi',
     '    ;;',
     'esac',
+    ...(agentId === 'claude' ? CLAUDE_ORIGIN_SH : []),
     '# Deterministic-approval request: only for a PermissionRequest hook while the wait is armed.',
     '# `nt_pending` stays empty otherwise, so the POST tag and the poll loop below are both inert.',
     'nt_pending=""',
@@ -240,7 +464,9 @@ export function buildManagedScript(
     // not depend on the env at all.
     ...(agentId === 'claude'
       ? [
-          'if [ -n "$NODETERM_PERM_WAIT_SECS" ] && [ "$NODETERM_PERM_WAIT_SECS" -gt 0 ] 2>/dev/null; then',
+          '# Never arm for a claude that is not the foreground of a terminal (claude-pane-origin.ts):',
+          '# its events are not delivered as this node\'s, so nobody could ever answer the hold.',
+          'if [ "$nt_claude_fg" != 0 ] && [ -n "$NODETERM_PERM_WAIT_SECS" ] && [ "$NODETERM_PERM_WAIT_SECS" -gt 0 ] 2>/dev/null; then',
           '  case "$payload" in',
           '    *\'"hook_event_name":"PermissionRequest"\'*|*\'"hook_event_name": "PermissionRequest"\'*)',
           '      nt_node=$(printf %s "$NODETERM_NODE_ID" | tr -c \'A-Za-z0-9_-\' \'_\')',
@@ -251,6 +477,7 @@ export function buildManagedScript(
           '      (umask 077; mkdir -p "$nt_dir") 2>/dev/null || :',
           '      nt_pending_file="$nt_dir/$nt_pending.json"',
           '      (umask 077; printf %s "$payload" > "$nt_pending_file") 2>/dev/null || :',
+          ...HELD_TOOL_SH,
           '      ;;',
           '  esac',
           'fi'
@@ -272,26 +499,33 @@ export function buildManagedScript(
     '  if [ -n "$NODETERM_HOOK_SOCK" ]; then',
     // The pipeline\'s exit status IS curl\'s (POSIX: the status of a pipeline is its last command),
     // which is what nt_send_request below reads to decide whether to fail over.
-    '    nt_hook_headers |',
-    `    curl -sS -X POST --unix-socket "$NODETERM_HOOK_SOCK" "http://localhost/hook/${agentId}" \\`,
+    '    nt_code=$(nt_hook_headers |',
+    `    curl -sS -o /dev/null -w '%{http_code}' -X POST --unix-socket "$NODETERM_HOOK_SOCK" "http://localhost/hook/${agentId}" \\`,
     '      --connect-timeout 0.5 --max-time 1.5 --config - \\',
     '      -H "Content-Type: application/x-www-form-urlencoded" \\',
     '      --data-urlencode "nodeId=${NODETERM_NODE_ID}" \\',
     '      --data-urlencode "version=${NODETERM_HOOK_VERSION}" \\',
+    '      --data-urlencode "nodeterm_context_window=${nt_context_window}" \\',
     '      --data-urlencode "nodeterm_pending_id=${nt_pending}" \\',
-    '      --data-urlencode "payload@${nt_payload_arg}" >/dev/null 2>&1',
+    ...eventField,
+    ...originFields,
+    '      --data-urlencode "payload@${nt_payload_arg}" 2>/dev/null) || return 1',
     '  elif [ -n "$NODETERM_HOOK_PORT" ]; then',
-    '    nt_hook_headers |',
-    `    curl -sS -X POST "http://127.0.0.1:\${NODETERM_HOOK_PORT}/hook/${agentId}" \\`,
+    '    nt_code=$(nt_hook_headers |',
+    `    curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:\${NODETERM_HOOK_PORT}/hook/${agentId}" \\`,
     '      --connect-timeout 0.5 --max-time 1.5 --config - \\',
     '      -H "Content-Type: application/x-www-form-urlencoded" \\',
     '      --data-urlencode "nodeId=${NODETERM_NODE_ID}" \\',
     '      --data-urlencode "version=${NODETERM_HOOK_VERSION}" \\',
+    '      --data-urlencode "nodeterm_context_window=${nt_context_window}" \\',
     '      --data-urlencode "nodeterm_pending_id=${nt_pending}" \\',
-    '      --data-urlencode "payload@${nt_payload_arg}" >/dev/null 2>&1',
+    ...eventField,
+    ...originFields,
+    '      --data-urlencode "payload@${nt_payload_arg}" 2>/dev/null) || return 1',
     '  else',
     '    return 1',
     '  fi',
+    '  [ "$nt_code" != "421" ]',
     '}',
     '# Request POST with a BOUNDED fallback walk. On a failed primary POST, try the OTHER endpoint',
     '# files in most-likely-alive order (nt_candidates) — at most $nt_fallback_max of them — and stop',
@@ -355,57 +589,74 @@ export function buildManagedScript(
     '# Hold the hook open for a phone/canvas answer file, polling every 0.5s up to the armed seconds.',
     'if [ -n "$nt_pending" ]; then',
     '  nt_answer="$HOME/.nodeterm/pending/$nt_pending.answer"',
-    '  nt_max=$((NODETERM_PERM_WAIT_SECS * 2))',
+    '  nt_max=$((nt_wait * 2))',
     '  nt_i=0',
     '  while [ "$nt_i" -lt "$nt_max" ]; do',
     '    if [ -f "$nt_answer" ]; then',
-    '      nt_decision=$(cat "$nt_answer" 2>/dev/null)',
-    '      rm -f "$nt_answer" "$nt_pending_file" 2>/dev/null || :',
-    '      # Fire-and-forget "answered" signal so the canvas/phone NEEDS YOU badge flips to working the',
-    '      # instant we read a valid answer, instead of sticking until the agent\'s next hook (which,',
-    '      # for a text-only reply, is not until the turn\'s Stop). Backgrounded (&) + short --max-time so',
-    '      # the decision JSON below is NEVER delayed. Same POST mechanism as above, tagged',
-    '      # nodeterm_answered=<decision>; only for a valid allow/deny (no POST on a bad/timed-out answer).',
-    '      # The payload temp file is still needed here (the foreground nt_send_request above read',
-    '      # it, and this backgrounded "answered" POST reads it again). Whichever backgrounded POST',
-    '      # is launched self-deletes it after curl returns; if none is (no transport, or a decision',
-    '      # that is neither allow nor deny), it is deleted inline just below.',
-    '      nt_payload_owned=0',
-    '      if [ "$nt_decision" = "allow" ] || [ "$nt_decision" = "deny" ]; then',
-    '        if [ -n "$NODETERM_HOOK_SOCK" ]; then',
-    '          { nt_hook_headers |',
-    `          curl -sS -X POST --unix-socket "$NODETERM_HOOK_SOCK" "http://localhost/hook/${agentId}" \\`,
-    '            --connect-timeout 0.5 --max-time 1 --config - \\',
-    '            -H "Content-Type: application/x-www-form-urlencoded" \\',
-    '            --data-urlencode "nodeId=${NODETERM_NODE_ID}" \\',
-    '            --data-urlencode "version=${NODETERM_HOOK_VERSION}" \\',
-    '            --data-urlencode "nodeterm_pending_id=${nt_pending}" \\',
-    '            --data-urlencode "nodeterm_answered=${nt_decision}" \\',
-    '            --data-urlencode "payload@${nt_payload_arg}" >/dev/null 2>&1; rm -f "$nt_payload_file" 2>/dev/null || :; } &',
-    '          nt_payload_owned=1',
-    '        elif [ -n "$NODETERM_HOOK_PORT" ]; then',
-    '          { nt_hook_headers |',
-    `          curl -sS -X POST "http://127.0.0.1:\${NODETERM_HOOK_PORT}/hook/${agentId}" \\`,
-    '            --connect-timeout 0.5 --max-time 1 --config - \\',
-    '            -H "Content-Type: application/x-www-form-urlencoded" \\',
-    '            --data-urlencode "nodeId=${NODETERM_NODE_ID}" \\',
-    '            --data-urlencode "version=${NODETERM_HOOK_VERSION}" \\',
-    '            --data-urlencode "nodeterm_pending_id=${nt_pending}" \\',
-    '            --data-urlencode "nodeterm_answered=${nt_decision}" \\',
-    '            --data-urlencode "payload@${nt_payload_arg}" >/dev/null 2>&1; rm -f "$nt_payload_file" 2>/dev/null || :; } &',
-    '          nt_payload_owned=1',
+    // Take the file's BYTE size, then read at most one byte past the cap: a hostile multi-megabyte
+    // file is never slurped into the shell, and the size check below rejects anything over it.
+    '      nt_size=$(wc -c < "$nt_answer" 2>/dev/null)',
+    `      nt_decision=$(head -c ${PERMISSION_DECISION_MAX_BYTES + 1} "$nt_answer" 2>/dev/null)`,
+    ...ANSWER_DECODE_SH,
+    '      if [ "$nt_verb" = hold ]; then',
+    '        # A plain allow on a question: consume it and KEEP HOLDING (see ANSWER_DECODE_SH).',
+    '        rm -f "$nt_answer" 2>/dev/null || :',
+    '      else',
+    '        rm -f "$nt_answer" "$nt_pending_file" 2>/dev/null || :',
+    '        # Fire-and-forget "answered" signal so the canvas/phone NEEDS YOU badge flips to working the',
+    '        # instant we read a valid answer, instead of sticking until the agent\'s next hook (which,',
+    '        # for a text-only reply, is not until the turn\'s Stop). Backgrounded (&) + short --max-time so',
+    '        # the decision JSON below is NEVER delayed. Same POST mechanism as above, tagged',
+    '        # nodeterm_answered=<verb> — the VERB decoded above, never the answer file itself: a JSON',
+    '        # answer carries the user\'s typed text, and nothing from that file may reach an argv.',
+    '        # Only for a valid allow/deny (no POST on a bad/timed-out answer).',
+    '        # The payload temp file is still needed here (the foreground nt_send_request above read',
+    '        # it, and this backgrounded "answered" POST reads it again). Whichever backgrounded POST',
+    '        # is launched self-deletes it after curl returns; if none is (no transport, or a decision',
+    '        # that is neither allow nor deny), it is deleted inline just below.',
+    '        nt_payload_owned=0',
+    '        if [ "$nt_verb" = "allow" ] || [ "$nt_verb" = "deny" ]; then',
+    '          if [ -n "$NODETERM_HOOK_SOCK" ]; then',
+    '            { nt_hook_headers |',
+    `            curl -sS -X POST --unix-socket "$NODETERM_HOOK_SOCK" "http://localhost/hook/${agentId}" \\`,
+    '              --connect-timeout 0.5 --max-time 1 --config - \\',
+    '              -H "Content-Type: application/x-www-form-urlencoded" \\',
+    '              --data-urlencode "nodeId=${NODETERM_NODE_ID}" \\',
+    '              --data-urlencode "version=${NODETERM_HOOK_VERSION}" \\',
+    '              --data-urlencode "nodeterm_context_window=${nt_context_window}" \\',
+    '              --data-urlencode "nodeterm_pending_id=${nt_pending}" \\',
+    '              --data-urlencode "nodeterm_answered=${nt_verb}" \\',
+    '              --data-urlencode "nodeterm_claude_pid=${nt_claude_pid}" \\',
+    '              --data-urlencode "nodeterm_claude_fg=${nt_claude_fg}" \\',
+    '              --data-urlencode "nodeterm_claude_tty=${nt_claude_tty}" \\',
+    '              --data-urlencode "payload@${nt_payload_arg}" >/dev/null 2>&1; rm -f "$nt_payload_file" 2>/dev/null || :; } &',
+    '            nt_payload_owned=1',
+    '          elif [ -n "$NODETERM_HOOK_PORT" ]; then',
+    '            { nt_hook_headers |',
+    `            curl -sS -X POST "http://127.0.0.1:\${NODETERM_HOOK_PORT}/hook/${agentId}" \\`,
+    '              --connect-timeout 0.5 --max-time 1 --config - \\',
+    '              -H "Content-Type: application/x-www-form-urlencoded" \\',
+    '              --data-urlencode "nodeId=${NODETERM_NODE_ID}" \\',
+    '              --data-urlencode "version=${NODETERM_HOOK_VERSION}" \\',
+    '              --data-urlencode "nodeterm_context_window=${nt_context_window}" \\',
+    '              --data-urlencode "nodeterm_pending_id=${nt_pending}" \\',
+    '              --data-urlencode "nodeterm_answered=${nt_verb}" \\',
+    '              --data-urlencode "nodeterm_claude_pid=${nt_claude_pid}" \\',
+    '              --data-urlencode "nodeterm_claude_fg=${nt_claude_fg}" \\',
+    '              --data-urlencode "nodeterm_claude_tty=${nt_claude_tty}" \\',
+    '              --data-urlencode "payload@${nt_payload_arg}" >/dev/null 2>&1; rm -f "$nt_payload_file" 2>/dev/null || :; } &',
+    '            nt_payload_owned=1',
+    '          fi',
     '        fi',
+    '        if [ "$nt_payload_owned" != 1 ]; then rm -f "$nt_payload_file" 2>/dev/null || :; fi',
+    '        # printf is a shell builtin (dash, bash, busybox): the decision never becomes an argv.',
+    '        if [ -n "$nt_out" ]; then printf \'%s\\n\' "$nt_out"; fi',
+    '        exit 0',
     '      fi',
-    '      if [ "$nt_payload_owned" != 1 ]; then rm -f "$nt_payload_file" 2>/dev/null || :; fi',
-    '      if [ "$nt_decision" = "allow" ]; then',
-    '        printf \'%s\\n\' \'{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}\'',
-    '      elif [ "$nt_decision" = "deny" ]; then',
-    '        printf \'%s\\n\' \'{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Denied from nodeterm."}}}\'',
-    '      fi',
-    '      exit 0',
     '    fi',
-    '    sleep 0.5 2>/dev/null || sleep 1',
-    '    nt_i=$((nt_i + 1))',
+    // nt_max counts HALF-seconds. Where fractional sleep is unsupported the fallback sleeps a full
+    // second, so it must count 2 — else the 540 s hold would run ~1080 s, past the hook timeout.
+    '    if sleep 0.5 2>/dev/null; then nt_i=$((nt_i + 1)); else sleep 1; nt_i=$((nt_i + 2)); fi',
     '  done',
     '  # Timed out: clean up the request + payload files and print nothing → Claude shows its normal prompt.',
     '  rm -f "$nt_pending_file" "$nt_payload_file" 2>/dev/null || :',

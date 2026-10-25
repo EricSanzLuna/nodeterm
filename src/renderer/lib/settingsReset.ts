@@ -15,6 +15,7 @@ export const TERMINAL_RESET_KEYS = [
   'fontFamily',
   'fontSize',
   'terminalWordSeparator',
+  'copyOnSelect',
   'fontWeight',
   'fontWeightBold',
   'drawBoldTextInBrightColors',
@@ -35,11 +36,20 @@ export const TERMINAL_RESET_KEYS = [
 export const APPEARANCE_RESET_KEYS = [
   'appTheme',
   'uiScale',
+  'tabBarHeight',
+  'markdownFontFamily',
+  'markdownFontSize',
   'accent',
+  'desktopWallpaper',
   'hiddenNodeMenuItems',
   'hiddenHeaderButtons',
   'showResumeCard',
-  'windowTitleActiveSession'
+  'canvasDots',
+  'glassTint',
+  'glassBlurWhileMoving',
+  'windowTitleActiveSession',
+  'stickyNoteBacking',
+  'groupFrameBacking'
 ] as const satisfies readonly (keyof Settings)[]
 
 /** The defaults for `keys`, as a patch for `useSettings.update`. */

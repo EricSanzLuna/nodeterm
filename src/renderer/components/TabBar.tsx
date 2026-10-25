@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type DragEvent } from 'react'
 import { createPortal } from 'react-dom'
 import { useProjects } from '../state/projects'
-import { isOmniKanbanEnabled, useViewMode, viewFor } from '../state/viewMode'
+import { isOmniKanbanEnabled, toggleBoardView, useViewMode, viewFor } from '../state/viewMode'
 import { useAgentStatus } from '../state/agentStatus'
+import { usePauseCounts } from '../state/pauseCounts'
 import { useSettings } from '../state/settings'
 import { accountsForProject, sshAccountsHint, systemAccountDisplay } from '../state/workspace'
 import { useSshConn } from '../state/sshConn'
@@ -12,14 +13,24 @@ import { sessionCount, sessionForProject, useProjectSession } from '../session/s
 import { tabClickAction } from '../session/relay-tab'
 import { useMenuFlip } from '../ui/useMenuFlip'
 import { commandTooltip } from '../lib/keybindingOverrides'
-import { IconCanvasView, IconKanban } from './icons'
+import { IconCanvasView, IconKanban, IconMoreVertical, IconPlus, IconUpdate } from './icons'
+import { runPendingUpdate, usePendingUpdate } from '../state/pendingUpdate'
 import { ProjectGlyph } from './ProjectGlyph'
+import { useTooltip } from './Tooltip'
+import { projectTabTooltip } from '../lib/projectTabTooltip'
+import { useDragAutoScroll } from '../lib/dragAutoScroll'
 import {
   ALL_PERMISSION_MODES,
   PERMISSION_MODE_LABELS,
   type AgentPermissionMode
 } from '@shared/agents/config'
 import { bypassSandboxCaveat, permissionModeAgentsLabel } from '@shared/agents/approval-mode'
+import { codexApprovalCaps } from '@renderer/state/codexCli'
+import { PROJECT_NAME_MAX, clampProjectName } from '@shared/project-name'
+import { CONFIRM_WAIVABLE_VERBS, WAIVABLE_VERB_ACTIONS, otherWaiverHint } from '@shared/control-confirm'
+import { projectWaiverRow, setControlConfirmWaivedForProject } from '../state/controlConfirmGate'
+import { useControlConfirm } from '../state/controlConfirm'
+import { isBrowserRuntime } from '../bridge/runtime'
 
 interface TabBarProps {
   onSwitch: (id: string) => void
@@ -33,6 +44,8 @@ interface TabBarProps {
   onOpenWelcome: () => void
   onRename: (id: string, name: string) => void
   onSetFolder: (id: string) => void
+  /** Issue #1145: move a local folder project's canvas into app data, or back into its folder. */
+  onMoveStorage?: (id: string, to: 'appData' | 'folder') => void
   /** Close (hide) the project without destroying it, reopenable from the start screen. */
   onCloseProject: (id: string) => void
   /** Open the Remote access dialog (host/share + connect). Shown for every project. */
@@ -44,6 +57,18 @@ interface TabBarProps {
   /** Deep-link to this project's own pane in Settings — everything this menu can change plus the
    *  shared/machine-local settings families, which have no other entry point. */
   onOpenProjectSettings: (id: string) => void
+  /** Open "Share with team" for an SSH project. Absent = the row is not offered. */
+  onShareWithTeam?: (projectId: string) => void
+  /** Why the share cannot start for this project right now (the row is then disabled with it as
+   *  its tooltip), or null when it can. */
+  shareBlockedReason?: (projectId: string) => string | null
+  /** Pause every agent session in the project (Canvas `pauseNodes`: one confirm, busy ones after
+   *  their current turn). */
+  onPauseProject: (id: string) => void
+  /** Drop the project's "pause after the current turn" marks. */
+  onCancelPendingPauses: (id: string) => void
+  /** Resume every PAUSED session of the ACTIVE project (offered only there). */
+  onResumeAllProject: (id: string) => void
 }
 
 /**
@@ -75,11 +100,17 @@ export function TabBar({
   onOpenWelcome,
   onRename,
   onSetFolder,
+  onMoveStorage,
   onCloseProject,
   onRemoteAccess,
   onSetDefaultAccount,
   onSetDefaultPermissionMode,
-  onOpenProjectSettings
+  onOpenProjectSettings,
+  onShareWithTeam,
+  shareBlockedReason,
+  onPauseProject,
+  onCancelPendingPauses,
+  onResumeAllProject
 }: TabBarProps) {
   // Select the raw array and filter in a memo, a `.filter()` inside the selector returns a
   // fresh array every store snapshot, which re-rendered the TabBar on EVERY projects change.
@@ -101,6 +132,10 @@ export function TabBar({
     return ids
   })
   const unreadSet = useMemo(() => new Set(unreadIds.split('|').filter(Boolean)), [unreadIds])
+  // ⏸ badge + the "Cancel pending pauses" row. Computed HERE, not in Canvas: this component
+  // already holds the projects array, and Canvas subscribing to it would re-render the whole canvas
+  // on every node serialization.
+  const pauseCounts = usePauseCounts(projects)
   const [menuId, setMenuId] = useState<string | null>(null)
   // `flipBase` is the ANCHOR's top edge: when the menu would overflow the bottom of the window,
   // it opens upward from the caret button instead (see useMenuFlip below).
@@ -108,7 +143,14 @@ export function TabBar({
     null
   )
   const [editingId, setEditingId] = useState<string | null>(null)
+  // One tooltip for the whole strip: a resting pointer shows the hovered tab's location
+  // (projectTabTooltip). The label is set as the pointer enters a tab, before the dwell runs out.
+  const [tabTipLabel, setTabTipLabel] = useState('')
+  const tabTip = useTooltip(tabTipLabel, { delay: 500 })
   const [draft, setDraft] = useState('')
+  // The stored name the editor opened on. Committing the cut draft of an over-long one
+  // (issue #940) stores that cut: the user asked to rename and sees what will be stored.
+  const [draftStart, setDraftStart] = useState('')
   // Tab drag-reorder: the project id being dragged + the current drop target ('' = end zone).
   const [dragId, setDragId] = useState<string | null>(null)
   const [dropId, setDropId] = useState<string | null>(null)
@@ -116,6 +158,13 @@ export function TabBar({
   const [acctOpen, setAcctOpen] = useState(false)
   // Whether the caret menu's "Default permission mode" group is expanded (same idiom as acctOpen).
   const [modeOpen, setModeOpen] = useState(false)
+  const [agentActsOpen, setAgentActsOpen] = useState(false)
+  // Per-project agent confirm rows read the live gate (`projectWaiverRow`) at render. These
+  // subscriptions are what re-render the menu when any input of that decision changes: the
+  // persisted waivers, the app-run ones, and the global permission mode (`globalMode` below; a
+  // project's own mode arrives with the projects store).
+  useSettings((s) => s.settings.controlConfirmWaivers)
+  useControlConfirm((s) => s.sessionWaived)
   const claudeAccounts = useSettings((s) => s.settings.claudeAccounts)
   // The mode a project without an override falls back to, shown in the "Use global (…)" entry.
   const globalMode = useSettings((s) => s.settings.claudePermissionMode)
@@ -158,12 +207,18 @@ export function TabBar({
     setMenuPos(null)
     setAcctOpen(false)
     setModeOpen(false)
+    setAgentActsOpen(false)
   }
 
   const openMenu = (id: string, anchor: HTMLElement) => {
     const r = anchor.getBoundingClientRect()
+    // Under Liquid Glass the bar is a visible glass slab and the caret sits inside it, so the menu
+    // hangs from the BAR's bottom edge rather than 3px inside it (visual QA N11). Still a plain
+    // position, so useMenuFlip keeps flipping/clamping a tall menu.
+    const glass = document.documentElement.dataset.ntGlass === 'on'
+    const bottom = glass ? Math.max(r.bottom, anchor.closest('.tabbar')?.getBoundingClientRect().bottom ?? 0) : r.bottom
     setMenuId(id)
-    setMenuPos({ top: r.bottom + 4, left: r.left, flipBase: r.top - 4 })
+    setMenuPos({ top: bottom + 4, left: r.left, flipBase: r.top - 4 })
   }
 
   // Viewport-edge flip for the caret menu, same behavior as the right-click ContextMenu. The
@@ -174,14 +229,16 @@ export function TabBar({
 
   const startRename = (id: string, current: string) => {
     setEditingId(id)
-    setDraft(current)
+    // Start from what a rename would store, so an over-long name (issue #940) is shown cut.
+    setDraft(clampProjectName(current))
+    setDraftStart(current)
     closeMenu()
   }
 
   const commitRename = () => {
     if (editingId) {
       const name = draft.trim()
-      if (name) onRename(editingId, name)
+      if (name && name !== draftStart) onRename(editingId, name)
     }
     setEditingId(null)
   }
@@ -206,11 +263,33 @@ export function TabBar({
   // The strip scrolls without a visible scrollbar (see .tabbar__tabs), so keep it navigable:
   // a plain mouse wheel scrolls it horizontally, and the active tab is brought into view.
   const tabsRef = useRef<HTMLDivElement>(null)
+  // While a tab is dragged the strip scrolls itself near (or past) its left/right edge, so a tab
+  // can travel from the far end to the front in one drag.
+  useDragAutoScroll(tabsRef, 'x', dragId !== null)
+  const pendingUpdate = usePendingUpdate((s) => s.pending)
   useEffect(() => {
     tabsRef.current
       ?.querySelector('.tab.active')
       ?.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' })
   }, [activeId, projects.length])
+
+
+  // The backdrop deliberately sits BELOW the bar, so a click on another tab switches to it in one
+  // go instead of being swallowed as a dismiss — which leaves the bar itself (its empty stretch,
+  // the brand, the +) unable to close the menu. This covers exactly that gap, and it closes
+  // WITHOUT consuming the event, so the click still lands wherever it was aimed.
+  useEffect(() => {
+    if (!menuId) return
+    const onDown = (e: PointerEvent): void => {
+      const el = e.target as HTMLElement | null
+      // The caret owns its own toggle; closing here first would let its click re-open the menu.
+      if (el?.closest('.tab-menu, .tab__caret')) return
+      closeMenu()
+    }
+    document.addEventListener('pointerdown', onDown, true)
+    return () => document.removeEventListener('pointerdown', onDown, true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [menuId])
 
   return (
     <>
@@ -225,8 +304,26 @@ export function TabBar({
       )}
 
       <div className="tabbar">
+        {pendingUpdate && (
+          // Figma-style: first thing after the traffic lights, accent-filled, no ✕. It stays until
+          // the update is installed, the card's dismiss never reaches it.
+          <button
+            className="tabbar__update"
+            title={
+              pendingUpdate.kind === 'downloaded'
+                ? `nodeterm v${pendingUpdate.version} is ready, restart to update`
+                : pendingUpdate.kind === 'manual'
+                  ? `nodeterm v${pendingUpdate.version} is available, download it to update`
+                  : 'This version is no longer supported, update to continue'
+            }
+            onClick={() => runPendingUpdate(pendingUpdate)}
+          >
+            <IconUpdate />
+            Update
+          </button>
+        )}
         <div className="brand">
-          <svg className="brand__mark" viewBox="0 0 48 48" width="26" height="26" aria-hidden="true">
+          <svg className="brand__mark" viewBox="0 0 48 48" width="22" height="22" aria-hidden="true">
             <defs>
               <linearGradient id="ntg" x1="0" y1="0" x2="1" y2="1">
                 <stop offset="0" stopColor="#a38dff" />
@@ -273,10 +370,25 @@ export function TabBar({
             return (
               <div
                 key={p.id}
-                className={`tab${active ? ' active' : ''}${swimlaneHighlight ? ' tab--swimlane-highlight' : ''}${p.unavailable ? ' unavailable' : ''}${dropId === p.id ? ' is-drop-before' : ''}`}
-                style={active ? { color: p.color } : undefined}
+                className={`tab${active ? ' active' : ''}${swimlaneHighlight ? ' tab--swimlane-highlight' : ''}${p.unavailable ? ' unavailable' : ''}${dropId === p.id ? ' is-drop-before' : ''}${menuId === p.id ? ' tab--menu-open' : ''}`}
+                // The project colour rides the GLYPH (below), not the label: `.tab.active` is
+                // neutral text on the page's own surface, like a browser tab. The one exception is
+                // the swimlane highlight, whose underline is `currentColor` and is meant to be the
+                // project's colour.
+                style={swimlaneHighlight ? { color: p.color } : undefined}
                 draggable={editingId !== p.id}
+                onMouseEnter={(e) => {
+                  // Not over the rename box or this tab's own open menu, where it would cover them.
+                  if (editingId === p.id || menuId === p.id) return
+                  const label = projectTabTooltip(p, sessionForProject(p.id).source)
+                  if (!label) return
+                  setTabTipLabel(label)
+                  tabTip.triggerProps.onMouseEnter(e)
+                }}
+                onMouseLeave={tabTip.triggerProps.onMouseLeave}
+                onMouseDown={tabTip.triggerProps.onMouseDown}
                 onDragStart={(e) => {
+                  tabTip.triggerProps.onMouseLeave()
                   e.dataTransfer.effectAllowed = 'move'
                   setDragId(p.id)
                 }}
@@ -315,15 +427,6 @@ export function TabBar({
                   if (action === 'switch') onSwitch(p.id)
                   else if (action === 'reconnect') onReconnect(p.id)
                 }}
-                title={
-                  p.unavailable
-                    ? sessionForProject(p.id).source === 'local'
-                      ? `${p.cwd ?? 'project'} is unavailable (folder missing or unreachable)`
-                      : `${p.name} disconnected, click to reconnect`
-                    : p.ssh
-                      ? `${p.ssh.server.user}@${p.ssh.server.host}:${p.ssh.remoteCwd}`
-                      : p.cwd || undefined
-                }
               >
                 <ProjectGlyph
                   icon={p.icon}
@@ -342,10 +445,17 @@ export function TabBar({
                     SSH
                   </span>
                 )}
+                {/* A relay tab of the host's SSH project: display strings only (relay-ssh.ts). */}
+                {!p.ssh && p.relaySsh && (
+                  <span className="tab__ssh" title={`${p.relaySsh.user}@${p.relaySsh.host}`}>
+                    SSH
+                  </span>
+                )}
                 {editingId === p.id ? (
                   <input
                     className="tab__edit"
                     value={draft}
+                    maxLength={PROJECT_NAME_MAX}
                     autoFocus
                     spellCheck={false}
                     onChange={(e) => setDraft(e.target.value)}
@@ -362,60 +472,72 @@ export function TabBar({
 
                 {multiSession && <TabSessionLabel projectId={p.id} />}
 
+                {pauseCounts[p.id] && (
+                  <span
+                    className="tab__paused"
+                    title={`${pauseCounts[p.id].paused} paused${pauseCounts[p.id].pending ? `, ${pauseCounts[p.id].pending} pausing after their current turn` : ''}`}
+                  >
+                    ⏸ {pauseCounts[p.id].paused}
+                    {pauseCounts[p.id].pending ? ` · ${pauseCounts[p.id].pending} pending` : ''}
+                  </span>
+                )}
+
                 {unreadCount > 0 && (
                   <span className="tab__badge" title={`${unreadCount} unread`}>
                     {unreadCount}
                   </span>
                 )}
 
-                {active && editingId !== p.id && (
-                  // The title was a hardcoded `(⌘⇧B)` — mac glyphs shown to Linux/Windows users
-                  // (a pre-existing bug: it was never even hintLabel-wrapped), and stale after a
-                  // remap. `commandTooltip` fixes both and drops the chord entirely when the
-                  // command is unbound.
-                  <button
-                    className="tab__board-toggle"
-                    title={commandTooltip(
-                      kanbanActive ? 'Canvas view' : 'Kanban view',
-                      'view.kanbanToggle'
+                {editingId !== p.id && (
+                  // The actions are one cluster with its own rhythm, not two more items in the
+                  // tab's label row: they sit a hair apart from each other and further from the
+                  // name than the name's own parts sit from one another.
+                  <span className="tab__actions">
+                    {active && (
+                      // On the ACTIVE tab only: the toggle says which view you are looking at, and
+                      // on an inactive tab it would flip a project's view without taking you
+                      // there. The chord comes from `commandTooltip`, so a remap or an unbound
+                      // command is not advertised as a chord that no longer works.
+                      <button
+                        className="tab__board-toggle"
+                        title={commandTooltip(
+                          kanbanActive ? 'Canvas view' : 'Kanban view',
+                          'view.kanbanToggle'
+                        )}
+                        aria-label={kanbanActive ? 'Canvas view' : 'Kanban view'}
+                        onClick={(e) => {
+                          e.stopPropagation() // a tab click switches projects, this flips the view
+                          // One decision with ⌘⇧B and the menu (state/viewMode.ts): from any board
+                          // to the canvas, from the canvas into the board.
+                          toggleBoardView(p.id)
+                        }}
+                      >
+                        {kanbanActive ? <IconCanvasView /> : <IconKanban />}
+                      </button>
                     )}
-                    onClick={(e) => {
-                      e.stopPropagation() // a tab click switches projects, this only flips the view
-                      const vm = useViewMode.getState()
-                      const settings = useSettings.getState().settings
-                      const omni = isOmniKanbanEnabled(settings)
-                      const asDefault = settings.omniKanbanAsDefault === true
-                      // Closing: global overlay is exclusive — any board toggle while it's open closes it.
-                      if (vm.globalKanban) {
-                        vm.toggleGlobalKanban()
-                        return
-                      }
-                      if (omni && asDefault) {
-                        vm.toggleGlobalKanban()
-                      } else {
-                        vm.toggle(p.id)
-                      }
-                    }}
-                  >
-                    {kanbanActive ? <IconCanvasView /> : <IconKanban />}
-                  </button>
-                )}
-                {active && editingId !== p.id && (
-                  <button
-                    className="tab__caret"
-                    title="Project options"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      if (menuId === p.id) closeMenu()
-                      else openMenu(p.id, e.currentTarget)
-                    }}
-                  >
-                    ⌄
-                  </button>
+                    <button
+                      className="tab__caret"
+                      title="Project options"
+                      aria-label="Project options"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        if (menuId === p.id) closeMenu()
+                        else openMenu(p.id, e.currentTarget)
+                      }}
+                    >
+                      <IconMoreVertical />
+                    </button>
+                  </span>
                 )}
               </div>
             )
           })}
+          {/* The end-of-strip drop zone (`dropId === ''`) had no marker at all — every other target
+              draws its line as the `::before` of the tab it lands in front of, and "after the last
+              one" has no such tab. It lives INSIDE the scroller so it lands after the last tab
+              rather than at the window edge. Rendered only mid-drag, and its negative margins
+              cancel its own width so appearing costs no layout shift. */}
+          {dragId && dropId === '' && <span className="tab__dropline" aria-hidden />}
           </div>
           <button
             type="button"
@@ -424,10 +546,12 @@ export function TabBar({
             aria-label="New project"
             onClick={onOpenWelcome}
           >
-            +
+            <IconPlus />
           </button>
         </div>
       </div>
+
+      {tabTip.bubble}
 
       {menuId &&
         menuPos &&
@@ -448,6 +572,20 @@ export function TabBar({
             >
               Set folder…
             </button>
+            {onMoveStorage &&
+              menuProject.cwd &&
+              !menuProject.ssh &&
+              !menuProject.remote &&
+              !menuProject.unavailable && (
+                <button
+                  onClick={() => {
+                    onMoveStorage(menuProject.id, menuProject.storeInAppData ? 'folder' : 'appData')
+                    closeMenu()
+                  }}
+                >
+                  {menuProject.storeInAppData ? 'Store canvas in folder' : 'Store canvas in app data'}
+                </button>
+              )}
             <button
               onClick={() => {
                 onRemoteAccess()
@@ -456,6 +594,24 @@ export function TabBar({
             >
               Remote access…
             </button>
+            {menuProject.ssh &&
+              !menuProject.remote &&
+              onShareWithTeam &&
+              (() => {
+                const blocked = shareBlockedReason?.(menuProject.id) ?? null
+                return (
+                  <button
+                    disabled={!!blocked}
+                    title={blocked ?? undefined}
+                    onClick={() => {
+                      onShareWithTeam(menuProject.id)
+                      closeMenu()
+                    }}
+                  >
+                    Share with team…
+                  </button>
+                )
+              })()}
             {menuAccounts.length > 0 && (
               <>
                 <button
@@ -544,7 +700,7 @@ export function TabBar({
                           // for codex the mode skips APPROVALS only: `--ask-for-approval never` does
                           // not touch `--sandbox`, which we deliberately leave alone, so "no
                           // permission checks" must not be read as "no sandbox either".
-                          `Skips every permission prompt. This override is saved in the project file (.nodeterm/project.json), so if you commit it, everyone who clones the repo runs their ${permissionModeAgentsLabel({ mode: 'bypassPermissions' })} sessions without permission checks too. ${bypassSandboxCaveat()}`.trim()
+                          `Skips every permission prompt. This override is saved in the project file (.nodeterm/project.json), so if you commit it, everyone who clones the repo runs their ${permissionModeAgentsLabel({ mode: 'bypassPermissions', caps: codexApprovalCaps() })} sessions without permission checks too. ${bypassSandboxCaveat(codexApprovalCaps())}`.trim()
                         : m === 'auto'
                           ? (menuAutoHint ?? undefined)
                           : undefined
@@ -564,6 +720,59 @@ export function TabBar({
                 ))}
               </div>
             )}
+            {
+              // Agent canvas-control confirms, per project: the SAME machine-local waiver the
+              // dialog's "Don't ask again for agents in …" grants (settings.json, never the
+              // git-shared project.json), reachable before any dialog has appeared. ✓ means agents
+              // in this project do it WITHOUT asking — the EFFECTIVE answer, read through the gate's
+              // own table (`projectWaiverRow`), so an app-run, machine-wide or Bypass waiver shows
+              // here too instead of the row promising a dialog that will not come.
+              // Desktop only: in the browser Server Edition canvas control is headless and gated by
+              // creator ownership, not by these waivers (@shared/control-confirm), so the rows would
+              // change nothing. A relay tab is another machine's project and its confirms are that
+              // machine's to waive.
+              !menuProject.remote &&
+                !isBrowserRuntime() && (
+                  <>
+                    <button
+                      className={`tab-menu__group${agentActsOpen ? ' open' : ''}`}
+                      onClick={() => setAgentActsOpen((v) => !v)}
+                    >
+                      Agents may, without asking
+                      <span className="tab-menu__caret">▸</span>
+                    </button>
+                    {agentActsOpen && (
+                      <div className="tab-menu__sub">
+                        {[...CONFIRM_WAIVABLE_VERBS].map((verb) => {
+                          const row = projectWaiverRow(verb, menuProject.id)
+                          // Another waiver still applies without this project's grant, so the row
+                          // cannot make agents ask again — name it and where it is revoked.
+                          const elsewhere = row.otherVia !== null
+                          return (
+                            <button
+                              key={verb}
+                              disabled={elsewhere && !row.granted}
+                              title={
+                                elsewhere
+                                  ? otherWaiverHint(row.otherVia!)
+                                  : row.granted
+                                    ? `Agents in "${menuProject.name}" do this without a confirm dialog (this computer only). Click to ask again.`
+                                    : `Agents in "${menuProject.name}" ask you first. Click to let them do this without asking (this computer only).`
+                              }
+                              onClick={() => {
+                                setControlConfirmWaivedForProject(verb, menuProject.id, !row.granted)
+                              }}
+                            >
+                              <span className="tab-menu__check">{row.skips ? '✓' : ''}</span>
+                              {WAIVABLE_VERB_ACTIONS[verb] ?? verb}
+                            </button>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </>
+                )
+            }
             <button
               onClick={() => {
                 onOpenProjectSettings(menuProject.id)
@@ -572,6 +781,56 @@ export function TabBar({
             >
               Project settings…
             </button>
+            {/* The id a `nodeterm://open?project=<id>` link names (another app's config maps its
+                repositories to these ids). A relay tab's id belongs to the host, which a link here
+                cannot open. */}
+            {!menuProject.remote && (
+              <button
+                onClick={() => {
+                  window.nodeTerminal.clipboard.writeText(menuProject.id)
+                  closeMenu()
+                }}
+              >
+                Copy project id
+              </button>
+            )}
+            <button
+              onClick={() => {
+                onPauseProject(menuProject.id)
+                closeMenu()
+              }}
+            >
+              Pause project
+            </button>
+            {(pauseCounts[menuProject.id]?.pending ?? 0) > 0 && (
+              <button
+                onClick={() => {
+                  onCancelPendingPauses(menuProject.id)
+                  closeMenu()
+                }}
+              >
+                Cancel pending pauses
+              </button>
+            )}
+            {/* Chromium shows no `title` for a DISABLED button (it receives no pointer events), so
+                the reason sits on a wrapper the pointer can reach; the disabled button lets the
+                pointer through to it (`.tab-menu__reason > button:disabled`). */}
+            <span
+              className="tab-menu__reason"
+              title={menuProject.id !== activeId ? 'Open the project to resume' : undefined}
+            >
+              <button
+                // Resume needs each node's mounted terminal (it re-launches the CLI into the pane
+                // and guards the typing), and only the active project's nodes are mounted.
+                disabled={menuProject.id !== activeId}
+                onClick={() => {
+                  onResumeAllProject(menuProject.id)
+                  closeMenu()
+                }}
+              >
+                Resume all
+              </button>
+            </span>
             <button
               onClick={() => {
                 onCloseProject(menuProject.id)

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { IconArrowLeft, IconArrowRight } from '../components/icons'
 import { searchOrUrl } from './browserUrl'
 import { BrowserStartPage } from './BrowserStartPage'
 import { useBrowserHistory } from '../state/browserHistory'
@@ -8,9 +9,11 @@ import { reloadWebview, type ReloadableWebview } from './webviewReload'
 import { describeLoadFailure, isReportableFailure, type WebviewLoadFailure } from './webviewError'
 import { WebviewErrorPlate } from './WebviewErrorPlate'
 import { WebviewLoadingBar } from './WebviewLoadingBar'
+import { WebviewZoomControls } from '../components/WebviewZoomControls'
+import type { ZoomableWebview } from '@shared/webview-zoom'
 
 // Minimal typing for the Electron <webview> element methods/events we use.
-type WebviewEl = HTMLElement & {
+type WebviewEl = HTMLElement & ZoomableWebview & {
   goBack(): void
   goForward(): void
   reload(): void
@@ -24,6 +27,9 @@ type WebviewEl = HTMLElement & {
 }
 
 interface BrowserSurfaceProps {
+  /** What to show while there is no page, instead of the new-tab start page (a run node's browser
+   *  panel says it is waiting for the run's address). */
+  blank?: React.ReactNode
   /** The node id — registers the guest webContents so main can route its new-window requests. */
   nodeId: string
   /** Initial URL (seeded once at mount). */
@@ -63,7 +69,8 @@ export function BrowserSurface({
   partition,
   onUrlChange,
   onTitleChange,
-  onGuestDiscarded
+  onGuestDiscarded,
+  blank
 }: BrowserSurfaceProps) {
   const ref = useRef<WebviewEl | null>(null)
   const rootRef = useRef<HTMLDivElement | null>(null)
@@ -270,10 +277,10 @@ export function BrowserSurface({
     <div className="browser-surface" ref={rootRef}>
       <div className="browser-node__toolbar nodrag">
         <button className="browser-node__btn" disabled={!canBack} onClick={() => ref.current?.goBack()} title="Back">
-          ◀
+          <IconArrowLeft />
         </button>
         <button className="browser-node__btn" disabled={!canFwd} onClick={() => ref.current?.goForward()} title="Forward">
-          ▶
+          <IconArrowRight />
         </button>
         <button
           className="browser-node__btn"
@@ -292,6 +299,7 @@ export function BrowserSurface({
             if (e.key === 'Enter') go()
           }}
         />
+        <WebviewZoomControls target={ref} disabled={discarded || !src} />
       </div>
       <div className="browser-node__view nodrag nowheel">
         {/* The element is UNMOUNTED while discarded — that is what ends the guest process; an
@@ -306,7 +314,8 @@ export function BrowserSurface({
             style={{ width: '100%', height: '100%' }}
           />
         )}
-        {!src && !discarded && (
+        {!src && !discarded && blank}
+        {!src && !discarded && !blank && (
           <BrowserStartPage
             onNavigate={(u) => {
               // A navigation with an initiator: whatever it navigates to is not a restore echo.

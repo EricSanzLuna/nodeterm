@@ -11,7 +11,7 @@ import {
   dictationBinding,
   effectiveBindings
 } from '../../lib/keybindingOverrides'
-import { IOS_APP_STORE_URL } from '../../lib/links'
+import { mobileStoreLinks, mobileStoreNames } from '../../lib/links'
 import { useSettings } from '../../state/settings'
 import { useEntitlement } from '../../state/entitlement'
 import { Switch } from '@renderer/ui/Switch'
@@ -26,8 +26,10 @@ import {
   SceneKeepAwake,
   SceneNotch,
   SceneNotify,
-  ScenePhone
+  ScenePhone,
+  SceneShortcuts
 } from './scenes'
+import type { CommandId } from '@shared/keybindings'
 
 const isMac = /Mac/i.test(navigator.platform || navigator.userAgent)
 
@@ -54,17 +56,20 @@ const STEPS = [
   'notify',
   'keepawake',
   ...(isMac ? (['notch'] as const) : []),
+  'shortcuts',
   'phone'
 ] as const
 type StepId = (typeof STEPS)[number]
 const STEP_COUNT = STEPS.length
 
 /**
- * First-run setup tour: welcome → agents → dictation → kanban → notifications. Each step
- * pairs an animated scene with ONE decision, and every choice writes settings immediately
- * (there is no final "save" — closing mid-way keeps what was chosen so far). Replaces both
- * the auto-opened ShortcutsPanel and the standalone notification-consent dialog on first
- * launch; rerunnable via the ⌘K "Setup tour" command.
+ * First-run setup tour: welcome → agents → dictation → kanban → notifications → keep-awake →
+ * (notch) → shortcuts → phone. Each step pairs an animated scene with ONE decision, and every
+ * choice writes settings immediately (there is no final "save" — closing mid-way keeps what was
+ * chosen so far). Replaces both the auto-opened ShortcutsPanel and the standalone
+ * notification-consent dialog on first launch — which is why it owes the user its own
+ * shortcuts step: before it, a fresh install never heard of ⌘K or ⌘/ at all. Rerunnable via the
+ * ⌘K "Setup tour" command.
  */
 export function OnboardingFlow({ onClose }: { onClose: () => void }) {
   const settings = useSettings((s) => s.settings)
@@ -143,6 +148,25 @@ export function OnboardingFlow({ onClose }: { onClose: () => void }) {
     return () => window.removeEventListener('keydown', onKey, true)
   }, [step])
 
+  // ---- shortcuts try-it: the command palette chord, caught the same way as the kanban one
+  // (capture phase, registry-matched, so a remap is what counts and the real palette never
+  // opens under the tour). ----
+  const [paletteTried, setPaletteTried] = useState(false)
+  const [palettePulse, setPalettePulse] = useState(0)
+  useEffect(() => {
+    if (STEPS[step] !== 'shortcuts') return
+    const onKey = (e: KeyboardEvent) => {
+      if (effectiveBindings('app.commandPalette').some((s) => matchesShortcut(e, s, isMac))) {
+        e.preventDefault()
+        e.stopPropagation()
+        setPaletteTried(true)
+        setPalettePulse((n) => n + 1)
+      }
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [step])
+
   // Esc skips the tour (settings chosen so far are already saved).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -184,6 +208,22 @@ export function OnboardingFlow({ onClose }: { onClose: () => void }) {
   // are live. `''` / `[]` mean the command is unbound — each site below says what it does then.
   const newAgentChip = chipFor('node.newAgent')
   const kanbanKeys = commandKeys('view.kanbanToggle')
+  const paletteKeys = commandKeys('app.commandPalette')
+  const panelKeys = commandKeys('app.shortcutsPanel')
+  // The handful worth learning on day one, each with its EFFECTIVE chord. A command the user
+  // unbound has no key to teach, so its row is dropped rather than shown chordless.
+  const essentials = (
+    [
+      ['app.commandPalette', 'Find any command, node or file'],
+      ['node.newAgent', `New ${agent.label}`],
+      ['node.newTerminal', 'New terminal'],
+      ['canvas.fitAll', 'See the whole canvas'],
+      ['node.maximize', 'Maximize / restore a node'],
+      ['view.kanbanToggle', 'Canvas ⇄ kanban']
+    ] as const satisfies ReadonlyArray<readonly [CommandId, string]>
+  )
+    .map(([id, label]) => ({ id, label, keys: commandKeys(id) }))
+    .filter((r) => r.keys.length > 0)
 
   const stepId: StepId = STEPS[step] ?? 'cover'
   const next = () => setStep((s) => Math.min(s + 1, STEP_COUNT - 1))
@@ -245,6 +285,7 @@ export function OnboardingFlow({ onClose }: { onClose: () => void }) {
               <SceneKeepAwake agentId={agentId} label={agent.label} color={agent.color} />
             )}
             {stepId === 'notch' && <SceneNotch />}
+            {stepId === 'shortcuts' && <SceneShortcuts keys={paletteKeys} query={`new ${agent.label.toLowerCase()}`} pulseKey={palettePulse} />}
             {stepId === 'phone' && <ScenePhone />}
           </div>
           <div className="onb-pane">
@@ -419,7 +460,9 @@ export function OnboardingFlow({ onClose }: { onClose: () => void }) {
                 </p>
                 <p>
                   Closing the lid still sleeps the machine — keep it open and plugged in for
-                  overnight runs.
+                  overnight runs (on a Mac, a closed lid works when plugged in with an external
+                  display). On battery below 5%, or when the machine runs critically hot, it is
+                  allowed to sleep.
                 </p>
                 <div className="onb-toggle-row">
                   <Switch
@@ -460,6 +503,63 @@ export function OnboardingFlow({ onClose }: { onClose: () => void }) {
               </>
             )}
 
+            {stepId === 'shortcuts' && (
+              <>
+                <h2>A few keys worth knowing</h2>
+                <p>
+                  Everything in nodeterm has a keyboard shortcut — and every one of them can be
+                  remapped.
+                </p>
+                <div className="onb-keys">
+                  {essentials.map((r) => (
+                    <div key={r.id} className="onb-keys__row">
+                      <span>{r.label}</span>
+                      <span className="onb-keys__chord">
+                        {r.keys.map((k, i) => (
+                          <kbd key={i} className="kbd">
+                            {k}
+                          </kbd>
+                        ))}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                {/* Same contract as the kanban try-it: no prompt when the palette is unbound. */}
+                {(paletteKeys.length > 0 || paletteTried) && (
+                  <div className={`onb-tryit ${paletteTried ? 'is-done' : ''}`}>
+                    {paletteTried ? (
+                      <>
+                        <OnbCheck /> That's the command palette — the one key to remember.
+                      </>
+                    ) : (
+                      <>
+                        Try it now — press{' '}
+                        {paletteKeys.map((k, i) => (
+                          <kbd key={i} className="kbd">
+                            {k}
+                          </kbd>
+                        ))}
+                      </>
+                    )}
+                  </div>
+                )}
+                <div className="onb-fineprint">
+                  {panelKeys.length > 0 ? (
+                    <>
+                      The full list is one{' '}
+                      {panelKeys.map((k, i) => (
+                        <kbd key={i} className="kbd">
+                          {k}
+                        </kbd>
+                      ))}{' '}
+                      away.{' '}
+                    </>
+                  ) : null}
+                  Remap anything in Settings → Keyboard Shortcuts.
+                </div>
+              </>
+            )}
+
             {stepId === 'phone' && (
               <>
                 <h2>Your sessions, in your pocket</h2>
@@ -469,16 +569,19 @@ export function OnboardingFlow({ onClose }: { onClose: () => void }) {
                   terminal from anywhere.
                 </p>
                 <p>
-                  Grab it from the App Store, then pair in seconds: Settings → Phone (or the
+                  Grab it from {mobileStoreNames()}, then pair in seconds: Settings → Phone (or the
                   phone button top-right) shows a QR — scan it and you're in.
                 </p>
                 <div className="onb-notify-actions">
-                  <button
-                    className="onb-btn onb-btn--primary"
-                    onClick={() => window.nodeTerminal.shell.openExternal(IOS_APP_STORE_URL)}
-                  >
-                    Get the iOS app
-                  </button>
+                  {mobileStoreLinks().map((store) => (
+                    <button
+                      key={store.id}
+                      className="onb-btn onb-btn--primary"
+                      onClick={() => window.nodeTerminal.shell.openExternal(store.url)}
+                    >
+                      {store.label}
+                    </button>
+                  ))}
                 </div>
               </>
             )}

@@ -4,12 +4,13 @@ import os from 'os'
 import path from 'path'
 import { ServerPlatform } from './platform-server'
 import { wireAgentStatus } from './agent-status'
-import { _resetForTest } from '../core/agent-status-mirror'
+import { _resetForTest, _inboxSnapshot } from '../core/agent-status-mirror'
 import { forgetGrokSession, grokSessionDirFor, readGrokSessionName } from '../core/grok-session'
 import {
   registerClaudeAccountsSource,
   resetClaudeAccountsSourceForTests
 } from '../core/claude-config-dir'
+import { normalizeClaude } from '../shared/agents/normalize'
 import { IPC } from '../shared/ipc'
 import { decodePtyData } from '../shared/rpc'
 
@@ -22,7 +23,7 @@ function fakeHooks() {
         agentId: string,
         nodeId: string,
         payload: Record<string, unknown>,
-        meta: { verified: boolean }
+        meta: { verified: boolean; contextWindow?: number | null }
       ) => void)
     | undefined
   return {
@@ -41,8 +42,9 @@ function fakeHooks() {
       agentId: string,
       nodeId: string,
       payload: Record<string, unknown>,
-      verified = false
-    ) => raw?.(agentId, nodeId, payload, { verified })
+      verified = false,
+      contextWindow?: number | null
+    ) => raw?.(agentId, nodeId, payload, { verified, contextWindow })
   }
 }
 
@@ -99,6 +101,23 @@ describe('wireAgentStatus', () => {
     expect(sent).toContainEqual({ t: 'ev', channel: IPC.agentStatus, args: [ev] })
   })
 
+  it('broadcasts the held question instead of unrelated working or done hooks', () => {
+    const fh = fakeHooks()
+    wireAgentStatus(platform, { hooks: fh.hooks as never })
+    const fire = (payload: Record<string, unknown>) => {
+      fh.fireRaw('claude', 'n1', payload)
+      const e = normalizeClaude({ nodeId: 'n1', agentId: 'claude', payload })
+      if (e) fh.fireNormalized(e)
+    }
+    fire({ hook_event_name: 'PreToolUse', session_id: 's', tool_name: 'AskUserQuestion', tool_use_id: 'q' })
+    for (const hook_event_name of ['PreToolUse', 'Stop']) {
+      fire({ hook_event_name, session_id: 's', tool_name: 'Bash' })
+      expect(lastAgentStatus()).toMatchObject({ state: 'waiting', askKind: 'question' })
+    }
+    fire({ hook_event_name: 'PostToolUse', session_id: 's', tool_name: 'AskUserQuestion', tool_use_id: 'q' })
+    expect(lastAgentStatus()).toMatchObject({ state: 'working' })
+  })
+
   it('broadcasts the ENRICHED event: an AskUserQuestion blocked edge loses its pendingId (askKind question)', () => {
     const fh = fakeHooks()
     wireAgentStatus(platform, { hooks: fh.hooks as never })
@@ -115,6 +134,20 @@ describe('wireAgentStatus', () => {
     expect(e.askKind).toBe('question')
     // The pendingId is STRIPPED so the canvas approve/deny gate (blocked && pendingId) never fires.
     expect('pendingId' in e).toBe(false)
+  })
+
+  it('forwards child approval details and ticket without tracking its transcript', () => {
+    const fh = fakeHooks()
+    const context = recTail()
+    wireAgentStatus(platform, { hooks: fh.hooks as never, contextTail: context.tail as never })
+    const payload = { hook_event_name: 'PermissionRequest', agent_id: 'child', session_id: 'parent',
+      transcript_path: '/tmp/child.jsonl', tool_name: 'Bash', tool_input: { command: 'echo child' },
+      nodeterm_pending_id: 'child-ticket' }
+    fh.fireRaw('claude', 'child-node', payload, true)
+    fh.fireNormalized({ ...normalizeClaude({ nodeId: 'child-node', agentId: 'claude', payload }), verified: true })
+    expect(lastAgentStatus()).toMatchObject({ state: 'blocked', pendingId: 'child-ticket', askKind: 'approval' })
+    expect(JSON.stringify(_inboxSnapshot().events)).toContain('echo child')
+    expect(context.calls).toEqual([])
   })
 
   it('broadcasts a genuine approval unchanged (keeps pendingId, askKind approval)', () => {
@@ -445,5 +478,191 @@ describe('wireAgentStatus — the grok raw-listener branch', () => {
       cwd: `/w/${'x'.repeat(400)}`
     })
     expect(grokSessionDirFor('gs-5')).toBeUndefined()
+  })
+})
+
+
+it('passes observed session capacity through the Server Edition transcript jail', () => {
+  const fh = fakeHooks()
+  const ctx = recTail()
+  wireAgentStatus(platform, { hooks: fh.hooks as never, contextTail: ctx.tail as never })
+  const transcriptPath = path.join(os.homedir(), '.claude', 'projects', 'capacity.jsonl')
+  fh.fireRaw('claude', 'capacity-node', { session_id: 'capacity', transcript_path: transcriptPath }, true, 32000)
+  expect(ctx.calls).toContainEqual({ m: 'track', args: ['capacity', transcriptPath, 32000] })
+  fh.fireRaw('claude', 'capacity-node', { session_id: 'capacity', transcript_path: transcriptPath }, true, null)
+  expect(ctx.calls).toContainEqual({ m: 'track', args: ['capacity', transcriptPath, null] })
+  const before = ctx.calls.length
+  fh.fireRaw('claude', 'capacity-node', { session_id: 'capacity', transcript_path: '/outside-jail/secret' }, true, 64000)
+  expect(ctx.calls).toHaveLength(before)
+})
+
+/**
+ * The cursor branch of the raw listener: the store is found by conversation_id under CURSOR_CONFIG_DIR
+ * and the REAL tail pushes its numbers (used/max from root field 5) to the renderer channel; the
+ * payload's transcript_path is never followed. The desktop copy in src/main/index.ts is the same call
+ * (`trackCursorContext`), which the core tests pin.
+ */
+describe('wireAgentStatus: the cursor raw-listener branch', () => {
+  let cfg: string, prev: string | undefined
+  beforeEach(() => {
+    cfg = fs.mkdtempSync(path.join(os.tmpdir(), 'nt-cursor-'))
+    prev = process.env.CURSOR_CONFIG_DIR
+    process.env.CURSOR_CONFIG_DIR = cfg
+  })
+  afterEach(() => {
+    if (prev === undefined) delete process.env.CURSOR_CONFIG_DIR
+    else process.env.CURSOR_CONFIG_DIR = prev
+    fs.rmSync(cfg, { recursive: true, force: true })
+  })
+
+  it('meters a cursor node from its store, and ptyDestroy releases the tail', async () => {
+    const { DatabaseSync } = await import('node:sqlite')
+    const id = '5667590a-e4c7-4f28-9d99-027f84c10837'
+    const d = path.join(cfg, 'chats', 'b', id)
+    fs.mkdirSync(d, { recursive: true })
+    const db = new DatabaseSync(path.join(d, 'store.db'))
+    db.exec('CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB); CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);')
+    // root: field 5 = {1: 40000, 2: 200000}
+    const root = Buffer.from([0x2a, 0x08, 0x08, 0xc0, 0xb8, 0x02, 0x10, 0xc0, 0x9a, 0x0c])
+    db.prepare('INSERT INTO blobs (id, data) VALUES (?, ?)').run('r00t', root)
+    db.prepare("INSERT INTO meta (key, value) VALUES ('0', ?)").run(Buffer.from(JSON.stringify({ latestRootBlobId: 'r00t', name: 'New Agent' })).toString('hex'))
+    db.close()
+
+    const fh = fakeHooks()
+    wireAgentStatus(platform, { hooks: fh.hooks as never })
+    fh.fireRaw('cursor', 'c1', { hook_event_name: 'stop', conversation_id: id, transcript_path: '/etc/passwd' })
+    const deadline = Date.now() + 3000
+    const update = () => sent.find((s) => s.channel === IPC.contextUpdate)
+    while (!update() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25))
+    expect(update()?.args[0]).toMatchObject({ sessionId: id, usedTokens: 40000, windowTokens: 200000, windowSource: 'transcript' })
+    platform.cast(platform.attach({ sendText: () => {}, sendBinary: () => {} }), IPC.ptyDestroy, ['c1'])
+  })
+
+  it("claude.sh firing with Cursor's (child) payload does not re-point the node: destroy releases the parent tail", async () => {
+    // Cursor runs nodeterm's claude.sh too (Claude settings import), with its own envelope and often a
+    // CHILD's chat id. The claude branch used to record that id as the node's session, so ptyDestroy
+    // untracked the child and the parent's 1 Hz store tail leaked.
+    const { DatabaseSync } = await import('node:sqlite')
+    const parent = '5667590a-e4c7-4f28-9d99-027f84c10838'
+    const child = '5667590a-e4c7-4f28-9d99-027f84c10839'
+    const d = path.join(cfg, 'chats', 'b', parent)
+    fs.mkdirSync(d, { recursive: true })
+    const db = new DatabaseSync(path.join(d, 'store.db'))
+    db.exec('CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB); CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);')
+    db.close()
+
+    const fh = fakeHooks()
+    const { cursorContextTail } = wireAgentStatus(platform, { hooks: fh.hooks as never })
+    fh.fireRaw('cursor', 'c3', { hook_event_name: 'stop', conversation_id: parent, generation_id: 'g1', cursor_version: 'v' })
+    const deadline = Date.now() + 3000
+    while (!cursorContextTail.pathFor(parent) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25))
+    expect(cursorContextTail.pathFor(parent)).toBeTruthy()
+    await new Promise((r) => setTimeout(r, 25)) // the async association lands after the track
+    const childPayload = { hook_event_name: 'preToolUse', conversation_id: child, generation_id: child, session_id: child,
+      cursor_version: 'v', tool_name: 'Read', transcript_path: path.join(os.homedir(), '.claude', 'projects', 'x.jsonl') }
+    fh.fireRaw('claude', 'c3', childPayload)
+    fh.fireRaw('cursor', 'c3', childPayload)
+    await new Promise((r) => setTimeout(r, 50))
+    platform.cast(platform.attach({ sendText: () => {}, sendBinary: () => {} }), IPC.ptyDestroy, ['c3'])
+    expect(cursorContextTail.pathFor(parent)).toBeUndefined()
+  })
+
+  it("ptyDestroy releases the node's cursor approval watch (no read may resurrect it)", () => {
+    const fh = fakeHooks()
+    const released: string[] = []
+    wireAgentStatus(platform, { hooks: { ...fh.hooks, releaseCursorNode: (id: string) => void released.push(id) } as never })
+    platform.cast(platform.attach({ sendText: () => {}, sendBinary: () => {} }), IPC.ptyDestroy, ['c4'])
+    expect(released).toEqual(['c4'])
+  })
+
+  it('an unknown chat id produces no meter and no throw', async () => {
+    const fh = fakeHooks()
+    wireAgentStatus(platform, { hooks: fh.hooks as never })
+    fh.fireRaw('cursor', 'c2', { hook_event_name: 'stop', conversation_id: '5667590a-e4c7-4f28-9d99-027f84c10999' })
+    await new Promise((r) => setTimeout(r, 100))
+    expect(sent.find((s) => s.channel === IPC.contextUpdate)).toBeUndefined()
+  })
+})
+
+// Claude's native SubagentStart/SubagentStop (core/claude-subagent-lifecycle.ts), replayed from the
+// REAL 2.1.284 capture (src/shared/agents/__fixtures__/claude/subagent-hook-payloads.json) through
+// this shell exactly as the hook server drives it: raw listener first, then the normalized one.
+describe('wireAgentStatus — Claude native subagent hooks', () => {
+  const fixture = JSON.parse(
+    fs.readFileSync(
+      path.join(__dirname, '../shared/agents/__fixtures__/claude/subagent-hook-payloads.json'),
+      'utf8'
+    )
+  ) as { scenarios: Record<string, { events: Record<string, unknown>[] }> }
+  // The capture's paths, re-rooted under THIS machine's ~/.claude so the transcript jail admits them.
+  const home = path.join(os.homedir(), '.claude')
+  const rehome = (p: Record<string, unknown>): Record<string, unknown> =>
+    JSON.parse(JSON.stringify(p).split('/home/user/.claude').join(home))
+  const replay = (name: string) => {
+    const fh = fakeHooks()
+    const sub = recTail()
+    wireAgentStatus(platform, { hooks: fh.hooks as never, subagentTail: sub.tail as never, contextTail: recTail().tail as never })
+    const payloads = fixture.scenarios[name].events.map(rehome)
+    for (const payload of payloads) {
+      fh.fireRaw('claude', 'n1', payload)
+      const e = normalizeClaude({ nodeId: 'n1', agentId: 'claude', payload })
+      if (e) fh.fireNormalized(e)
+    }
+    const statuses = sent
+      .filter((m) => (m as { channel?: string }).channel === IPC.agentStatus)
+      .map((m) => (m as { args: Record<string, unknown>[] }).args[0])
+    return { payloads, sub, statuses }
+  }
+
+  it('broadcasts one labelled card per child, keyed by agent_id, and replaces the first tool-drawn card', () => {
+    const { payloads, statuses } = replay('print_parallel_foreground')
+    const ids = [...new Set(payloads.filter((p) => p.hook_event_name === 'SubagentStart').map((p) => p.agent_id))]
+    const starts = statuses.filter((s) => s.kind === 'subagent-start')
+    expect(starts.filter((s) => s.subagentSignal === 'tool')).toHaveLength(1)
+    const native = starts.filter((s) => s.subagentSignal === 'native')
+    expect(native.map((s) => s.toolUseId)).toEqual(ids)
+    expect(native.map((s) => s.taskLabel)).toEqual(['Read a.txt', 'Read b.txt'])
+    expect(native[0].supersedes).toBe(starts[0].toolUseId)
+    const ended = new Set(statuses.filter((s) => s.kind === 'subagent-end').map((s) => s.toolUseId))
+    for (const id of ids) expect(ended.has(id)).toBe(true)
+  })
+
+  it("tails each child's own transcript from SubagentStart, and stops the replaced tool tail", () => {
+    const { payloads, sub } = replay('print_parallel_foreground')
+    const starts = payloads.filter((p) => p.hook_event_name === 'SubagentStart')
+    const stops = new Map(
+      payloads.filter((p) => p.hook_event_name === 'SubagentStop').map((p) => [p.agent_id, p.agent_transcript_path])
+    )
+    for (const s of starts) {
+      const tf = sub.calls.find((c) => c.m === 'trackFile' && c.args[0] === s.agent_id)
+      expect(tf?.args[1]).toBe(stops.get(s.agent_id)) // the derived path IS the file the stop names
+      expect(sub.calls.some((c) => c.m === 'finish' && c.args[0] === s.agent_id)).toBe(true)
+    }
+    // Only the first tool call (before the session proved native hooks) got a tool-path tail…
+    const toolTracks = sub.calls.filter((c) => c.m === 'track')
+    expect(toolTracks).toHaveLength(1)
+    // …and it was stopped when its native card replaced it.
+    expect(sub.calls.some((c) => c.m === 'finish' && c.args[0] === toolTracks[0].args[0])).toBe(true)
+  })
+
+  it('a side-agent stop (no start, empty type) reaches no browser', () => {
+    const { payloads, statuses } = replay('interactive_parallel')
+    const phantoms = payloads.filter((p) => p.hook_event_name === 'SubagentStop' && p.agent_type === '')
+    expect(phantoms.length).toBeGreaterThan(0)
+    for (const p of phantoms) expect(statuses.some((s) => s.toolUseId === p.agent_id)).toBe(false)
+  })
+
+  it('a SubagentStart whose parent transcript is outside the jail tails nothing', () => {
+    const fh = fakeHooks()
+    const sub = recTail()
+    wireAgentStatus(platform, { hooks: fh.hooks as never, subagentTail: sub.tail as never })
+    fh.fireRaw('claude', 'n1', {
+      hook_event_name: 'SubagentStart',
+      session_id: 's1',
+      agent_id: 'a0123456789abcdef',
+      agent_type: 'general-purpose',
+      transcript_path: path.join(os.homedir(), '.ssh', 'x.jsonl')
+    })
+    expect(sub.calls.filter((c) => c.m === 'trackFile' && c.args[1] !== undefined)).toEqual([])
   })
 })

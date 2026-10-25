@@ -1,10 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
+import { Tooltip } from '../components/Tooltip'
+import { IconClose, IconUngroup } from '../components/icons'
 import { NodeResizer, useReactFlow, type NodeProps } from '@xyflow/react'
 import { NODE_MIN_SIZES } from '../lib/nodeSizing'
-import { NODE_COLORS, ungroupNodes, type CanvasNode } from '../state/workspace'
+import { ungroupNodes, type CanvasNode } from '../state/workspace'
+import { NodeColorSwatches } from '../components/NodeColorSwatches'
 import { useProjects } from '../state/projects'
 import { useWorktrees, WORKTREE_STATUS_POLL_MS } from '../state/worktrees'
+import { useSession } from '../session/session'
+import { useGitBranch } from '../state/gitBranches'
 import { useProjectSetup } from '../state/projectSetup'
+import { useSettings } from '../state/settings'
+import { backedFillStyle } from '@shared/canvas-backing'
 
 export type WorktreeAction = 'merge' | 'remove' | 'unbind' | 'rerun-setup'
 
@@ -23,13 +30,15 @@ export function setWorktreeActionHandler(
 
 /**
  * A group frame: a dashed, rounded, translucent box that contains child nodes. A floating
- * label pill (color dot + name) sits on the top border; ungroup/× appear top-right on hover.
+ * label pill (color dot + name) sits on the top border; Ungroup appears top-right on hover.
  * Children are real React Flow nodes parented to this one, so dragging the frame moves them
  * together. The frame renders behind its children (it appears first in the array).
  */
 export function GroupNode({ id, data, selected }: NodeProps<CanvasNode>) {
   const { updateNodeData, setNodes } = useReactFlow()
   const [showColors, setShowColors] = useState(false)
+  // Settings → Appearance → Group frame background (issue #1113); 0 = the old see-through look.
+  const backing = useSettings((s) => s.settings.groupFrameBacking)
   // The frame element, observed for viewport visibility by the worktree-status tick below.
   const frameRef = useRef<HTMLDivElement | null>(null)
 
@@ -61,6 +70,8 @@ export function GroupNode({ id, data, selected }: NodeProps<CanvasNode>) {
   // behaviour is no facts at all, not local facts about a remote checkout.
   const sshProject = useProjects((s) => !!s.projects.find((p) => p.id === s.activeProjectId)?.ssh)
   const wtPath = sshProject ? undefined : wt?.path
+  const { api } = useSession()
+  const branch = useGitBranch(api.git, wtPath)
   // Asking once per render is NOT enough to make the chip live: nothing re-renders a group frame
   // while the user works inside its terminals, so the dirty count would freeze at whatever it was
   // when the node last happened to render (verified — it sat at "0 changed" until the canvas was
@@ -150,7 +161,8 @@ export function GroupNode({ id, data, selected }: NodeProps<CanvasNode>) {
       className={frameClass}
       style={{
         borderColor: bound && stale ? undefined : data.color,
-        background: bound && stale ? undefined : `${data.color}${bound ? '1c' : '0f'}`,
+        // A stale worktree frame keeps its CSS look; everything else gets the tint (+ backing).
+        ...(bound && stale ? {} : backedFillStyle(data.color, bound ? '1c' : '0f', backing)),
         // Rounded selection ring (box-shadow follows border-radius, unlike the resizer line).
         boxShadow: selected ? `0 0 0 1.5px ${data.color}` : undefined
       }}
@@ -164,25 +176,23 @@ export function GroupNode({ id, data, selected }: NodeProps<CanvasNode>) {
       />
 
       <div className="group-node__label">
-        <button
-          className="group-node__dot nodrag"
-          style={{ background: data.color }}
-          title="Color"
-          onClick={() => setShowColors((v) => !v)}
-        />
+        <Tooltip label="Color">
+          <button
+            className="group-node__dot nodrag"
+            style={{ background: data.color }}
+            aria-label="Color"
+            onClick={() => setShowColors((v) => !v)}
+          />
+        </Tooltip>
         {showColors && (
-          <div className="color-popover">
-            {NODE_COLORS.map((c) => (
-              <button
-                key={c}
-                style={{ background: c }}
-                onClick={() => {
-                  updateNodeData(id, { color: c })
-                  setShowColors(false)
-                }}
-              />
-            ))}
-          </div>
+          <NodeColorSwatches
+            className="color-popover"
+            selected={data.color as string | undefined}
+            onPick={(c) => {
+              updateNodeData(id, { color: c })
+              setShowColors(false)
+            }}
+          />
         )}
         <input
           className="group-node__name nodrag"
@@ -205,7 +215,7 @@ export function GroupNode({ id, data, selected }: NodeProps<CanvasNode>) {
               <span className="group-node__branch" title={wt.path}>
                 {/* The branch git reports NOW wins: the user may have switched branches inside
                     the worktree from a terminal, and the persisted name would then be a lie. */}
-                ⎇ {status?.branch || wt.branch}
+                ⎇ {branch || status?.branch || wt.branch}
                 {!!status && status.dirty > 0 && (
                   <em className="group-node__wt-dirty" title={`${status.dirty} changed file(s)`}>
                     {' '}
@@ -237,6 +247,9 @@ export function GroupNode({ id, data, selected }: NodeProps<CanvasNode>) {
               // PROJECT lane, so it can never re-attach a worktree group's run — clicking it would
               // leave this chip failed and its nodes armed forever. Re-running here re-attaches the
               // group's lane, and a `done` from the new run releases them.
+              // Keeps a native `title` while the frame's action buttons moved to Tooltip: the
+              // bubble is `white-space: nowrap`, so these four explanatory lines would render as
+              // one bar running off the window.
               (setupRun.kind === 'setup' && setupRun.state === 'failed' ? (
                 <button
                   className={`group-node__setup group-node__setup--${setupBusy ? 'running' : 'failed'} nodrag`}
@@ -266,49 +279,55 @@ export function GroupNode({ id, data, selected }: NodeProps<CanvasNode>) {
                 </span>
               ))}
             {!stale && (
-              <button
-                className="group-node__wt-btn"
-                title="Merge to main"
-                onClick={() => worktreeActionHandler?.(id, 'merge')}
-              >
-                ⤴
-              </button>
+              <Tooltip label="Merge to main">
+                <button
+                  className="group-node__wt-btn"
+                  aria-label="Merge to main"
+                  onClick={() => worktreeActionHandler?.(id, 'merge')}
+                >
+                  ⤴
+                </button>
+              </Tooltip>
             )}
-            <button
-              className="group-node__wt-btn"
-              title={
+            <Tooltip
+              label={
                 stale
                   ? 'Unbind (the directory is gone — also prunes the stale git registration)'
                   : 'Unbind worktree (keeps the worktree on disk)'
               }
-              onClick={() => worktreeActionHandler?.(id, 'unbind')}
             >
-              Unbind
-            </button>
-            {!stale && (
               <button
                 className="group-node__wt-btn"
-                title="Remove worktree"
-                onClick={() => worktreeActionHandler?.(id, 'remove')}
+                onClick={() => worktreeActionHandler?.(id, 'unbind')}
               >
-                ✕
+                Unbind
               </button>
+            </Tooltip>
+            {!stale && (
+              <Tooltip label="Remove worktree">
+                <button
+                  className="group-node__wt-btn"
+                  aria-label="Remove worktree"
+                  onClick={() => worktreeActionHandler?.(id, 'remove')}
+                >
+                  <IconClose />
+                </button>
+              </Tooltip>
             )}
           </div>
         )}
       </div>
 
       <div className="group-node__actions nodrag">
-        <button className="group-node__ungroup" title="Ungroup" onClick={ungroup}>
-          ungroup
-        </button>
-        <button
-          className="group-node__close"
-          title="Remove group (keeps nodes)"
-          onClick={ungroup}
-        >
-          ×
-        </button>
+        <Tooltip label="Ungroup (keeps nodes)">
+          <button
+            className="group-node__ungroup"
+            aria-label="Ungroup (keeps nodes)"
+            onClick={ungroup}
+          >
+            <IconUngroup />
+          </button>
+        </Tooltip>
       </div>
     </div>
   )

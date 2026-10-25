@@ -5,17 +5,20 @@ import path from 'path'
 import { execFileSync } from 'child_process'
 import { ServerPlatform } from '../platform-server'
 import { registerCoreHandlers } from './index'
+import { createIntegrationLifecycle, registerIntegrationLifecycle } from '../../core/agent-integrations'
 import { IPC } from '../../shared/ipc'
 import { DEFAULT_SETTINGS, type GitStatus } from '../../shared/types'
 import { initPlatform, resetPlatformForTests } from '../../core/platform'
 import { DownloadTickets } from '../../core/download-tickets'
 import { projectImagesDir } from '../../core/canvas-images'
+import { projectWhiteboardsDir } from '../../core/whiteboards'
 
 // The per-account hook writers are exercised by src/core/claude-accounts-service.test.ts. Observe
 // them here instead of running them: the real installer writes into the USER's `~/.nodeterm`, and
 // a unit test has no business touching the machine it runs on.
 const hookInstalls: string[] = []
-vi.mock('../../core/agents/hooks/claude', () => ({
+vi.mock('../../core/agents/hooks/claude', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../core/agents/hooks/claude')>()),
   installClaudeHooksInto: (dir: string) => {
     hookInstalls.push(dir)
   },
@@ -98,6 +101,30 @@ describe('registerCoreHandlers (canvas images)', () => {
     })
     expect((res as { result: string }).result).toBe(path.join(projectImagesDir(repo), 'shot.png'))
   })
+
+  it('forwards whiteboardLocation, so a board lands where the SHELL resolved it', async () => {
+    // A folder project kept in app data answers its app-data root here and no folder from
+    // `localProjectCwd`; a missing forward would send its boards to the app's shared folder.
+    resetPlatformForTests()
+    const p2 = new ServerPlatform({ userDataDir: repo, appVersion: '0' })
+    initPlatform(p2)
+    const appRoot = path.join(repo, 'project-files', 'p2')
+    registerCoreHandlers(p2, {
+      getSettings: () => DEFAULT_SETTINGS,
+      localProjectCwd: () => undefined,
+      whiteboardLocation: (id) => (id === 'p2' ? { projectCwd: appRoot, createRoot: true } : {})
+    })
+    const ui2 = p2.attach({ sendText: () => {}, sendBinary: () => {} })
+    const res = await p2.dispatch(ui2, {
+      t: 'req',
+      id: 1,
+      method: IPC.filesSaveWhiteboard,
+      args: ['p2', 'whiteboard-1', '{"type":"excalidraw"}']
+    })
+    expect((res as { result: { path: string } }).result.path).toBe(
+      path.join(projectWhiteboardsDir(appRoot), 'whiteboard-1.excalidraw')
+    )
+  })
 })
 
 describe('registerCoreHandlers (download tickets)', () => {
@@ -163,7 +190,16 @@ describe('registerCoreHandlers (download tickets)', () => {
 describe('registerCoreHandlers (managed Claude accounts, #313)', () => {
   beforeEach(() => {
     hookInstalls.length = 0
+    // The account's hook comes from the consent lifecycle (#744) — claude enabled here.
+    registerIntegrationLifecycle(
+      createIntegrationLifecycle({
+        settings: () => ({ ...DEFAULT_SETTINGS, agentIntegrations: { agents: { claude: 'enabled' }, origin: 'asked' } }),
+        userDataDir: () => repo,
+        shims: () => ({ context: path.join(repo, 'context-links', 'context.sh') })
+      })
+    )
   })
+  afterEach(() => registerIntegrationLifecycle(null))
 
   it('add() creates the config dir under this host userData and remove() deletes it', async () => {
     const added = (await call(IPC.claudeAccountsAdd)) as { id: string; configDir: string }

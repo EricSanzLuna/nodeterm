@@ -2,7 +2,10 @@ import type { Socket } from 'net'
 import { createHash, randomUUID } from 'crypto'
 import * as pty from 'node-pty'
 import { TerminalEmulator } from './terminal-emulator'
+import { CwdReportScanner } from './cwd-report'
+import { windowsConptySpawnOptions } from '../core/windows-conpty-dll'
 import type {
+  CaptureVisibleResult,
   ExecuteLaunchResult,
   SessionHostShellDialect,
   SessionHostSpawnOptions
@@ -16,7 +19,14 @@ const LAUNCH_READINESS_POLL_MS = 100
 const VERIFY_TIMEOUT_MS = 2_000
 const ECHO_EDGE_CHARS = 24
 const DELIVERY_ATTEMPTS = 3
-const KILL_LINE = '\x15'
+import {
+  KILL_LINE,
+  WINDOWS_KILL_LINE,
+  shellKillLineSequence
+} from '../shared/shell-kill-line'
+
+export { KILL_LINE, WINDOWS_KILL_LINE, shellKillLineSequence }
+
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 // eslint-disable-next-line no-control-regex
 const ESC_SEQ = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]/g
@@ -84,6 +94,7 @@ interface AttachmentState {
   geometry?: Geometry
   explicitPaused: boolean
   subscribed: boolean
+  watching: boolean
 }
 
 /** A warm attach must temporarily claim geometry and (on reconnect) restore its explicit pause
@@ -141,10 +152,28 @@ export class HostSession {
   /** Each app connection contributes one componentwise geometry claim. The effective PTY size is
    * the minimum across live claims so every viewer fits; removing the smallest claim grows it. */
   private readonly geometryClaims = new Map<Socket, Geometry>()
+  /** Subscribed connections attached in `watch` mode (`watch-attach` feature): they receive output
+   *  but hold NO geometry claim, so a live link / relay viewer can never size the pty. A claim-
+   *  carrying attach on the same connection takes it out of this set again. */
+  private readonly watchers = new Set<Socket>()
+  /** The cwd the pane last REPORTED in its output (OSC 7 / 9;9 / 633 — see cwd-report.ts). Null
+   *  until one arrives; deliberately never seeded with the spawn cwd. */
+  private reportedCwd: string | null = null
+  private readonly cwdScanner = new CwdReportScanner()
   /** A detach/close increments the socket epoch before clearing state. A delayed prepare/rollback
    * from the prior epoch can then observe cancellation instead of resurrecting a ghost socket. */
   private readonly attachmentEpochs = new WeakMap<Socket, number>()
   private appliedGeometry: Geometry
+  /** Told every time the pty is actually resized — the host pushes it to the connections that
+   *  negotiated the `geometry` feature, so each viewer can render the size the pty really has
+   *  instead of the one it asked for (issue #914). Called inside the emulator tail, after both
+   *  actuators succeeded; it must not throw back into it. */
+  onGeometryApplied?: (geometry: Geometry) => void
+
+  /** The size the pty runs at right now. */
+  get geometry(): Geometry {
+    return { ...this.appliedGeometry }
+  }
   /** Consecutive callers asking for the same effective target share one acknowledgement. If that
    * actuator attempt fails, every waiter sees the failure; a later exact retry starts a new one. */
   private pendingGeometry: { key: string; promise: Promise<void> } | null = null
@@ -153,6 +182,10 @@ export class HostSession {
    * co-attach, one level further down the stack. */
   readonly subscribers = new Set<Socket>()
   readonly createdAt = Date.now()
+  /** When the pty last produced output (epoch ms) — the session reaper's idleness clock, reported
+   * by `listSessions` to `sessionDetails` connections. Starts at creation, like tmux's
+   * `window_activity`; host.ts stamps it on every pty `data` callback and nothing else moves it. */
+  lastOutputAt = this.createdAt
   /** Set once, by whichever path (natural pty exit or an explicit `killSession`) ends this
    * session first — guards against double-dispose/double-broadcast when both could race. */
   exited = false
@@ -167,6 +200,10 @@ export class HostSession {
 
   get suppressingPrivateLaunchOutput(): boolean {
     return this.privateLaunchOutput
+  }
+
+  get killLineSequence(): string {
+    return shellKillLineSequence(this.launchDialect, this.shellExecutableName)
   }
 
   /** True once a successful explicit kill has claimed the name but before node-pty proves process
@@ -209,7 +246,10 @@ export class HostSession {
         cols: this.appliedGeometry.cols,
         rows: this.appliedGeometry.rows,
         cwd: spawn.cwd,
-        env: spawn.env
+        env: spawn.env,
+        // Win32: node-pty's bundled ConPTY when it is installed (mouse + alt-screen modes reach
+        // the emulator on Windows 10). `{}` everywhere else — byte-identical options.
+        ...windowsConptySpawnOptions()
       })
     this.term =
       overrides?.term ??
@@ -241,6 +281,29 @@ export class HostSession {
     return settled
   }
 
+  /** Scan one PTY-output chunk for a cwd report. Synchronous and independent of the emulator queue:
+   *  it is called for every chunk, including private launch echo (a cwd is not launch material). */
+  noteOutput(data: string): void {
+    const cwd = this.cwdScanner.push(data)
+    if (cwd !== undefined) this.reportedCwd = cwd
+  }
+
+  /** `paneCwd`: the last REPORTED cwd, or null when the pane never reported one. */
+  get paneCwd(): string | null {
+    return this.reportedCwd
+  }
+
+  /** Is this connection subscribed in watch mode (no geometry claim)? */
+  isWatching(socket: Socket): boolean {
+    return this.watchers.has(socket)
+  }
+
+  /** The visible-screen keyframe, behind the same output barrier as `serialize`. */
+  async captureVisible(): Promise<CaptureVisibleResult> {
+    await this.outputTail
+    return this.term.captureVisible()
+  }
+
   /** Wait until every PTY-output chunk observed before this call has reached xterm. */
   settleOutput(): Promise<void> {
     return this.outputTail
@@ -265,6 +328,30 @@ export class HostSession {
     return this.term.serialize(scrollback)
   }
 
+  /**
+   * Has the app in this pane requested bracketed paste? Behind `outputTail` for the same reason
+   * `serialize` is: xterm applies writes asynchronously, so a mode set by output we have already
+   * observed is not in `modes` yet. Reading it early answers "no" for the turn that just enabled
+   * it — which is exactly the injected-prompt delivery this gates (see send-keys-delivery.ts).
+   */
+  async bracketedPasteRequested(): Promise<boolean> {
+    await this.outputTail
+    return this.term.bracketedPasteRequested()
+  }
+
+  /** The pane app's mouse-tracking protocol, behind `outputTail` for the same reason. */
+  async mouseTrackingMode(): Promise<'none' | 'x10' | 'vt200' | 'drag' | 'any'> {
+    await this.outputTail
+    return this.term.mouseTrackingMode()
+  }
+
+  /** Agent messaging's stricter form of the same read: the pane must also still be alive and not
+   * inside a private launch, because the envelope is only ever written as a framed paste. */
+  async messagePasteReady(): Promise<boolean> {
+    await this.outputTail
+    return !this.exited && !this.suppressingPrivateLaunchOutput && this.term.bracketedPasteRequested()
+  }
+
   /** Stage an attach's explicit flow state and per-socket geometry before the warm screen barrier.
    * The returned commit is the only operation that activates live delivery. */
   async prepareAttachment(
@@ -273,16 +360,35 @@ export class HostSession {
     rows: number,
     paused: boolean
   ): Promise<PreparedHostAttachment> {
+    return this.stageAttachment(socket, normalizedGeometry(cols, rows), paused)
+  }
+
+  /** `watch-attach`: the same transaction with NO geometry claim. A connection that held one gives
+   *  it up (its last voting subscriber left), and the pty's size is re-derived from the remaining
+   *  claims — with none left it keeps the size it has. Never spawns: callers reach this only for an
+   *  existing generation. Any explicit pause the connection held is returned. */
+  prepareWatchAttachment(socket: Socket): Promise<PreparedHostAttachment> {
+    // Never paused: a viewer holds no flow ticket on the shared pty (see `pauseFor`).
+    return this.stageAttachment(socket, null, false)
+  }
+
+  private async stageAttachment(
+    socket: Socket,
+    claim: Geometry | null,
+    paused: boolean
+  ): Promise<PreparedHostAttachment> {
     const epoch = (this.attachmentEpochs.get(socket) ?? 0) + 1
     this.attachmentEpochs.set(socket, epoch)
     const previous: AttachmentState = {
       geometry: this.geometryClaims.get(socket),
       explicitPaused: this.explicitPauseOwners.has(socket),
-      subscribed: this.subscribers.has(socket)
+      subscribed: this.subscribers.has(socket),
+      watching: this.watchers.has(socket)
     }
     this.setSocketPauseOwner(this.explicitPauseOwners, socket, paused)
     try {
-      await this.setGeometryClaim(socket, cols, rows)
+      if (claim) await this.setGeometryClaim(socket, claim.cols, claim.rows)
+      else if (this.geometryClaims.delete(socket)) await this.applyEffectiveGeometry()
     } catch (error) {
       await this.restoreAttachment(socket, previous, epoch)
       throw error
@@ -296,6 +402,8 @@ export class HostSession {
         finished = true
         if (this.attachmentEpochs.get(socket) !== epoch || socket.destroyed) return false
         this.subscribers.add(socket)
+        if (claim) this.watchers.delete(socket)
+        else this.watchers.add(socket)
         // A response written before this attach may already have filled the socket. The new
         // session must inherit that socket-wide transport ticket before any live frame can add to
         // the same queue.
@@ -329,11 +437,15 @@ export class HostSession {
   /** Update only the requesting subscriber's geometry claim. */
   async resizeFor(socket: Socket, cols: number, rows: number): Promise<void> {
     if (!this.subscribers.has(socket)) return
+    // A watch-mode connection has no claim to update, and must never acquire one by resizing.
+    if (this.watchers.has(socket)) throw new Error('a watch attachment cannot resize the terminal')
     await this.setGeometryClaim(socket, cols, rows)
   }
 
   pauseFor(socket: Socket): void {
     if (!this.subscribers.has(socket)) return
+    // A viewer never slows the owner's terminal: a watch-mode connection takes no pause ticket.
+    if (this.watchers.has(socket)) return
     this.setSocketPauseOwner(this.explicitPauseOwners, socket, true)
   }
 
@@ -357,6 +469,7 @@ export class HostSession {
     this.attachmentEpochs.set(socket, (this.attachmentEpochs.get(socket) ?? 0) + 1)
     const wasPaused = this.hasPauseOwner()
     this.subscribers.delete(socket)
+    this.watchers.delete(socket)
     this.explicitPauseOwners.delete(socket)
     this.transportPauseOwners.delete(socket)
     this.reconcileProcFlow(wasPaused)
@@ -387,6 +500,7 @@ export class HostSession {
     this.transportPauseOwners.clear()
     this.emulatorPauseOwner = false
     this.geometryClaims.clear()
+    this.watchers.clear()
     this.term.dispose()
   }
 
@@ -576,11 +690,11 @@ export class HostSession {
           if (attempt >= DELIVERY_ATTEMPTS) {
             // Never submit an unverified/mangled command. Clear it so the terminal remains
             // recoverable, cache the fixed failure, and let explicit user action decide next.
-            write(KILL_LINE)
+            write(this.killLineSequence)
             finish(new Error('session-host could not verify launch command delivery'))
             return
           }
-          if (!write(KILL_LINE)) return
+          if (!write(this.killLineSequence)) return
           tryOnce()
         }, VERIFY_TIMEOUT_MS)
         timer.unref?.()
@@ -637,6 +751,8 @@ export class HostSession {
     else this.explicitPauseOwners.delete(socket)
     if (previous.subscribed) this.subscribers.add(socket)
     else this.subscribers.delete(socket)
+    if (previous.watching) this.watchers.add(socket)
+    else this.watchers.delete(socket)
     this.reconcileProcFlow(wasPaused)
 
     if (previous.geometry) this.geometryClaims.set(socket, previous.geometry)
@@ -670,6 +786,11 @@ export class HostSession {
       this.proc.resize(target.cols, target.rows)
       this.term.resize(target.cols, target.rows)
       this.appliedGeometry = target
+      try {
+        this.onGeometryApplied?.({ ...target })
+      } catch {
+        // A notification failure must not turn a successful resize into a failed one.
+      }
     })
     const pending = { key, promise: reconciled }
     this.pendingGeometry = pending

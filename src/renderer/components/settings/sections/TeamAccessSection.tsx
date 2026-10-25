@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useEntitlement } from '../../../state/entitlement'
 import { useTeamAccess } from '../../../state/teamAccess'
 import { listSeats, usedCount, type SeatEntry } from '../../../state/teamAccessCore'
@@ -43,8 +43,12 @@ export function TeamAccessSection({
 }): React.JSX.Element {
   const ent = useEntitlement()
   const seats = useEntitlement((s) => s.seats)
-  const used = useTeamAccess((s) => usedCount(s.seats))
-  const seatList = useTeamAccess((s) => listSeats(s.seats))
+  // Select the table itself and derive from it. `listSeats` builds a NEW array on every call, and
+  // zustand 5 compares selector results with Object.is, so selecting it directly never settled:
+  // React error #185 (maximum update depth) took the whole section down.
+  const seatTable = useTeamAccess((s) => s.seats)
+  const used = usedCount(seatTable)
+  const seatList = useMemo(() => listSeats(seatTable), [seatTable])
   const view = teamAccessView({ premium: ent.isPremium, seats, used })
 
   const [email, setEmail] = useState('')
@@ -117,8 +121,9 @@ export function TeamAccessSection({
             <div className="space-y-3">
               <h4 className="text-[13px] font-medium text-text">Invite a teammate</h4>
               <p className="text-sm text-muted">
-                A teammate on a seat can run commands on {thisMachine()} — the same as giving
-                them SSH access. Only invite people you trust.
+                A teammate on a seat gets full access to {thisMachine()} as you — every project,
+                and commands in any folder — the same as giving them SSH access. Only invite people
+                you trust.
               </p>
               <FieldRow
                 label="Teammate email"
@@ -143,12 +148,12 @@ export function TeamAccessSection({
                 <p className="text-sm text-muted">All seats in use — add a seat.</p>
               ) : null}
               {atCap ? (
-                <p className="text-sm" style={{ color: '#ff9f0a' }}>
+                <p className="text-sm" style={{ color: 'var(--warn)' }}>
                   All seats in use — add a seat.
                 </p>
               ) : null}
               {error ? (
-                <p className="text-sm" style={{ color: '#ff9f0a' }}>
+                <p className="text-sm" style={{ color: 'var(--warn)' }}>
                   {error}
                 </p>
               ) : null}
@@ -191,8 +196,8 @@ export function TeamAccessSection({
               end-to-end encrypted relay.
             </p>
             <p className="text-sm text-muted">
-              A seat grants shell access: a teammate on a seat can run commands on{' '}
-              {thisMachine()} — the same as giving them SSH access. Every connection is still
+              A seat grants full access: a teammate on a seat can run commands on{' '}
+              {thisMachine()} as you, in every project — the same as giving them SSH access. Every connection is still
               verified with a one-time pairing code you compare together.
             </p>
             <Button variant="primary" onClick={() => void ent.upgrade()}>

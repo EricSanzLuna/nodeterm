@@ -9,7 +9,9 @@ import path from 'path'
 import { COPILOT_HOOK_EVENTS } from '@shared/agents/hook-events'
 import {
   buildManagedHookCommand,
-  installManagedHookScript
+  installManagedHookScript,
+  installWindowsHookWrapper,
+  writeManagedHookFileAtomic
 } from './install-helper'
 
 const SCRIPT_FILE_NAME = 'copilot.sh'
@@ -21,6 +23,8 @@ const REMOTE_HOME_MAX = 4096
 export interface CopilotHookCommand {
   type: 'command'
   bash: string
+  /** What Copilot runs on Windows instead of `bash`. Present only in a Windows install. */
+  powershell?: string
   timeoutSec: number
   matcher?: string
 }
@@ -59,14 +63,22 @@ export function copilotHookConfigPath(): string {
   return path.join(copilotHomeDir(), 'hooks', COPILOT_HOOK_FILE)
 }
 
-/** Pure config builder shared with the SSH installer, which supplies a remote script path. */
-export function buildCopilotHookConfig(command: string): CopilotHookConfig {
+/**
+ * Pure config builder shared with the SSH installer, which supplies a remote script path.
+ *
+ * `windowsCommand` adds Copilot's `powershell` key — the one it runs on Windows, where the `bash`
+ * line is never consulted. `bash` stays in either case (Copilot requires a command for the
+ * platform it runs on, and keeping the POSIX line means a config copied off a Windows box still
+ * works elsewhere). The SSH installer passes none, so a host's file is byte-identical.
+ */
+export function buildCopilotHookConfig(command: string, windowsCommand?: string): CopilotHookConfig {
   const hooks: Record<string, CopilotHookCommand[]> = {}
   for (const event of COPILOT_HOOK_EVENTS) {
     hooks[event] = [
       {
         type: 'command',
         bash: command,
+        ...(windowsCommand !== undefined ? { powershell: windowsCommand } : {}),
         timeoutSec: 5,
         // Copilot's notification matcher is a regex on notification_type. These are the only two
         // notifications that change nodeterm state; filtering at source avoids one process per
@@ -80,17 +92,22 @@ export function buildCopilotHookConfig(command: string): CopilotHookConfig {
   return { version: 1, hooks }
 }
 
-export function installCopilotHooks(): void {
+export function installCopilotHooks(platform: NodeJS.Platform | string = process.platform, cmdExe?: string): void {
   const script = installManagedHookScript('copilot', SCRIPT_FILE_NAME)
   if (!script) return
+  // On Windows Copilot runs the `powershell` key, so its wrapper must exist before the config
+  // names it (same order rule as installHooksInto).
+  const windows = platform === 'win32'
+  if (windows && !installWindowsHookWrapper('copilot', script)) return
   const configPath = copilotHookConfigPath()
   try {
     fs.mkdirSync(path.dirname(configPath), { recursive: true })
-    fs.writeFileSync(
-      configPath,
-      `${JSON.stringify(buildCopilotHookConfig(buildManagedHookCommand(script)), null, 2)}\n`,
-      'utf8'
+    const config = buildCopilotHookConfig(
+      buildManagedHookCommand(script),
+      windows ? buildManagedHookCommand(script, {}, 'win32', cmdExe) : undefined
     )
+    // Our own file, published by rename so copilot never reads it half written.
+    writeManagedHookFileAtomic(configPath, `${JSON.stringify(config, null, 2)}\n`)
   } catch (e) {
     console.warn('[agent-hooks] copilot install failed', e)
   }
@@ -99,11 +116,7 @@ export function installCopilotHooks(): void {
 export function removeCopilotHooks(): void {
   const configPath = copilotHookConfigPath()
   try {
-    fs.writeFileSync(
-      configPath,
-      `${JSON.stringify({ version: 1, hooks: {} }, null, 2)}\n`,
-      'utf8'
-    )
+    writeManagedHookFileAtomic(configPath, `${JSON.stringify({ version: 1, hooks: {} }, null, 2)}\n`)
   } catch {
     /* fail open */
   }

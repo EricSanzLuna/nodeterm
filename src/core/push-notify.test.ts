@@ -3,13 +3,19 @@ import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import type { NormalizedAgentEvent } from '@shared/agents/normalize'
+import nacl from 'tweetnacl'
 import {
   createPushNotify,
   createLiveUpdatePush,
+  createHostAuthCache,
   type PushNotifyDeps,
+  type PushNotifyHandle,
   type PushHostIdentity,
-  type LiveUpdateDeps
+  type LiveUpdateDeps,
+  type LiveUpdateHandle
 } from './push-notify'
+import { popProverFor } from './relay/relay-pop'
+import { createTestPopServer } from './relay/relay-pop.test-server'
 import {
   onInboxActionable,
   onNodeStateChange,
@@ -238,6 +244,7 @@ describe('createPushNotify', () => {
     expect(body.hostLabel).toBe('niova')
     expect(body.events[0]).toEqual({
       kind: 'approval',
+      eventId: 'id', // the mirror InboxEvent.id, renamed — the raw `id` key itself stays out
       title: 'Approve write to /etc/hosts',
       detail: 'Edit needs sudo',
       nodeId: 'node-9',
@@ -248,6 +255,27 @@ describe('createPushNotify', () => {
     expect(body.events[0]).not.toHaveProperty('id')
     expect(body.events[0]).not.toHaveProperty('resolved')
     expect(body.events[0]).not.toHaveProperty('pendingId')
+    h.stop()
+  })
+
+  it('forwards the mirror inbox event id as eventId on an immediate send', async () => {
+    const em = makeEmitter()
+    const h = createPushNotify(baseDeps({ subscribe: em.subscribe }))
+    em.emit(iev({ nodeId: 'a', id: '1789-7', title: 'A' }))
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(bodyOf().events[0].eventId).toBe('1789-7')
+    h.stop()
+  })
+
+  it('batched events each carry their OWN eventId, in order', async () => {
+    const em = makeEmitter()
+    const h = createPushNotify(baseDeps({ subscribe: em.subscribe }))
+    em.emit(iev({ nodeId: 'a', id: '1000-1', title: 'A' }))
+    em.emit(iev({ nodeId: 'b', id: '1000-2', kind: 'done', title: 'B' }))
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(bodyOf().events.map((e) => e.eventId)).toEqual(['1000-1', '1000-2'])
     h.stop()
   })
 
@@ -506,6 +534,19 @@ describe('createPushNotify', () => {
       h.stop()
     })
 
+    it('grant-mode POSTs carry the same eventId as host mode', async () => {
+      const em = makeEmitter()
+      const h = createPushNotify(grantDeps({ subscribe: em.subscribe }))
+      em.emit(iev({ nodeId: 'a', id: '2000-3', title: 'A' }))
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      for (const c of fetchMock.mock.calls) {
+        expect(c[1].headers.authorization).toMatch(/^Bearer /)
+        expect(JSON.parse(c[1].body).events[0].eventId).toBe('2000-3')
+      }
+      h.stop()
+    })
+
     it('marks a grant dead on a 401/403 (only the failing one)', async () => {
       const dead: string[] = []
       // tok-A → 403, tok-B → 200 (keyed on the Bearer header).
@@ -617,10 +658,16 @@ describe('createPushNotify', () => {
       h.stop()
     })
 
-    // The one overlap the desktop CAN see: the same phone dropped a grant on this Mac AND on an SSH
-    // host it reaches (src/main's allPushGrants concatenates both lists), so the same deviceId shows
-    // up twice with different tokens. First occurrence wins — main puts the local grants first.
-    it('OVERLAP: two grants for the same deviceId collapse to ONE POST (first wins)', async () => {
+    // A grant authorizes pushes about the HOST it was dropped on — nothing else. src/main's
+    // allPushGrants concatenates this machine's grants with a sweep of every connected SSH host, so
+    // one phone that reached three hosts contributes three grants, each signed for a DIFFERENT
+    // connectionId (the phone's own saved-connection UUID for that host — exactly the scope its
+    // per-host mute is keyed by). Collapsing them per deviceId and posting every event under the
+    // survivor sent host B's events under host A's grant: the backend then consulted A's mute for
+    // B's event, and a host the user had turned OFF kept ringing the phone (issue #435, field
+    // report). Events are routed to the grants swept from THEIR host; a node with no host
+    // attribution (a local node, or the Server Edition) goes to this machine's own grants.
+    it('PER-HOST: an event routes ONLY to the grants swept from the host its node lives on', async () => {
       const em = makeEmitter()
       const h = createPushNotify(
         baseDeps({
@@ -628,7 +675,68 @@ describe('createPushNotify', () => {
           getHostIdentity: () => null,
           getGrants: () => [
             { deviceId: 'dev-A', grant: 'tok-local' },
-            { deviceId: 'dev-A', grant: 'tok-remote' },
+            { deviceId: 'dev-A', grant: 'tok-h1', host: 'u@h1' },
+            { deviceId: 'dev-A', grant: 'tok-h2', host: 'u@h2' },
+            { deviceId: 'dev-B', grant: 'tok-h2-B', host: 'u@h2' }
+          ],
+          grantHostFor: (nodeId) => ({ a: 'u@h1', b: 'u@h2' })[nodeId],
+          hostLabel: () => 'niova'
+        })
+      )
+      em.emit(iev({ nodeId: 'a', title: 'A' }))
+      em.emit(iev({ nodeId: 'b', title: 'B' }))
+      em.emit(iev({ nodeId: 'c', title: 'C' })) // no attribution → local
+      await vi.advanceTimersByTimeAsync(2000)
+      const sent = fetchMock.mock.calls.map((c) => [
+        c[1].headers.authorization,
+        JSON.parse(c[1].body).events.map((e: { title: string }) => e.title)
+      ])
+      expect(sent).toEqual(
+        expect.arrayContaining([
+          ['Bearer tok-h1', ['A']],
+          ['Bearer tok-h2', ['B']],
+          ['Bearer tok-h2-B', ['B']],
+          ['Bearer tok-local', ['C']]
+        ])
+      )
+      expect(sent).toHaveLength(4)
+      h.stop()
+    })
+
+    it('PER-HOST: a phone holding grants on two hosts gets ONE push per event, under the right host', async () => {
+      const em = makeEmitter()
+      const h = createPushNotify(
+        baseDeps({
+          subscribe: em.subscribe,
+          getHostIdentity: () => null,
+          getGrants: () => [
+            { deviceId: 'dev-A', grant: 'tok-h1', host: 'u@h1' },
+            { deviceId: 'dev-A', grant: 'tok-h2', host: 'u@h2' }
+          ],
+          grantHostFor: () => 'u@h2',
+          hostLabel: () => 'niova'
+        })
+      )
+      em.emit(iev({ nodeId: 'a', title: 'A' }))
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(fetchMock.mock.calls[0][1].headers.authorization).toBe('Bearer tok-h2')
+      h.stop()
+    })
+
+    // Without any host attribution (the Server Edition: one machine, its own grant dir) every
+    // grant is local and every event is local — the pre-existing fan-out, unchanged. Two files
+    // for one device cannot exist in one dir (the filename IS the deviceId), so the within-host
+    // first-wins dedupe is defensive only.
+    it('no grantHostFor (Server Edition): every event goes to every local grant, first-wins per device', async () => {
+      const em = makeEmitter()
+      const h = createPushNotify(
+        baseDeps({
+          subscribe: em.subscribe,
+          getHostIdentity: () => null,
+          getGrants: () => [
+            { deviceId: 'dev-A', grant: 'tok-A' },
+            { deviceId: 'dev-A', grant: 'tok-A-dup' },
             { deviceId: 'dev-B', grant: 'tok-B' }
           ],
           hostLabel: () => 'niova'
@@ -636,11 +744,30 @@ describe('createPushNotify', () => {
       )
       em.emit(iev({ nodeId: 'a', title: 'A' }))
       await vi.advanceTimersByTimeAsync(2000)
-      expect(fetchMock).toHaveBeenCalledTimes(2)
       expect(fetchMock.mock.calls.map((c) => c[1].headers.authorization)).toEqual([
-        'Bearer tok-local',
+        'Bearer tok-A',
         'Bearer tok-B'
       ])
+      h.stop()
+    })
+
+    // A remote node's event must NEVER fall back to this machine's grants: a grant dropped here
+    // authorizes pushes about this machine only, and a phone that only reaches host h1 has no
+    // connection to open a "local" event with anyway.
+    it('PER-HOST: a remote node with no grant on its host is dropped from the granted leg', async () => {
+      const em = makeEmitter()
+      const h = createPushNotify(
+        baseDeps({
+          subscribe: em.subscribe,
+          getHostIdentity: () => null,
+          getGrants: () => [{ deviceId: 'dev-A', grant: 'tok-local' }],
+          grantHostFor: () => 'u@h1',
+          hostLabel: () => 'niova'
+        })
+      )
+      em.emit(iev({ nodeId: 'a', title: 'A' }))
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(fetchMock).not.toHaveBeenCalled()
       h.stop()
     })
 
@@ -710,6 +837,23 @@ describe('createPushNotify', () => {
       await vi.advanceTimersByTimeAsync(2000)
       expect(fetchMock).toHaveBeenCalledTimes(1)
       expect(bodyOf().events.map((e) => e.title)).toEqual(['A', 'B'])
+      h.stop()
+    })
+
+    it('a held event flushed on the away edge still carries its eventId', async () => {
+      const em = makeEmitter()
+      const pres = presenceEmitter()
+      const h = createPushNotify(
+        baseDeps({ subscribe: em.subscribe, isUserPresent: () => true, subscribePresence: pres.subscribe })
+      )
+      em.emit(iev({ nodeId: 'a', id: '3000-1', title: 'A' }))
+      em.emit(iev({ nodeId: 'b', id: '3000-2', title: 'B' }))
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(fetchMock).not.toHaveBeenCalled() // held while present
+      pres.away()
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(bodyOf().events.map((e) => e.eventId)).toEqual(['3000-1', '3000-2'])
       h.stop()
     })
 
@@ -1447,19 +1591,29 @@ describe('createLiveUpdatePush', () => {
       h.stop()
     })
 
-    it('OVERLAP: two grants for the same deviceId collapse to ONE POST (first wins)', async () => {
+    // Same per-host routing as notify (issue #435): a Live Activity update about a node on host h2
+    // goes ONLY under h2's grant — never under another host's, whose connectionId names a host the
+    // phone may have muted, and whose card the phone would then attribute to the wrong connection.
+    it('PER-HOST: an update routes ONLY to the grants swept from the host its node lives on', async () => {
       const { h, st } = wire({
         getHostIdentity: () => null,
         getGrants: () => [
           { deviceId: 'dev-A', grant: 'tok-local' },
-          { deviceId: 'dev-A', grant: 'tok-remote' }
+          { deviceId: 'dev-A', grant: 'tok-h1', host: 'u@h1' },
+          { deviceId: 'dev-A', grant: 'tok-h2', host: 'u@h2' }
         ],
+        grantHostFor: (nodeId) => ({ a: 'u@h2' })[nodeId],
         hostLabel: () => 'niova'
       })
       st.emit({ nodeId: 'a', event: 'start', state: 'working', ts: 1 })
+      st.emit({ nodeId: 'c', event: 'start', state: 'working', ts: 2 }) // unattributed → local
       await vi.advanceTimersByTimeAsync(1000)
-      expect(fetchMock).toHaveBeenCalledTimes(1)
-      expect(fetchMock.mock.calls[0][1].headers.authorization).toBe('Bearer tok-local')
+      const sent = fetchMock.mock.calls.map((c) => [
+        c[1].headers.authorization,
+        JSON.parse(c[1].body).updates.map((u: { nodeId: string }) => u.nodeId)
+      ])
+      expect(sent).toEqual(expect.arrayContaining([['Bearer tok-h2', ['a']], ['Bearer tok-local', ['c']]]))
+      expect(sent).toHaveLength(2)
       h.stop()
     })
 
@@ -1611,5 +1765,653 @@ describe('push payload ts is Unix MILLISECONDS (the mirror is the source)', () =
       _resetForTest()
       fs.rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+// ---- host key proof-of-possession: the hostAuth session (relay-pop.ts) ----------------------
+// A PoP-enabled backend latches a host once it has proven possession of its key, and from then on
+// refuses an unproven host-mode send (403 pop_required). The host proves once through
+// /v1/push/host-auth and attaches the session it gets (`hostAuth`) to notify and live-update.
+// Without a prover nothing changes: no challenge, no field (every test above runs that way).
+describe('host-mode push proves possession of the host key (hostAuth session)', () => {
+  const MIN = 60_000
+  const keys = nacl.box.keyPair()
+  const PUB = Buffer.from(keys.publicKey).toString('base64')
+  const PROVEN: PushHostIdentity = { ...IDENTITY, hostPublicKeyB64: PUB, prove: popProverFor(keys) }
+
+  type Init = { body: string; signal?: AbortSignal; headers: Record<string, string> }
+  type Answer = unknown | Promise<unknown>
+  type Route = (init: Init) => Answer
+  /** A real Response: the only kind a key-proof refusal check may read. */
+  const json = (status: number, body: unknown): Response => new Response(JSON.stringify(body), { status })
+  /** A bare answer with no clone()/json(): reading it throws, so a test using it pins "not read". */
+  const bare = (status: number): { ok: boolean; status: number } => ({ ok: status >= 200 && status < 300, status })
+
+  let pop: ReturnType<typeof createTestPopServer>
+  let sessions: number
+  const challengeOk: Route = (init) => json(200, pop.issue(JSON.parse(init.body).hostPublicKeyB64, 'push'))
+  /** The backend's /v1/push/host-auth: verify with purpose push + subject hostDeviceId, then a new session. */
+  const hostAuthOk: Route = (init) => {
+    const b = JSON.parse(init.body)
+    const proven = pop.verify({
+      hostPublicKeyB64: b.hostPublicKeyB64,
+      purpose: 'push',
+      subject: IDENTITY.hostDeviceId,
+      popChallenge: b.popChallenge,
+      popProof: b.popProof
+    })
+    return proven ? json(200, { hostAuth: `HA-${++sessions}`, exp: 0 }) : json(403, { error: 'pop_invalid' })
+  }
+
+  function route(r: { challenge?: Route; hostAuth?: Route; notify?: Route; live?: Route } = {}): void {
+    fetchMock = vi.fn(async (url: string, init: Init) => {
+      if (url.endsWith('/v1/relay/challenge')) return (r.challenge ?? challengeOk)(init)
+      if (url.endsWith('/v1/push/host-auth')) return (r.hostAuth ?? hostAuthOk)(init)
+      if (url.endsWith('/v1/push/notify')) return (r.notify ?? (() => bare(200)))(init)
+      if (url.endsWith('/v1/push/live-update')) return (r.live ?? (() => bare(200)))(init)
+      throw new Error(`unexpected fetch ${url}`)
+    })
+  }
+  const paths = (): string[] => fetchMock.mock.calls.map((c) => String(c[0]).replace('https://api.nodeterm.dev', ''))
+  const callsTo = (suffix: string): Array<[string, Init]> =>
+    fetchMock.mock.calls.filter((c) => String(c[0]).endsWith(suffix)) as Array<[string, Init]>
+  const bodyTo = (suffix: string, i = -1): Record<string, unknown> => JSON.parse(callsTo(suffix).at(i)![1].body)
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    clock = 0
+    sessions = 0
+    pop = createTestPopServer()
+    route()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  /** A notify service over PROVEN with a manual event source; `send` emits one event on a fresh node. */
+  function notify(over: Partial<PushNotifyDeps> = {}): { h: PushNotifyHandle; send: () => Promise<void> } {
+    const em = makeEmitter()
+    const h = createPushNotify(baseDeps({ subscribe: em.subscribe, getHostIdentity: () => PROVEN, ...over }))
+    let n = 0
+    return {
+      h,
+      async send() {
+        em.emit(iev({ nodeId: `n${++n}`, title: `t${n}` }))
+        await vi.advanceTimersByTimeAsync(2000)
+      }
+    }
+  }
+
+  it('first flush: challenge, host-auth, then the notify carrying the session', async () => {
+    const { h, send } = notify()
+    await send()
+    expect(paths()).toEqual(['/v1/relay/challenge', '/v1/push/host-auth', '/v1/push/notify'])
+    expect(bodyTo('/v1/relay/challenge')).toEqual({ hostPublicKeyB64: PUB, purpose: 'push' })
+    const auth = bodyTo('/v1/push/host-auth')
+    expect(Object.keys(auth).sort()).toEqual(['hostDeviceId', 'hostPublicKeyB64', 'popChallenge', 'popProof'])
+    expect(auth).toMatchObject({ hostDeviceId: 'host-device-1', hostPublicKeyB64: PUB })
+    const body = bodyTo('/v1/push/notify')
+    expect(body).toMatchObject({ hostDeviceId: 'host-device-1', hostPublicKeyB64: PUB, hostLabel: 'niova', hostAuth: 'HA-1' })
+    expect(body.events).toHaveLength(1)
+    h.stop()
+  })
+
+  it('a second flush inside 10 minutes reuses the session: ONE call, the notify', async () => {
+    const { h, send } = notify()
+    await send()
+    fetchMock.mockClear()
+    clock = 10 * MIN - 1
+    await send()
+    expect(paths()).toEqual(['/v1/push/notify'])
+    expect(bodyTo('/v1/push/notify').hostAuth).toBe('HA-1')
+    h.stop()
+  })
+
+  it('after 10 minutes on our own clock the flush proves again', async () => {
+    const { h, send } = notify()
+    await send()
+    fetchMock.mockClear()
+    clock = 10 * MIN
+    await send()
+    expect(paths()).toEqual(['/v1/relay/challenge', '/v1/push/host-auth', '/v1/push/notify'])
+    expect(bodyTo('/v1/push/notify').hostAuth).toBe('HA-2')
+    h.stop()
+  })
+
+  it.each(['pop_invalid', 'pop_required'])(
+    'a notify answered 403 %s clears the session: the next flush proves again',
+    async (error) => {
+      let n = 0
+      route({ notify: () => (++n === 1 ? json(403, { error }) : bare(200)) })
+      const { h, send } = notify()
+      await send()
+      fetchMock.mockClear()
+      clock = 6000
+      await send()
+      expect(paths()).toEqual(['/v1/relay/challenge', '/v1/push/host-auth', '/v1/push/notify'])
+      expect(bodyTo('/v1/push/notify').hostAuth).toBe('HA-2')
+      h.stop()
+    }
+  )
+
+  it('a 403 that is not a key-proof refusal (forbidden) keeps the session', async () => {
+    let n = 0
+    route({ notify: () => (++n === 1 ? json(403, { error: 'forbidden' }) : bare(200)) })
+    const { h, send } = notify()
+    await send()
+    fetchMock.mockClear()
+    clock = 6000
+    await send()
+    expect(paths()).toEqual(['/v1/push/notify'])
+    expect(bodyTo('/v1/push/notify').hostAuth).toBe('HA-1')
+    h.stop()
+  })
+
+  it.each<[string, { challenge?: Route; hostAuth?: Route }]>([
+    ['the challenge answering 503', { challenge: () => bare(503) }],
+    ['the challenge answering 500', { challenge: () => bare(500) }],
+    ['the challenge answering 429', { challenge: () => bare(429) }],
+    ['a challenge network error', { challenge: () => Promise.reject(new TypeError('fetch failed')) }],
+    ['a malformed challenge 200', { challenge: () => json(200, { nope: true }) }],
+    // A server key the proof cannot use: the all-zero key gives a degenerate shared secret.
+    ['a challenge with an unusable server key', { challenge: () => json(200, { challenge: 'c.x', serverPublicKeyB64: 'A'.repeat(43) + '=' }) }],
+    ['host-auth answering 503', { hostAuth: () => bare(503) }],
+    ['host-auth answering 429', { hostAuth: () => bare(429) }],
+    ['host-auth refusing the proof (403 pop_invalid)', { hostAuth: () => json(403, { error: 'pop_invalid' }) }],
+    ['host-auth refusing the host (403 forbidden)', { hostAuth: () => json(403, { error: 'forbidden' }) }],
+    ['a host-auth network error', { hostAuth: () => Promise.reject(new TypeError('fetch failed')) }],
+    ['a malformed host-auth 200', { hostAuth: () => json(200, { nope: true }) }],
+    // The backend reads an EMPTY hostAuth as present-but-invalid: it must never be sent.
+    ['a host-auth 200 with an empty session', { hostAuth: () => json(200, { hostAuth: '', exp: 0 }) }]
+  ])('%s drops the host notify for that batch (never an unproven send) and throws nothing', async (_label, r) => {
+    route(r)
+    const { h, send } = notify()
+    await expect(send()).resolves.toBeUndefined()
+    expect(callsTo('/v1/push/notify')).toHaveLength(0)
+    h.stop()
+  })
+
+  it('a dropped host leg does not drop the granted leg of the same flush', async () => {
+    route({ challenge: () => bare(503) })
+    const { h, send } = notify({ getGrants: () => [{ deviceId: 'dev-A', grant: 'tok-A' }] })
+    await send()
+    const sent = callsTo('/v1/push/notify')
+    expect(sent).toHaveLength(1)
+    expect(sent[0][1].headers.authorization).toBe('Bearer tok-A')
+    expect(JSON.parse(sent[0][1].body)).not.toHaveProperty('hostAuth')
+    h.stop()
+  })
+
+  it.each([404, 405])('an old backend (challenge %i) gets the legacy notify: no hostAuth field', async (status) => {
+    route({ challenge: () => bare(status) })
+    const { h, send } = notify()
+    await send()
+    expect(paths()).toEqual(['/v1/relay/challenge', '/v1/push/notify'])
+    expect(Object.keys(bodyTo('/v1/push/notify'))).toEqual(['hostDeviceId', 'hostPublicKeyB64', 'hostLabel', 'events'])
+    h.stop()
+  })
+
+  it('host-auth answering 404 (no session route) sends the legacy notify', async () => {
+    route({ hostAuth: () => bare(404) })
+    const { h, send } = notify()
+    await send()
+    expect(paths()).toEqual(['/v1/relay/challenge', '/v1/push/host-auth', '/v1/push/notify'])
+    expect(bodyTo('/v1/push/notify')).not.toHaveProperty('hostAuth')
+    h.stop()
+  })
+
+  it('an old backend is remembered: the next flush inside 10 minutes asks no challenge', async () => {
+    route({ challenge: () => bare(404) })
+    const { h, send } = notify()
+    await send()
+    fetchMock.mockClear()
+    clock = 6000
+    await send()
+    expect(paths()).toEqual(['/v1/push/notify'])
+    expect(bodyTo('/v1/push/notify')).not.toHaveProperty('hostAuth')
+    fetchMock.mockClear()
+    clock = 10 * MIN
+    await send()
+    expect(paths()).toEqual(['/v1/relay/challenge', '/v1/push/notify'])
+    h.stop()
+  })
+
+  it('a legacy notify answered 403 forgets the old-backend verdict: the next flush asks again and proves', async () => {
+    // A proxy answers the challenge 404 while the backend redeploys; the unproven notify lands on the
+    // fresh backend, which requires a proof from this latched host. That batch is only dropped, and
+    // the 403 is judged by its status alone (an unproven send's body is never read).
+    let redeploying = true
+    let n = 0
+    route({
+      challenge: (init) => (redeploying ? bare(404) : challengeOk(init)),
+      notify: () => (++n === 1 ? bare(403) : bare(200))
+    })
+    const { h, send } = notify()
+    await send()
+    expect(paths()).toEqual(['/v1/relay/challenge', '/v1/push/notify'])
+    redeploying = false
+    fetchMock.mockClear()
+    clock = 6000
+    await send()
+    expect(paths()).toEqual(['/v1/relay/challenge', '/v1/push/host-auth', '/v1/push/notify'])
+    expect(bodyTo('/v1/push/notify').hostAuth).toBe('HA-1')
+    h.stop()
+  })
+
+  it('without a prover nothing changes: no challenge, no hostAuth (byte-identical legacy)', async () => {
+    const { h, send } = notify({ getHostIdentity: () => ({ ...PROVEN, prove: undefined }) })
+    await send()
+    expect(paths()).toEqual(['/v1/push/notify'])
+    expect(Object.keys(bodyTo('/v1/push/notify'))).toEqual(['hostDeviceId', 'hostPublicKeyB64', 'hostLabel', 'events'])
+    h.stop()
+  })
+
+  it('a new host key (or device id) proves again instead of reusing the old session', async () => {
+    let id: PushHostIdentity = PROVEN
+    const { h, send } = notify({ getHostIdentity: () => id })
+    await send()
+    const rotated = nacl.box.keyPair()
+    id = { ...IDENTITY, hostPublicKeyB64: Buffer.from(rotated.publicKey).toString('base64'), prove: popProverFor(rotated) }
+    fetchMock.mockClear()
+    clock = 6000
+    await send()
+    expect(paths()).toEqual(['/v1/relay/challenge', '/v1/push/host-auth', '/v1/push/notify'])
+    expect(bodyTo('/v1/push/notify').hostAuth).toBe('HA-2')
+    h.stop()
+  })
+
+  it('a challenge that never answers is aborted by the 8 s post timeout: that batch is dropped', async () => {
+    route({
+      challenge: (init) =>
+        new Promise((_resolve, reject) => init.signal?.addEventListener('abort', () => reject(new Error('aborted'))))
+    })
+    const { h, send } = notify()
+    await send() // the flush starts at 2 s and waits on the challenge
+    await vi.advanceTimersByTimeAsync(7999)
+    expect(callsTo('/v1/relay/challenge')[0][1].signal?.aborted).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(callsTo('/v1/relay/challenge')[0][1].signal?.aborted).toBe(true)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(callsTo('/v1/push/host-auth')).toHaveLength(0)
+    expect(callsTo('/v1/push/notify')).toHaveLength(0)
+    h.stop()
+  })
+
+  it('ONE 8 s timer covers the challenge and the host-auth post (a slow challenge leaves it the rest)', async () => {
+    route({
+      challenge: (init) => new Promise((resolve) => setTimeout(() => resolve(challengeOk(init)), 5000)),
+      hostAuth: (init) =>
+        new Promise((_resolve, reject) => init.signal?.addEventListener('abort', () => reject(new Error('aborted'))))
+    })
+    const { h, send } = notify()
+    await send()
+    await vi.advanceTimersByTimeAsync(5000) // the challenge answers; host-auth now hangs
+    expect(callsTo('/v1/push/host-auth')).toHaveLength(1)
+    const signal = callsTo('/v1/push/host-auth')[0][1].signal
+    expect(signal).toBe(callsTo('/v1/relay/challenge')[0][1].signal)
+    await vi.advanceTimersByTimeAsync(2999)
+    expect(signal?.aborted).toBe(false)
+    await vi.advanceTimersByTimeAsync(1) // 8 s after the challenge went out, not 8 s after host-auth
+    expect(signal?.aborted).toBe(true)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(callsTo('/v1/push/notify')).toHaveLength(0)
+    h.stop()
+  })
+
+  it('failing proofs back off: a second failure in a row holds the next attempt for 5 s', async () => {
+    // Each attempt is a /v1/relay/challenge, whose per-IP budget the relay host-token mint shares.
+    let up = false
+    route({ challenge: (init) => (up ? challengeOk(init) : bare(503)) })
+    const { h, send } = notify()
+    await send() // t=2 s: failure 1, the next batch may try again at once
+    await send() // t=4 s: failure 2, nothing before t=9 s
+    expect(callsTo('/v1/relay/challenge')).toHaveLength(2)
+    up = true
+    clock = 4000
+    await send() // t=6 s: held — dropped without a request
+    expect(callsTo('/v1/relay/challenge')).toHaveLength(2)
+    expect(callsTo('/v1/push/notify')).toHaveLength(0)
+    clock = 9000
+    await send() // t=8 s on the timers, 9 s on the clock: tries, proves, sends
+    expect(callsTo('/v1/relay/challenge')).toHaveLength(3)
+    expect(bodyTo('/v1/push/notify').hostAuth).toBe('HA-1')
+    h.stop()
+  })
+
+  it('overlapping flushes share ONE proof in flight', async () => {
+    let answer: (() => void) | null = null
+    route({
+      challenge: (init) =>
+        new Promise((resolve) => {
+          answer = () => resolve(challengeOk(init))
+        })
+    })
+    const em = makeEmitter()
+    const h = createPushNotify(baseDeps({ subscribe: em.subscribe, getHostIdentity: () => PROVEN }))
+    for (let i = 0; i < 12; i++) em.emit(iev({ nodeId: `m${i}`, title: `t${i}` }))
+    await vi.advanceTimersByTimeAsync(2000) // flush A (10 events) waits on the challenge
+    await vi.advanceTimersByTimeAsync(2000) // flush B (2 events) starts while A still waits
+    expect(callsTo('/v1/relay/challenge')).toHaveLength(1)
+    answer!()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(callsTo('/v1/relay/challenge')).toHaveLength(1)
+    expect(callsTo('/v1/push/host-auth')).toHaveLength(1)
+    expect(callsTo('/v1/push/notify').map((c) => JSON.parse(c[1].body).hostAuth)).toEqual(['HA-1', 'HA-1'])
+    h.stop()
+  })
+
+  it('a backward wall-clock step never stretches the proof backoff: a healthy backend proves on the next call', async () => {
+    // The hold is an absolute wall-clock time. A clock stepped back a day would otherwise keep
+    // host-mode push held for that whole day; a hold farther out than the longest step is a clock
+    // step, never a backoff we set.
+    let up = false
+    route({ challenge: (init) => (up ? challengeOk(init) : bare(503)) })
+    const { h, send } = notify()
+    await send() // failure 1 (clock 0): the next attempt may go at once
+    await send() // failure 2: held until 5 s
+    clock = 5000
+    await send() // failure 3: held until 20 s
+    clock = 20_000
+    await send() // failure 4: held until 80 s, the longest step
+    expect(callsTo('/v1/relay/challenge')).toHaveLength(4)
+    up = true
+    await send() // same clock: a hold exactly one longest step out is honoured
+    expect(callsTo('/v1/relay/challenge')).toHaveLength(4)
+    expect(callsTo('/v1/push/notify')).toHaveLength(0)
+    clock = 20_000 - 24 * 60 * MIN // the wall clock steps back a day
+    await send()
+    expect(callsTo('/v1/relay/challenge')).toHaveLength(5)
+    expect(callsTo('/v1/push/notify')).toHaveLength(1)
+    expect(bodyTo('/v1/push/notify').hostAuth).toBe('HA-1')
+    h.stop()
+  })
+
+  it.each<[string, { challenge?: Route }, string | undefined, string | undefined]>([
+    ['session', {}, 'HA-1', 'HA-2'],
+    ['old-backend verdict', { challenge: () => bare(404) }, undefined, undefined]
+  ])(
+    'a backward wall-clock step expires a cached %s: the next get() proves again',
+    async (_label, r, first, second) => {
+      // A negative age is no evidence of freshness. Read as "fresh", a clock stepped back an hour kept
+      // the same session for that hour PLUS the 10 minutes, past the server's 15-minute TTL.
+      route(r)
+      const cache = createHostAuthCache({
+        apiBase: 'https://api.nodeterm.dev',
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        now: () => clock
+      })
+      clock = 60 * MIN
+      await expect(cache.get(PROVEN)).resolves.toBe(first)
+      expect(cache.onFile(PROVEN)).toBe(true)
+      clock = 0 // the wall clock steps back an hour
+      expect(cache.onFile(PROVEN)).toBe(false)
+      await expect(cache.get(PROVEN)).resolves.toBe(second)
+      expect(callsTo('/v1/relay/challenge')).toHaveLength(2)
+    }
+  )
+
+  it('a cached legacy verdict refused by a host latched elsewhere re-proves and re-posts in the SAME batch', async () => {
+    // The backend predated the proof when this sender asked, so it holds "legacy" for 10 minutes.
+    // Meanwhile the host latched through another path (the standing host's proven mint, or the
+    // other push stream), so the backend now refuses its unproven post (403 pop_required — judged by
+    // status alone: `bare` throws if the body is read). Re-proving at once keeps the batch.
+    let predates = true
+    let latched = false
+    route({
+      challenge: (init) => (predates ? bare(404) : challengeOk(init)),
+      notify: (init) => (latched && !JSON.parse(init.body).hostAuth ? bare(403) : bare(200))
+    })
+    const { h, send } = notify()
+    await send()
+    expect(paths()).toEqual(['/v1/relay/challenge', '/v1/push/notify'])
+    predates = false
+    latched = true
+    fetchMock.mockClear()
+    clock = 6000
+    await send()
+    expect(paths()).toEqual(['/v1/push/notify', '/v1/relay/challenge', '/v1/push/host-auth', '/v1/push/notify'])
+    const [first, again] = callsTo('/v1/push/notify').map((c) => JSON.parse(c[1].body))
+    expect(first).not.toHaveProperty('hostAuth')
+    expect(again).toEqual({ ...first, hostAuth: 'HA-1' })
+    // The next batch rides the new session: no second proof.
+    fetchMock.mockClear()
+    clock = 12_000
+    await send()
+    expect(paths()).toEqual(['/v1/push/notify'])
+    expect(bodyTo('/v1/push/notify').hostAuth).toBe('HA-1')
+    h.stop()
+  })
+
+  it('the re-post goes out ONCE: a refused re-post is not retried (never a loop)', async () => {
+    let predates = true
+    route({
+      challenge: (init) => (predates ? bare(404) : challengeOk(init)),
+      notify: (init) =>
+        predates ? bare(200) : JSON.parse(init.body).hostAuth ? json(403, { error: 'pop_invalid' }) : bare(403)
+    })
+    const { h, send } = notify()
+    await send()
+    predates = false
+    fetchMock.mockClear()
+    clock = 6000
+    await send()
+    expect(paths()).toEqual(['/v1/push/notify', '/v1/relay/challenge', '/v1/push/host-auth', '/v1/push/notify'])
+    // The re-post's pop_invalid clears the session as any proven post's does: the next batch
+    // proves again, and a proven post's refusal is never re-posted.
+    fetchMock.mockClear()
+    clock = 12_000
+    await send()
+    expect(paths()).toEqual(['/v1/relay/challenge', '/v1/push/host-auth', '/v1/push/notify'])
+    h.stop()
+  })
+
+  it('a re-proof that fails drops the batch: no unproven re-post', async () => {
+    let predates = true
+    route({
+      challenge: (init) => (predates ? bare(404) : bare(503)),
+      notify: (init) => (predates || JSON.parse(init.body).hostAuth ? bare(200) : bare(403))
+    })
+    const { h, send } = notify()
+    await send()
+    predates = false
+    fetchMock.mockClear()
+    clock = 6000
+    await send()
+    expect(paths()).toEqual(['/v1/push/notify', '/v1/relay/challenge'])
+    h.stop()
+  })
+
+  it('an old backend that refuses every host notify (403 forbidden) costs challenge + notify per batch, never a third request', async () => {
+    // The verdict each batch posts under was asked for in that same batch, so a 403 is no sign the
+    // host latched since: nothing is re-asked, and the batch stays at two requests. That is one more
+    // than before the proof existed (notify alone), because each refused post forgets the verdict.
+    route({ challenge: () => bare(404), notify: () => bare(403) })
+    const { h, send } = notify()
+    for (let i = 1; i <= 3; i++) {
+      fetchMock.mockClear()
+      clock = i * 6000
+      await send()
+      expect(paths()).toEqual(['/v1/relay/challenge', '/v1/push/notify'])
+    }
+    h.stop()
+  })
+
+  it('a cached legacy verdict refused while the backend still predates the proof: one re-ask, no re-post', async () => {
+    let n = 0
+    route({ challenge: () => bare(404), notify: () => (++n === 1 ? bare(200) : bare(403)) })
+    const { h, send } = notify()
+    await send()
+    expect(paths()).toEqual(['/v1/relay/challenge', '/v1/push/notify'])
+    // The re-ask caches the verdict again, so each later batch is the notify plus one challenge:
+    // the two requests a batch cost before, in the other order.
+    for (let i = 1; i <= 2; i++) {
+      fetchMock.mockClear()
+      clock = i * 6000
+      await send()
+      expect(paths()).toEqual(['/v1/push/notify', '/v1/relay/challenge'])
+    }
+    h.stop()
+  })
+
+  it.each(['challenge', 'host-auth'] as const)(
+    'a %s answer that throws when read: get() resolves drop (never rejects) and backs off like any failure',
+    async (leg) => {
+      let fail = true
+      // `bare` has no json(): reading it throws inside the proof.
+      const broken = (ok: Route): Route => (init) => (fail ? bare(200) : ok(init))
+      route(leg === 'challenge' ? { challenge: broken(challengeOk) } : { hostAuth: broken(hostAuthOk) })
+      const cache = createHostAuthCache({
+        apiBase: 'https://api.nodeterm.dev',
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        now: () => clock
+      })
+      await expect(cache.get(PROVEN)).resolves.toBe('drop') // failure 1: the next may go at once
+      await expect(cache.get(PROVEN)).resolves.toBe('drop') // failure 2: nothing before 5 s
+      fail = false
+      const asked = callsTo('/v1/relay/challenge').length
+      await expect(cache.get(PROVEN)).resolves.toBe('drop') // held: no request
+      expect(callsTo('/v1/relay/challenge')).toHaveLength(asked)
+      clock = 5000
+      await expect(cache.get(PROVEN)).resolves.toBe('HA-1')
+    }
+  )
+
+  it('a proof that throws resolves drop for EVERY caller sharing it', async () => {
+    let answer: (() => void) | null = null
+    route({
+      hostAuth: () =>
+        new Promise((resolve) => {
+          answer = () => resolve(bare(200)) // no json(): reading it throws
+        })
+    })
+    const cache = createHostAuthCache({
+      apiBase: 'https://api.nodeterm.dev',
+      fetchImpl: fetchMock as unknown as typeof fetch,
+      now: () => clock
+    })
+    const first = cache.get(PROVEN)
+    const joined = cache.get(PROVEN)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(callsTo('/v1/push/host-auth')).toHaveLength(1)
+    answer!()
+    await expect(Promise.all([first, joined])).resolves.toEqual(['drop', 'drop'])
+  })
+
+  it('a throwing proof inside a flush drops only that batch: the flush resolves', async () => {
+    route({ hostAuth: () => bare(200) })
+    const em = makeEmitter()
+    const h = createPushNotify(baseDeps({ subscribe: em.subscribe, getHostIdentity: () => PROVEN }))
+    em.emit(iev({ nodeId: 'x', title: 'x' }))
+    await expect(h._flushNow()).resolves.toBeUndefined()
+    expect(callsTo('/v1/push/host-auth')).toHaveLength(1)
+    expect(callsTo('/v1/push/notify')).toHaveLength(0)
+    h.stop()
+  })
+
+  describe('live-update', () => {
+    function live(): { h: LiveUpdateHandle; edge: (nodeId: string) => Promise<void> } {
+      const st = emitter<NodeStateChange>()
+      const h = createLiveUpdatePush({
+        subscribeStateChange: st.subscribe,
+        subscribeNowChange: () => () => {},
+        getHostIdentity: () => PROVEN,
+        mobilePushEnabled: () => true,
+        mobileLiveActivities: () => true,
+        isPackaged: () => true,
+        env: {},
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        now: () => clock,
+        batchWindowMs: 1000
+      })
+      return {
+        h,
+        async edge(nodeId) {
+          st.emit({ nodeId, event: 'start', state: 'working', ts: clock })
+          await vi.advanceTimersByTimeAsync(1000)
+        }
+      }
+    }
+
+    it('proves once and carries the cached session on every post', async () => {
+      const { h, edge } = live()
+      await edge('a')
+      expect(paths()).toEqual(['/v1/relay/challenge', '/v1/push/host-auth', '/v1/push/live-update'])
+      expect(bodyTo('/v1/push/live-update')).toMatchObject({ hostPublicKeyB64: PUB, hostAuth: 'HA-1' })
+      fetchMock.mockClear()
+      clock = 9 * MIN
+      await edge('b')
+      expect(paths()).toEqual(['/v1/push/live-update'])
+      expect(bodyTo('/v1/push/live-update').hostAuth).toBe('HA-1')
+      h.stop()
+    })
+
+    it('a live-update answered 403 pop_invalid clears the session; a transient challenge drops the batch', async () => {
+      let n = 0
+      let challengeUp = true
+      route({
+        challenge: (init) => (challengeUp ? challengeOk(init) : bare(503)),
+        live: () => (++n === 1 ? json(403, { error: 'pop_invalid' }) : bare(200))
+      })
+      const { h, edge } = live()
+      await edge('a')
+      challengeUp = false
+      fetchMock.mockClear()
+      await edge('b') // must prove again, cannot, and so sends nothing
+      expect(paths()).toEqual(['/v1/relay/challenge'])
+      challengeUp = true
+      fetchMock.mockClear()
+      await edge('c')
+      expect(paths()).toEqual(['/v1/relay/challenge', '/v1/push/host-auth', '/v1/push/live-update'])
+      expect(bodyTo('/v1/push/live-update').hostAuth).toBe('HA-2')
+      h.stop()
+    })
+
+    it('notify proving latches the host; live-update\'s cached legacy verdict re-proves in the same batch', async () => {
+      // "Latched elsewhere" through the other push stream: each stream caches its own verdict.
+      let predates = true
+      let latched = false
+      const refuseUnproven: Route = (init) => (latched && !JSON.parse(init.body).hostAuth ? bare(403) : bare(200))
+      route({
+        challenge: (init) => (predates ? bare(404) : challengeOk(init)),
+        hostAuth: (init) => {
+          latched = true
+          return hostAuthOk(init)
+        },
+        notify: refuseUnproven,
+        live: refuseUnproven
+      })
+      const n = notify()
+      const l = live()
+      await n.send() // notify caches "legacy" at 0
+      clock = 5 * MIN
+      await l.edge('a') // live-update caches "legacy" at 5 min
+      predates = false
+      clock = 10 * MIN
+      await n.send() // notify's verdict has expired: it proves, and the backend latches the host
+      expect(bodyTo('/v1/push/notify').hostAuth).toBe('HA-1')
+      fetchMock.mockClear()
+      await l.edge('b') // live-update's 5-minute-old legacy verdict is refused
+      expect(paths()).toEqual([
+        '/v1/push/live-update',
+        '/v1/relay/challenge',
+        '/v1/push/host-auth',
+        '/v1/push/live-update'
+      ])
+      expect(bodyTo('/v1/push/live-update').hostAuth).toBe('HA-2')
+      n.h.stop()
+      l.h.stop()
+    })
+
+    it('its session is its own: notify proving does not stand in for live-update', async () => {
+      const n = notify()
+      const l = live()
+      await n.send()
+      await l.edge('a')
+      expect(callsTo('/v1/push/host-auth')).toHaveLength(2)
+      expect(bodyTo('/v1/push/notify').hostAuth).toBe('HA-1')
+      expect(bodyTo('/v1/push/live-update').hostAuth).toBe('HA-2')
+      n.h.stop()
+      l.h.stop()
+    })
   })
 })

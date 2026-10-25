@@ -192,7 +192,7 @@ tab).
 ### Trust (4d — scoped to the crypto/pairing layer)
 
 - The peer's device key becomes **persistent** (today the client key is ephemeral)
-  and is **pinned on both ends**; SAS (6-digit) is verified **mutually**.
+  and is **pinned on both ends**; SAS (10-digit v2; a v1 peer shows the first six) is verified **mutually**.
 - Revocation is a first-class action (facepile avatar → "Remove"): it unpins the key
   **and kills the live session** — closes the relay connection, drops the peer's pty
   subscriptions, leaves presence. Unpinning alone would leave the peer connected.
@@ -237,7 +237,7 @@ function confirmLocal(s: MutualApproval): MutualApproval
 function confirmRemote(s: MutualApproval): MutualApproval
 function isMutuallyApproved(s: MutualApproval): boolean
 function recordApproval(store: ApprovedDevices, s: MutualApproval): ApprovedDevices   // pins s.peerKeyB64 only when both confirmed
-function mutualSas(shared: Uint8Array): string                                        // "NNN NNN"; alias of sasFromSharedKey
+function mutualSas(shared: Uint8Array): string                                        // "NNN NNN NNNN"; alias of sasFromSharedKey
 ```
 
 Flow: `emptyMutualApproval(peerKeyB64, sessionId)` → `confirmLocal` on this human's SAS
@@ -473,6 +473,28 @@ made the **host listener** multi-peer and packaged it.
 - **Follow-up:** a seat row shows the invite email + generic connected/pending state; joining a seat
   to its presence name/color (different id spaces — renderer UUID vs ClientId) is deferred.
 
+## Hosted team relay (a Server Edition as the host)
+
+Decision 1's asymmetry ("if the host sleeps, the peer's world freezes") now has an answer for a
+team that can run a Server Edition: that core is the relay host, and the sharer's laptop can be
+off. Operator guide, roles and limitations: **`docs/hosted-team-relay.md`**. What it changed here:
+
+- **The relay moved to core.** `e2ee`, `relay-socket`, the trust gate, `relay-host`, `relay-client`
+  and the rest live in `src/core/relay/`; `src/main/remote/` keeps re-export shims and the desktop's
+  own wrappers. `connectRelayHost` gained injected seams (`PeerAttach`, `PinStore`, `autoApprove`,
+  `RelayHostHooks`, `deny()`). Team Access passes no hooks and takes the unhooked path, unchanged.
+- **A standing host on the tunnel dialect now exists in core**: `hosted-scheduler.ts` (one warm
+  idle listener, refreshed against the token's server-clock expiry, with a backoff that resets only
+  on proof the relay works or on a fresh start), driven by `hosted-service.ts`. It is the
+  host-side mechanism the iOS tunnel migration below needs. The desktop's own phone host
+  (`standing-host.ts`) is still on the old dialect; rebuilding it on this scheduler is the
+  remaining desktop step.
+- **Roles exist, for hosted peers only.** Viewer, Commenter, Editor and Owner are enforced in the
+  host core (`core/relay/access-policy.ts`). A Team Access peer is still fully trusted (decision 2).
+- **The bookmark follow-up is partly closed, for hosted teams only.** A joined team is bookmarked
+  (`<userData>/relay-bookmarks.json`) and reconnects at boot with no new code, but the tab itself
+  is still not persisted: it appears once the reconnect is approved.
+
 ## 4a → 4c interface (landed)
 
 The session layer lives in `src/renderer/session/` (`session.ts` + `localSession.ts`).
@@ -564,7 +586,7 @@ session):
   `/tmp/nt-B`). Then:
   1. On A, start a remote host (New Remote Connection → host), **pick which project to share**
      (default = active), and copy the pairing offer.
-  2. On B, paste the offer → both show the **same 6-digit SAS** → B sees the **ConsentNotice**
+  2. On B, paste the offer → both show the **same 10-digit SAS** → B sees the **ConsentNotice**
      on A's approval → confirm on both → the **shared project opens as a tab on B, already
      populated with A's nodes** (NOT a blank canvas — this is the project-scope check). B sees ONLY
      the shared project, not A's other projects.

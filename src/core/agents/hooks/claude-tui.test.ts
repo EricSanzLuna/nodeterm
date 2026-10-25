@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { mkdtempSync, readFileSync, writeFileSync, existsSync } from 'fs'
-import { tmpdir } from 'os'
+import { readFileSync, writeFileSync, existsSync } from 'fs'
 import path from 'path'
 import { ensureFullscreenTui, ensureFullscreenTuiInFile, TUI_FULLSCREEN } from './claude-tui'
+import { testTmpDir } from '../../test-tmp'
 
 describe('ensureFullscreenTui (pure)', () => {
   it('writes tui=fullscreen when the key is absent', () => {
@@ -32,7 +32,7 @@ describe('ensureFullscreenTui (pure)', () => {
 })
 
 describe('ensureFullscreenTuiInFile (fail-open file wrapper)', () => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'nt-tui-'))
+  const dir = testTmpDir('nt-tui-')
 
   it('creates the key in a missing file (parents made, valid JSON written)', () => {
     const p = path.join(dir, 'nested', 'settings.json')
@@ -68,7 +68,7 @@ describe('ensureFullscreenTuiInFile (fail-open file wrapper)', () => {
     expect(readFileSync(p, 'utf8')).toBe('{ not json')
   })
 
-  it('an empty file is treated as {} and gets the key', () => {
+  it('initializes a successfully read empty file' , () => {
     const p = path.join(dir, 'empty.json')
     writeFileSync(p, '', 'utf8')
     expect(ensureFullscreenTuiInFile(p)).toBe(true)

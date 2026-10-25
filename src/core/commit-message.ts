@@ -4,8 +4,9 @@ import os from 'os'
 import path from 'path'
 import { promisify } from 'util'
 import type { GitResult, Settings } from '../shared/types'
-import { findInPathString, shellPathNow } from './exec-path'
+import { directExecutableInvocation, findInPathString, shellPathNow } from './exec-path'
 import { resolveGitRemote, runRemoteGit } from './remote-ssh/remote-git'
+import { AUTH_ENV_STRIP } from './claude-accounts-core'
 
 const run = promisify(execFile)
 
@@ -148,17 +149,70 @@ interface Plan {
   bin: string
   args: string[]
   stdin: string | null
+  /** Removes what the plan created ({promptFile}'s temp dir); call once the agent has exited. */
+  cleanup?: () => void
 }
 
-function planAgent(settings: Settings, prompt: string): Plan | { error: string } {
+/** CreateProcess caps the whole command line at 32,767 UTF-16 units; keep headroom for quoting. */
+const WIN_CMDLINE_MAX = 32_000
+
+/** A Windows command line's length for `bin args…` as libuv quotes it: each element wrapped in
+ *  quotes, every `"` and `\` possibly escaped — an upper bound, which is what a refusal needs. */
+function winCommandLineLength(bin: string, args: string[]): number {
+  const quoted = (a: string) => a.length + 3 + (a.match(/["\\]/g)?.length ?? 0)
+  return [bin, ...args].reduce((n, a) => n + quoted(a), 0)
+}
+
+/** Why a `{prompt}` plan cannot work on Windows — said up front, instead of the spawn failing with
+ *  "Cannot safely execute Windows script" or a raw ENAMETOOLONG. */
+export const WINDOWS_INLINE_PROMPT_ERROR =
+  'On Windows this command cannot receive a multi-line prompt as an argument (npm .cmd shim / command-line length limit). Remove {prompt} to send it on stdin, or use {promptFile}.'
+
+export interface PlanAgentOptions {
+  /** The platform to plan for (default `os.platform()`). */
+  platform?: NodeJS.Platform
+  /** Where {promptFile}'s private temp dir is made (default `os.tmpdir()`). */
+  tmpDir?: string
+}
+
+/** Exported for tests only. */
+export function planAgent(settings: Settings, prompt: string, opts: PlanAgentOptions = {}): Plan | { error: string } {
+  const platform = opts.platform ?? os.platform()
   if (settings.commitAgent === 'custom') {
     const tokens = tokenize(settings.commitAgentCommand)
     if (tokens.length === 0) return { error: 'No custom commit command set (Settings → Commit messages).' }
     const bin = resolveBinary(tokens[0])
     if (!bin) return { error: `Command "${tokens[0]}" not found.` }
     const rest = tokens.slice(1)
+    const inlineRefused = (args: string[]): boolean =>
+      platform === 'win32' &&
+      rest.includes('{prompt}') &&
+      (directExecutableInvocation(bin, args, { platform }) === null || winCommandLineLength(bin, args) > WIN_CMDLINE_MAX)
+    if (rest.includes('{promptFile}')) {
+      // The prompt as a FILE PATH: no argv quoting, no shim line-break refusal, no length limit —
+      // the one inline form that works for every CLI on every platform. A private dir per run
+      // (mkdtemp is 0700 on POSIX; Windows' per-user %TEMP% is already private), removed by
+      // `cleanup` after the agent exits.
+      const dir = fs.mkdtempSync(path.join(opts.tmpDir ?? os.tmpdir(), 'nt-prompt-'))
+      const file = path.join(dir, 'prompt.txt')
+      try {
+        fs.writeFileSync(file, prompt, { mode: 0o600 })
+      } catch (e) {
+        fs.rmSync(dir, { recursive: true, force: true })
+        return { error: `Could not write the prompt file: ${(e as Error).message}` }
+      }
+      const cleanup = () => fs.rmSync(dir, { recursive: true, force: true })
+      const args = rest.map((t) => (t === '{promptFile}' ? file : t === '{prompt}' ? prompt : t))
+      if (inlineRefused(args)) {
+        cleanup()
+        return { error: WINDOWS_INLINE_PROMPT_ERROR }
+      }
+      return { bin, args, stdin: null, cleanup }
+    }
     if (rest.includes('{prompt}')) {
-      return { bin, args: rest.map((t) => (t === '{prompt}' ? prompt : t)), stdin: null }
+      const args = rest.map((t) => (t === '{prompt}' ? prompt : t))
+      if (inlineRefused(args)) return { error: WINDOWS_INLINE_PROMPT_ERROR }
+      return { bin, args, stdin: null }
     }
     return { bin, args: rest, stdin: prompt }
   }
@@ -176,12 +230,20 @@ function spawnAgent(
   bin: string,
   args: string[],
   cwd: string,
-  stdin: string | null
+  stdin: string | null,
+  env: NodeJS.ProcessEnv = process.env
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const child = spawn(bin, args, {
+    const invocation = directExecutableInvocation(bin, args)
+    if (!invocation) {
+      resolve({ code: 1, stdout: '', stderr: `Cannot safely execute Windows script: ${bin}` })
+      return
+    }
+
+    const child = spawn(invocation.executable, invocation.args, {
+      ...invocation.options,
       cwd,
-      env: process.env,
+      env,
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true
     })
@@ -279,15 +341,51 @@ export function localAgentCwd(cwd: string, isRemote: boolean, home: string): str
   return !cwd || isRemote ? home : cwd
 }
 
+/**
+ * The env for running an agent under a managed Claude account: `CLAUDE_CONFIG_DIR` points at the
+ * account's dir and the auth vars that would shadow its OAuth login are stripped — the same two
+ * moves `PtyManager` makes for the node's own session, so a one-shot request goes out as the same
+ * identity the node runs as.
+ */
+export function claudeAccountEnv(base: NodeJS.ProcessEnv, configDir: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base, CLAUDE_CONFIG_DIR: configDir }
+  for (const k of AUTH_ENV_STRIP) delete env[k]
+  return env
+}
+
+/**
+ * A CLI error printed where the answer should be. `claude -p` writes "Failed to authenticate: …" /
+ * "Invalid API key …" / "API Error: …" to STDOUT, so the exit code alone is not enough evidence —
+ * and treating that line as the answer is how a node ended up titled "Failed to authenticate: OAuth s…".
+ */
+const CLI_ERROR_OUTPUT =
+  /^(failed to authenticate|invalid api key|api error|error:|oauth token|authentication_error|please run \/login|credit balance is too low)/i
+
+export function isCliErrorOutput(message: string): boolean {
+  return CLI_ERROR_OUTPUT.test(message.trim())
+}
+
 /** Plan + spawn the configured agent on a prompt and return its cleaned output. */
-export async function runAgent(prompt: string, cwd: string, settings: Settings): Promise<GitResult> {
+export async function runAgent(
+  prompt: string,
+  cwd: string,
+  settings: Settings,
+  env?: NodeJS.ProcessEnv
+): Promise<GitResult> {
   const plan = planAgent(settings, prompt)
   if ('error' in plan) return { ok: false, message: plan.error }
 
   const spawnCwd = localAgentCwd(cwd, !!resolveGitRemote(cwd), os.homedir())
-  const res = await spawnAgent(plan.bin, plan.args, spawnCwd, plan.stdin)
+  let res: Awaited<ReturnType<typeof spawnAgent>>
+  try {
+    res = await spawnAgent(plan.bin, plan.args, spawnCwd, plan.stdin, env)
+  } finally {
+    plan.cleanup?.()
+  }
   const message = cleanMessage(res.stdout)
-  if (res.code !== 0 && !message) {
+  // A nonzero exit is a failure even when stdout has text: that text is the CLI's error message,
+  // never an answer. Same for a known error line on a zero exit.
+  if (res.code !== 0 || isCliErrorOutput(message)) {
     return { ok: false, message: extractError(res.stderr || res.stdout) }
   }
   if (!message) return { ok: false, message: 'Agent produced no output.' }
@@ -298,7 +396,8 @@ export async function runAgent(prompt: string, cwd: string, settings: Settings):
 export async function generateTerminalName(
   content: string,
   cwd: string,
-  settings: Settings
+  settings: Settings,
+  env?: NodeJS.ProcessEnv
 ): Promise<GitResult> {
   const trimmed = content.trim()
   if (!trimmed) return { ok: false, message: 'No terminal output to read yet.' }
@@ -309,7 +408,7 @@ Terminal output:
 \`\`\`
 ${clip}
 \`\`\``
-  const r = await runAgent(prompt, cwd, settings)
+  const r = await runAgent(prompt, cwd, settings, env)
   if (!r.ok) return r
   const name = r.message
     .split('\n')[0]

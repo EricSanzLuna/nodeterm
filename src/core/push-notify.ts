@@ -14,6 +14,7 @@
 
 import type { InboxEvent, NodeStateChange, NodeNowChange } from './agent-status-mirror'
 import type { PushGrant } from './push-grants'
+import { fetchPopChallenge, popRefusalOf, type PopProver } from './relay/relay-pop'
 
 const DEFAULT_API_BASE = 'https://api.nodeterm.dev'
 // Batch actionable events landing close together into one POST (≤10 events/call per the contract).
@@ -41,11 +42,17 @@ export interface PushHostIdentity {
   hostPublicKeyB64: string
   hostLabel: string
   hasPairedPhone: boolean
+  /** Proves possession of the host key for a PoP-enabled backend (relay-pop.ts). The secret stays in
+   *  the prover's closure; absent ⇒ host-mode push stays legacy. */
+  prove?: PopProver
 }
 
 /** The per-event body the backend `/v1/push/notify` expects (a subset of InboxEvent). */
 export interface PushNotifyEvent {
   kind: 'approval' | 'question' | 'done'
+  /** The mirror inbox event id (`InboxEvent.id`, `${ts}-${seq}`), so a phone can claim the exact
+   *  Inbox card. The backend forwards it to FCM only; the APNs payload never carries it. */
+  eventId?: string
   title: string
   detail?: string
   nodeId: string
@@ -86,22 +93,49 @@ interface SendTarget {
 }
 
 /**
- * One POST per DEVICE, not per grant FILE.
+ * One POST per (host, device), not per grant FILE.
  *
  * `src/main`'s `allPushGrants` concatenates this machine's `~/.nodeterm/push-grants` with a sweep of
- * every connected SSH host, and one phone that reached two of them dropped a DIFFERENT token on
- * each — so the same `deviceId` can appear twice in the merged list and would earn that phone two
- * notifications for one event. (`remote-push-grants`'s cache dedupes only within its own half.)
- * First occurrence wins, which is why main puts the local grants first; a 401/403 on the survivor
- * marks it dead and the next send promotes the other, the same self-healing the remote cache does.
+ * every connected SSH host, so one phone that reached several of them appears several times — once
+ * per host, with a DIFFERENT token each time. Those are not duplicates: each token is signed for
+ * the phone's connectionId for THAT host, which is also the scope its per-host mute is keyed by.
+ * This used to collapse them per deviceId ("first occurrence wins") and post every event under the
+ * survivor, so host B's events went out under host A's grant and the backend consulted A's mute for
+ * a B event — a host the user had turned OFF kept ringing the phone (issue #435). Events are now
+ * routed per host (`grantsFor` / `groupByGrantHost`); within one host a device has exactly one file
+ * (the filename is the deviceId), so the first-wins here is defensive only.
  */
-function dedupeGrantsByDevice(grants: readonly PushGrant[]): PushGrant[] {
+function dedupeGrants(grants: readonly PushGrant[]): PushGrant[] {
   const seen = new Set<string>()
   const out: PushGrant[] = []
   for (const g of grants) {
-    if (seen.has(g.deviceId)) continue
-    seen.add(g.deviceId)
+    const key = `${g.host ?? ''}\u0000${g.deviceId}`
+    if (seen.has(key)) continue
+    seen.add(key)
     out.push(g)
+  }
+  return out
+}
+
+/** The grants that may carry an event about `host` (undefined = a node on THIS machine): exactly
+ *  the ones swept from that host. A grant dropped here never carries a remote node's event, and a
+ *  remote host's grant never carries another host's — the phone signed each for one host. */
+function grantsFor(grants: readonly PushGrant[], host: string | undefined): PushGrant[] {
+  return grants.filter((g) => (g.host ?? undefined) === host)
+}
+
+/** Bucket a batch by the host each item's node lives on. Without a `hostOf` resolver (the Server
+ *  Edition: one machine, its own grant dir) everything is local — one bucket, the legacy fan-out. */
+function groupByGrantHost<T extends { nodeId: string }>(
+  items: readonly T[],
+  hostOf: ((nodeId: string) => string | undefined) | undefined
+): Map<string | undefined, T[]> {
+  const out = new Map<string | undefined, T[]>()
+  for (const it of items) {
+    const host = hostOf ? hostOf(it.nodeId) : undefined
+    const bucket = out.get(host)
+    if (bucket) bucket.push(it)
+    else out.set(host, [it])
   }
   return out
 }
@@ -121,7 +155,7 @@ function dedupeGrantsByDevice(grants: readonly PushGrant[]): PushGrant[] {
  *
  * The correct exclusion is per DEVICE, and this process cannot express it: a `PushGrant` is keyed by
  * the phone's `deviceId` (the grant filename), while the relay-paired registry
- * (`remote-approved-devices.json`, read by `loadApprovedDevices`) stores nothing but base64 NaCl box
+ * (`remote-approved-phones.json`, read by `phonePins.load`) stores nothing but base64 NaCl box
  * PUBLIC KEYS — and this service is only told `hasPairedPhone: boolean` in the first place. The two
  * identifiers never meet on the desktop: the phone's own deviceId is seen exactly once, transiently,
  * during a LAN QR pair (`pairing-service.ts`'s `phoneDeviceId`, spent on the `/v1/relay/device` mint
@@ -134,6 +168,12 @@ function dedupeGrantsByDevice(grants: readonly PushGrant[]): PushGrant[] {
  * knowable — either the backend does it (it sees the relay device row AND the grant's deviceId, so
  * it is the only party holding both halves) or the desktop starts persisting the phone's deviceId
  * beside its pinned pubkey at pair time. Both are protocol changes, not a filter we can add here.
+ *
+ * **The grants are the whole list, tagged by host — the SPLIT happens at send time.** The relay leg
+ * carries every event under this machine's identity (the backend has no other host identity to
+ * check a per-host mute against — see the known gap in the PR). The granted leg is per host: each
+ * event goes only under the grants swept from the host its node lives on (`grantHostFor`), because
+ * a grant is signed for that one host's connectionId and the phone's mute is keyed by exactly that.
  */
 function resolveSendTarget(
   getHostIdentity: () => PushHostIdentity | null,
@@ -142,7 +182,7 @@ function resolveSendTarget(
   const id = getHostIdentity()
   // The paired-phone gate is host-mode only — a grant IS the phone's opt-in.
   const host = id && id.hasPairedPhone ? id : null
-  const grants = dedupeGrantsByDevice(getGrants?.() ?? [])
+  const grants = dedupeGrants(getGrants?.() ?? [])
   if (!host && grants.length === 0) return null
   return { host, grants }
 }
@@ -176,6 +216,222 @@ async function postJson(
   }
 }
 
+// ---- Host-mode proof of possession: the hostAuth session ------------------------------------
+// A PoP-enabled backend latches a host the first time it proves it holds its key, and from then on
+// refuses an unproven host-mode notify or live-update (403 pop_required). The host proves once —
+// `/v1/relay/challenge` (purpose `push`) then `POST /v1/push/host-auth` — and attaches the session it
+// gets (`hostAuth`) to every host-mode post until it re-proves. Push never stops anything, so nothing
+// here is terminal: a batch that cannot be proven is DROPPED, exactly like a network error, because an
+// unproven send from a latched host is refused anyway. Only a challenge answered 404/405 means "this
+// backend predates the proof" (relay-pop.ts), and only then does the post go out legacy — with ONE
+// exception, push's own: a 200 challenge whose host-auth post answers 404 (see `establish`), cached for
+// 10 minutes like the 404/405 verdict. One backend registers both routes or neither, so that answer
+// comes only from a redeploy window; push stops nothing, and the backend gates the unproven post
+// regardless (a latched host's is refused, which forgets the verdict — see postHostMode).
+
+// The server's session TTL is 15 min; re-prove on OUR clock, well inside it, so a skewed clock or a
+// long batch window never presents an expired session.
+const HOST_AUTH_REPROVE_MS = 10 * 60_000
+// Earliest next proving attempt after the Nth failure in a row (the last entry repeats). The first
+// retry is free — a blip costs one batch, not the next minute — but a backend that keeps refusing
+// (no live pairing, a proof it never accepts, its own 429) is asked once a minute, not once a batch:
+// the live-update stream flushes up to once a second, and every attempt spends the per-IP
+// /v1/relay/challenge budget the relay host-token mint needs too.
+const HOST_AUTH_RETRY_MS = [0, 5_000, 15_000, 60_000]
+// The hold is an absolute WALL-clock time, on purpose: the 10-minute session age above must keep
+// advancing across a sleep, which a monotonic clock does not. So a hold farther out than the longest
+// step can only be a clock that stepped BACK after it was set, and it is ignored — honouring it would
+// hold host-mode push for the whole step (a day, for a day's step).
+const HOST_AUTH_RETRY_MAX_MS = Math.max(...HOST_AUTH_RETRY_MS)
+
+export interface HostAuthCache {
+  /** The session token to attach, undefined for legacy (no prover, or an old backend), or 'drop'
+   *  when a failure means this batch must not go out unproven. Never '' — the backend reads an
+   *  empty `hostAuth` as present-but-invalid. Never rejects: a proof that throws is a failure like
+   *  any other ('drop', and the backoff). */
+  get(identity: PushHostIdentity): Promise<string | undefined | 'drop'>
+  /** Whether `get` would answer from the cache right now, without asking the backend. */
+  onFile(identity: PushHostIdentity): boolean
+  /** Forget the session (or the old-backend verdict): the next batch proves again. */
+  invalidate(): void
+}
+
+/**
+ * One hostAuth session per sender (notify and live-update each own one: they are independent streams
+ * and each re-proves at most every 10 minutes). The "old backend" verdict is cached the same way, so
+ * a backend without the routes that ACCEPTS the host's posts costs one challenge per 10 minutes rather
+ * than one per batch. One that refuses them (403 forbidden: no live pairing) costs a challenge on every
+ * batch, because each refused unproven post forgets the verdict (postHostMode) — one request per batch
+ * more than before the proof existed, until the backend with the proof is deployed and its host-auth
+ * `forbidden` is backed off instead. The
+ * challenge, the host-auth post and its body read share ONE `FETCH_TIMEOUT_MS` timer: nothing else
+ * bounds a stalled challenge, and the batch waits on it. Concurrent `get`s share the proof in flight.
+ */
+export function createHostAuthCache(d: { apiBase: string; fetchImpl: typeof fetch; now: () => number }): HostAuthCache {
+  // token undefined = the backend predates the proof (challenge 404/405, or no host-auth route).
+  let cached: { key: string; token: string | undefined; at: number } | null = null
+  let inflight: { key: string; result: Promise<string | undefined | 'drop'> } | null = null
+  let failures = 0
+  let retryAt = 0
+
+  async function establish(id: PushHostIdentity, prove: PopProver): Promise<string | undefined | 'drop'> {
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS)
+    try {
+      const ch = await fetchPopChallenge({
+        apiBase: d.apiBase,
+        hostPublicKeyB64: id.hostPublicKeyB64,
+        purpose: 'push',
+        fetch: d.fetchImpl,
+        signal: ctrl.signal
+      })
+      // Never unproven after a transient failure: a latched host's unproven send is refused.
+      if (!ch.ok) return ch.unsupported ? undefined : 'drop'
+      let popProof: string
+      try {
+        popProof = prove({
+          challenge: ch.challenge,
+          serverPublicKeyB64: ch.serverPublicKeyB64,
+          purpose: 'push',
+          subject: id.hostDeviceId
+        })
+      } catch {
+        return 'drop' // a server key the proof cannot use (malformed, or low-order)
+      }
+      let res: Response
+      try {
+        res = await d.fetchImpl(`${d.apiBase}/v1/push/host-auth`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            hostDeviceId: id.hostDeviceId,
+            hostPublicKeyB64: id.hostPublicKeyB64,
+            popChallenge: ch.challenge,
+            popProof
+          }),
+          signal: ctrl.signal
+        })
+      } catch {
+        return 'drop'
+      }
+      if (res.status === 404) return undefined // a backend with the challenge but no session route
+      if (!res.ok) return 'drop' // 403 forbidden (no live pairing) / pop_invalid, 429, 5xx
+      const json = (await res.json().catch(() => null)) as { hostAuth?: unknown } | null
+      if (!json || typeof json.hostAuth !== 'string' || !json.hostAuth) return 'drop'
+      return json.hostAuth
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  const keyOf = (id: PushHostIdentity): string => `${id.hostPublicKeyB64}\n${id.hostDeviceId}`
+  // A NEGATIVE age is a wall clock that stepped back since the entry was cached, and is read as
+  // expired: taken as fresh, a step back of an hour would serve the same session (or old-backend
+  // verdict) for that hour plus the 10 minutes, past the server's 15-minute TTL.
+  const onFile = (key: string): boolean => {
+    if (!cached || cached.key !== key) return false
+    const age = d.now() - cached.at
+    return age >= 0 && age < HOST_AUTH_REPROVE_MS
+  }
+
+  return {
+    invalidate() {
+      cached = null
+    },
+    onFile(id) {
+      return !!id.prove && onFile(keyOf(id))
+    },
+    async get(id) {
+      if (!id.prove) return undefined
+      const key = keyOf(id)
+      if (cached && onFile(key)) return cached.token
+      if (inflight && inflight.key === key) return inflight.result
+      const now = d.now()
+      if (now < retryAt && retryAt - now <= HOST_AUTH_RETRY_MAX_MS) return 'drop'
+      // A proof that throws is a failure like any other: 'drop', through the backoff below. The
+      // catch is on the SHARED promise, so a caller joining the proof in flight never sees a
+      // rejection either (the timer-driven flush has nowhere to send one).
+      const result = establish(id, id.prove).catch((): 'drop' => 'drop')
+      inflight = { key, result }
+      try {
+        const r = await result
+        if (r === 'drop') {
+          failures++
+          retryAt = d.now() + HOST_AUTH_RETRY_MS[Math.min(failures, HOST_AUTH_RETRY_MS.length) - 1]
+        } else {
+          failures = 0
+          retryAt = 0
+          cached = { key, token: r, at: d.now() }
+        }
+        return r
+      } finally {
+        if (inflight?.result === result) inflight = null
+      }
+    }
+  }
+}
+
+/** Read a JSON body within `ms` (null past it, or on a body that is not JSON). A response body can
+ *  stall after its headers, and `postJson`'s timer stops at the headers. */
+async function jsonWithin(res: Response, ms: number): Promise<unknown> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      res.json().catch(() => null),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), ms)
+      })
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * The host-mode post, shared by notify and live-update: attach the session when there is one (the
+ * field only when it is a non-empty string), and forget it when the backend refuses it. The refusal
+ * is read ONLY from a 403 to a post that carried a session: an unproven post's body is never
+ * read — a 403 there (a latched host behind an old-backend verdict, or no live pairing) is judged by
+ * its status alone, and forgets the verdict.
+ *
+ * An unproven post refused under a verdict that was already ON FILE (asked for in an earlier batch)
+ * is the host having latched since, through another path: the standing host's proven mint, or the
+ * other push stream. That batch proves at once and is re-posted ONCE, carrying the session, if the
+ * proof comes back with one; otherwise it is dropped, as before. A verdict asked for in THIS batch is
+ * not re-asked: the challenge answered moments ago, so asking again would add a request to every
+ * batch of an old backend that refuses this host (403 forbidden, no live pairing) and change nothing.
+ * The re-post is never re-posted.
+ */
+async function postHostMode(
+  fetchImpl: typeof fetch,
+  cache: HostAuthCache,
+  url: string,
+  host: PushHostIdentity,
+  payload: Record<string, unknown>
+): Promise<void> {
+  const onFile = cache.onFile(host)
+  const hostAuth = await cache.get(host)
+  if (hostAuth === 'drop') return
+  const body = {
+    hostDeviceId: host.hostDeviceId,
+    hostPublicKeyB64: host.hostPublicKeyB64,
+    hostLabel: host.hostLabel,
+    ...payload
+  }
+  const res = await postJson(fetchImpl, url, hostAuth ? { ...body, hostAuth } : body)
+  if (!res || res.status !== 403 || !host.prove) return
+  if (hostAuth) {
+    if (popRefusalOf(403, await jsonWithin(res, FETCH_TIMEOUT_MS))) cache.invalidate()
+    return
+  }
+  cache.invalidate()
+  if (!onFile) return
+  const proven = await cache.get(host)
+  if (!proven || proven === 'drop') return
+  const again = await postJson(fetchImpl, url, { ...body, hostAuth: proven })
+  if (again?.status === 403 && popRefusalOf(403, await jsonWithin(again, FETCH_TIMEOUT_MS))) cache.invalidate()
+}
+
 export interface PushNotifyDeps {
   /** Subscribe to actionable inbox events. In production this is `onInboxActionable`. */
   subscribe: (cb: (e: InboxEvent) => void) => () => void
@@ -189,6 +445,13 @@ export interface PushNotifyDeps {
   getGrants?: () => PushGrant[]
   /** Mark a grant dead after a 401/403 (dropped until its file changes). Paired with `getGrants`. */
   markGrantDead?: (grant: string) => void
+  /** The SSH host (`sshHostKey`, `user@host`) a node's project lives on, or undefined for a node on
+   *  THIS machine. Drives the granted leg's per-host routing: an event goes only under the grants
+   *  swept from its node's host (`PushGrant.host`), never under another host's — each grant is
+   *  signed for one host's connectionId, the scope the phone's per-host mute is keyed by (issue
+   *  #435). Absent (the Server Edition) ⇒ every node is local and every grant is local: the legacy
+   *  fan-out. In production this is `workspaceStore.sshProjectIdForNode` → the project's host key. */
+  grantHostFor?: (nodeId: string) => string | undefined
   /** `os.hostname()`, passed in to keep core pure — the granted-mode `hostLabel` (a granted send
    *  carries no host identity, so this is the only host label the backend sees). */
   hostLabel?: () => string
@@ -252,6 +515,9 @@ export function createPushNotify(deps: PushNotifyDeps): PushNotifyHandle {
   const now = deps.now ?? Date.now
   const batchWindowMs = deps.batchWindowMs ?? DEFAULT_BATCH_WINDOW_MS
   const throttleMs = deps.throttleMs ?? DEFAULT_THROTTLE_MS
+
+  // This sender's own hostAuth session (the host-mode proof of possession, above).
+  const hostAuthCache = createHostAuthCache({ apiBase, fetchImpl, now })
 
   const buffer: PushNotifyEvent[] = []
   // Presence-aware hold queue: while the user is present, accepted alerts wait here (with the mirror
@@ -317,6 +583,7 @@ export function createPushNotify(deps: PushNotifyDeps): PushNotifyHandle {
     }
     const payload: PushNotifyEvent = {
       kind: e.kind,
+      eventId: e.id,
       title: e.title,
       ...(e.detail ? { detail: e.detail } : {}),
       nodeId: e.nodeId,
@@ -366,26 +633,26 @@ export function createPushNotify(deps: PushNotifyDeps): PushNotifyHandle {
 
     const url = `${apiBase}/v1/push/notify`
     if (target.host) {
-      // Relay-identity body — byte-identical to the pre-grants shape.
-      await postJson(fetchImpl, url, {
-        hostDeviceId: target.host.hostDeviceId,
-        hostPublicKeyB64: target.host.hostPublicKeyB64,
-        hostLabel: target.host.hostLabel,
-        events
-      })
+      // Relay-identity body — byte-identical to the pre-grants shape when no prover is set, and
+      // carrying `hostAuth` once the host has proven possession of its key.
+      await postHostMode(fetchImpl, hostAuthCache, url, target.host, { events })
     }
     // …and the grants, in the SAME flush (see resolveSendTarget: a paired phone must not silence
-    // the SSH-only ones). One POST per live grant, Bearer-authorized, NO host identity fields —
-    // just `hostLabel` (os.hostname(), injected). A 401/403 marks that grant dead.
+    // the SSH-only ones). PER HOST: each event goes only under the grants swept from the host its
+    // node lives on — a grant is signed for that one host's connectionId, which is what the phone's
+    // per-host mute is keyed by (issue #435). One POST per live grant, Bearer-authorized, NO host
+    // identity fields — just `hostLabel` (os.hostname(), injected). A 401/403 marks that grant dead.
     const label = deps.hostLabel?.()
-    for (const g of target.grants) {
-      const res = await postJson(
-        fetchImpl,
-        url,
-        { ...(label ? { hostLabel: label } : {}), events },
-        g.grant
-      )
-      if (res && (res.status === 401 || res.status === 403)) deps.markGrantDead?.(g.grant)
+    for (const [host, group] of groupByGrantHost(events, deps.grantHostFor)) {
+      for (const g of grantsFor(target.grants, host)) {
+        const res = await postJson(
+          fetchImpl,
+          url,
+          { ...(label ? { hostLabel: label } : {}), events: group },
+          g.grant
+        )
+        if (res && (res.status === 401 || res.status === 403)) deps.markGrantDead?.(g.grant)
+      }
     }
   }
 
@@ -490,6 +757,9 @@ export interface LiveUpdateDeps {
   getGrants?: () => PushGrant[]
   /** Mark a grant dead after a 401/403 (dropped until its file changes). Paired with `getGrants`. */
   markGrantDead?: (grant: string) => void
+  /** See the identical field on `PushNotifyDeps`: the node → SSH host resolver behind the granted
+   *  leg's per-host routing. Absent ⇒ every node and every grant is local. */
+  grantHostFor?: (nodeId: string) => string | undefined
   /** `os.hostname()`, passed in to keep core pure — the granted-mode `hostLabel`. */
   hostLabel?: () => string
   /** The `settings.mobilePushEnabled` master switch. */
@@ -526,6 +796,9 @@ export function createLiveUpdatePush(deps: LiveUpdateDeps): LiveUpdateHandle {
   const now = deps.now ?? Date.now
   const batchWindowMs = deps.batchWindowMs ?? DEFAULT_LIVE_BATCH_WINDOW_MS
   const coalesceMs = deps.coalesceMs ?? DEFAULT_LIVE_COALESCE_MS
+
+  // Its own hostAuth session, independent of notify's (each re-proves at most every 10 minutes).
+  const hostAuthCache = createHostAuthCache({ apiBase, fetchImpl, now })
 
   const buffer: LiveUpdateItem[] = []
   // Per-node coalescing of activity/context ticks.
@@ -705,25 +978,24 @@ export function createLiveUpdatePush(deps: LiveUpdateDeps): LiveUpdateHandle {
 
     const url = `${apiBase}/v1/push/live-update`
     if (target.host) {
-      // Relay-identity body — byte-identical to the pre-grants shape.
-      await postJson(fetchImpl, url, {
-        hostDeviceId: target.host.hostDeviceId,
-        hostPublicKeyB64: target.host.hostPublicKeyB64,
-        hostLabel: target.host.hostLabel,
-        updates
-      })
+      // Relay-identity body — byte-identical to the pre-grants shape when no prover is set, and
+      // carrying `hostAuth` once the host has proven possession of its key.
+      await postHostMode(fetchImpl, hostAuthCache, url, target.host, { updates })
     }
-    // …and the grants, in the SAME flush (see resolveSendTarget). One POST per live grant,
+    // …and the grants, in the SAME flush (see resolveSendTarget), PER HOST exactly like notify:
+    // an update goes only under the grants swept from its node's host. One POST per live grant,
     // Bearer-authorized, NO host identity fields.
     const label = deps.hostLabel?.()
-    for (const g of target.grants) {
-      const res = await postJson(
-        fetchImpl,
-        url,
-        { ...(label ? { hostLabel: label } : {}), updates },
-        g.grant
-      )
-      if (res && (res.status === 401 || res.status === 403)) deps.markGrantDead?.(g.grant)
+    for (const [host, group] of groupByGrantHost(updates, deps.grantHostFor)) {
+      for (const g of grantsFor(target.grants, host)) {
+        const res = await postJson(
+          fetchImpl,
+          url,
+          { ...(label ? { hostLabel: label } : {}), updates: group },
+          g.grant
+        )
+        if (res && (res.status === 401 || res.status === 403)) deps.markGrantDead?.(g.grant)
+      }
     }
   }
 

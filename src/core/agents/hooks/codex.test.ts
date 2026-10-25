@@ -1,5 +1,10 @@
-import { describe, expect, it } from 'vitest'
-import { buildCodexHooksAndTrust, buildManagedCommand, CODEX_EVENTS } from './codex'
+import { describe, expect, it, vi } from 'vitest'
+import {
+  buildCodexHooksAndTrust,
+  buildManagedCommand,
+  CODEX_EVENTS,
+  defaultWindowsCmdExe
+} from './codex'
 import { computeTrustedHash } from './codex-trust'
 import { buildCodexWindowsWrapper, WINDOWS_SH_CANDIDATES } from './codex-windows-wrapper'
 
@@ -18,22 +23,74 @@ describe('buildManagedCommand', () => {
     expect(buildManagedCommand('/a/b/codex.sh', 'darwin')).toContain('else cat >/dev/null 2>&1')
   })
 
-  // Issue #567: codex runs a hook command through `cmd.exe /C` on Windows
-  // (codex-rs/hooks/src/engine/command_runner.rs, rust-v0.151.0), which answers
-  // "-x was unexpected at this time." and exit 1 to an `sh` one-liner — on EVERY event, for the
-  // life of the node.
-  it('win32: points cmd.exe at the batch wrapper beside the script, not at an sh one-liner', () => {
-    expect(buildManagedCommand('C:\\Users\\u\\.nodeterm\\agent-hooks\\codex.sh', 'win32')).toBe(
-      '"C:\\Users\\u\\.nodeterm\\agent-hooks\\codex-hook.cmd"'
-    )
-    expect(buildManagedCommand('C:\\a\\codex.sh', 'win32')).not.toContain('[ -x')
-    expect(buildManagedCommand('C:\\a\\codex.sh', 'win32')).not.toContain('/bin/sh')
+  // These assert what the builder CONSTRUCTS. They cannot show that the string executes — that took
+  // running codex on Windows against a throwaway CODEX_HOME, and those results live in the PR for
+  // #685. What a unit test can do is pin the spelling those measurements validated, so a later edit
+  // cannot quietly walk away from it. `cmdExe` is passed explicitly throughout: the default reads
+  // the environment, and these assertions must not depend on the host running them.
+  const CMD = 'C:\\WINDOWS\\System32\\cmd.exe'
+
+  // Issues #567 / #685. The hook runs in the session's shell, and shell_detect.rs prefers PowerShell
+  // on Windows (rust-v0.153.4); command_runner.rs's COMSPEC/`cmd.exe /C` is the fallback. An `sh`
+  // one-liner is a parse error to both — "-x was unexpected at this time." / "Missing '(' after
+  // 'if' in if statement." — exit 1 on EVERY event, for the life of the node.
+  it('win32: constructs a command pointing at the batch wrapper, not an sh one-liner', () => {
+    expect(
+      buildManagedCommand('C:\\Users\\u\\.nodeterm\\agent-hooks\\codex.sh', 'win32', CMD)
+    ).toBe(`${CMD} /d /c call "C:\\Users\\u\\.nodeterm\\agent-hooks\\codex-hook.cmd "`)
+    expect(buildManagedCommand('C:\\a\\codex.sh', 'win32', CMD)).not.toContain('[ -x')
+    expect(buildManagedCommand('C:\\a\\codex.sh', 'win32', CMD)).not.toContain('/bin/sh')
   })
 
-  it('win32: the path stays one quoted token — a user profile routinely has a space in it', () => {
-    expect(buildManagedCommand('C:\\Users\\First Last\\agent-hooks\\codex.sh', 'win32')).toBe(
-      '"C:\\Users\\First Last\\agent-hooks\\codex-hook.cmd"'
-    )
+  // The regression #685 reports. A BARE quoted path — what #567 emitted — is a valid PowerShell
+  // expression: a string literal. PowerShell echoes it, exits 0 and runs nothing, so codex reports
+  // the hook `Completed` while no hook ever fired (measured). A silently dark badge is strictly
+  // worse than the exit-1 noise #567 set out to remove, so the command must never START with a
+  // quote — that is the whole defect, in one assertion.
+  it('win32: constructs a command that names an interpreter, never a bare quoted path', () => {
+    const command = buildManagedCommand('C:\\Users\\u\\.nodeterm\\agent-hooks\\codex.sh', 'win32', CMD)
+    expect(command.startsWith('"')).toBe(false)
+    expect(command.startsWith(`${CMD} /d /c call "`)).toBe(true)
+  })
+
+  // Two separate pieces, both load-bearing, both easy to mistake for noise:
+  //   `call`         stops cmd's /C rule stripping the quote pair around a path holding `&`, `(`
+  //                  or `)`, which cmd would then re-parse as metacharacters.
+  //   trailing space makes PowerShell keep that quoting when it builds cmd's native argument line.
+  // Measured through the shipped codex: with both, profile paths containing `&` and `(` run; with
+  // `call` alone they Fail. A tidy-up that "removes the stray space" would silently reintroduce the
+  // breakage, hence this test.
+  it('win32: keeps the call + trailing-space quoting that survives & and ( in a profile path', () => {
+    const command = buildManagedCommand('C:\\Users\\A&B (x)\\agent-hooks\\codex.sh', 'win32', CMD)
+    expect(command).toBe(`${CMD} /d /c call "C:\\Users\\A&B (x)\\agent-hooks\\codex-hook.cmd "`)
+    expect(command.endsWith(' "')).toBe(true)
+  })
+
+  it('win32: constructs one quoted token — a user profile routinely has a space in it', () => {
+    // The documented `cmd /s /c ""..."" ` doubling was measured Failed — PowerShell collapses the
+    // doubled quotes before cmd sees them — so the quoting stays a single surrounding pair.
+    const command = buildManagedCommand('C:\\Users\\First Last\\agent-hooks\\codex.sh', 'win32', CMD)
+    expect(command).toBe(`${CMD} /d /c call "C:\\Users\\First Last\\agent-hooks\\codex-hook.cmd "`)
+    expect(command).not.toContain('""')
+  })
+
+  // The program name must be usable UNQUOTED, because a quoted leading token is the #685 bug
+  // itself. Anything that could not be written bare falls back to the PATH lookup.
+  it('win32: falls back to bare cmd when the resolved interpreter path needs quoting', () => {
+    vi.stubEnv('SystemRoot', 'C:\\Windows With Space')
+    vi.stubEnv('windir', '')
+    expect(defaultWindowsCmdExe()).toBe('cmd')
+
+    vi.stubEnv('SystemRoot', 'C:\\WINDOWS')
+    expect(defaultWindowsCmdExe()).toBe('C:\\WINDOWS\\System32\\cmd.exe')
+
+    // Neither variable set — the POSIX case, since this function is exported and callable there.
+    vi.stubEnv('SystemRoot', '')
+    expect(defaultWindowsCmdExe()).toBe('cmd')
+    vi.unstubAllEnvs()
+
+    expect(buildManagedCommand('C:\\a\\codex.sh', 'win32', 'cmd').startsWith('cmd /d /c call "'))
+      .toBe(true)
   })
 
   // The platform is the machine that will RUN codex. RemoteHooks writes this into an SSH host's
@@ -107,7 +164,7 @@ describe('buildCodexHooksAndTrust', () => {
   })
 
   it('is idempotent — re-running on its own output does not duplicate the managed handler', () => {
-    const command = buildManagedCommand('/x/agent-hooks/codex.sh')
+    const command = buildManagedCommand('/home/u/.nodeterm/agent-hooks/codex.sh')
     const first = buildCodexHooksAndTrust({}, command, '/x/hooks.json')!
     const second = buildCodexHooksAndTrust(first.config, command, '/x/hooks.json')!
     for (const ev of CODEX_EVENTS) {
@@ -120,7 +177,7 @@ describe('buildCodexHooksAndTrust', () => {
   })
 
   it('preserves a user-authored hook at its original index before the managed handler', () => {
-    const command = buildManagedCommand('/x/agent-hooks/codex.sh')
+    const command = buildManagedCommand('/home/u/.nodeterm/agent-hooks/codex.sh')
     const userDef = { hooks: [{ type: 'command' as const, command: 'echo mine' }] }
     const built = buildCodexHooksAndTrust({ hooks: { Stop: [userDef] } }, command, '/x/hooks.json')!
     const stop = built.config.hooks?.Stop ?? []
@@ -129,7 +186,7 @@ describe('buildCodexHooksAndTrust', () => {
   })
 
   it('keeps two user definitions at their trust-key indices and trusts the managed tail', () => {
-    const command = buildManagedCommand('/x/agent-hooks/codex.sh')
+    const command = buildManagedCommand('/home/u/.nodeterm/agent-hooks/codex.sh')
     const firstUserDef = { hooks: [{ type: 'command' as const, command: 'echo first' }] }
     const secondUserDef = { hooks: [{ type: 'command' as const, command: 'echo second' }] }
     const built = buildCodexHooksAndTrust(
@@ -148,7 +205,7 @@ describe('buildCodexHooksAndTrust', () => {
   })
 
   it('sweeps a stale managed handler out of an event we no longer subscribe to', () => {
-    const command = buildManagedCommand('/x/agent-hooks/codex.sh')
+    const command = buildManagedCommand('/home/u/.nodeterm/agent-hooks/codex.sh')
     // PreCompact is not in CODEX_EVENTS; a stale managed copy there must be removed.
     const stale = { hooks: [{ type: 'command' as const, command }] }
     const built = buildCodexHooksAndTrust({ hooks: { PreCompact: [stale] } }, command, '/x/hooks.json')!
@@ -210,12 +267,65 @@ describe('buildCodexHooksAndTrust', () => {
     }
   })
 
+  // Issue #685 repair. A Windows machine on which a #567 build installed successfully carries the
+  // BARE quoted wrapper path — the entry PowerShell reads as a string literal and never runs. It
+  // has to be REPLACED, not appended beside: were the matcher to miss it, the dead entry would
+  // survive every launch while still being reported `Completed`. The matcher keys off the
+  // `.nodeterm/agent-hooks/codex-hook.cmd` path, which both spellings carry, so the strip catches it.
+  it('replaces the pre-#685 bare-quoted wrapper entry with the cmd /c one', () => {
+    const stale = {
+      hooks: [
+        {
+          type: 'command' as const,
+          command: '"C:\\Users\\u\\.nodeterm\\agent-hooks\\codex-hook.cmd"'
+        }
+      ]
+    }
+    const command = buildManagedCommand('C:\\Users\\u\\.nodeterm\\agent-hooks\\codex.sh', 'win32')
+    const built = buildCodexHooksAndTrust(
+      { hooks: { Stop: [stale], SessionStart: [stale] } },
+      command,
+      'C:\\Users\\u\\.codex\\hooks.json'
+    )!
+    for (const ev of ['Stop', 'SessionStart']) {
+      expect(built.config.hooks![ev]).toEqual([{ hooks: [{ type: 'command', command }] }])
+    }
+  })
+
   // The mirror of the above: a POSIX host that somehow carries a `.cmd` entry (a settings file
   // copied between machines) is repaired the same way rather than accumulating both.
   it('replaces a stray Windows entry on a POSIX install', () => {
     const stale = {
       hooks: [{ type: 'command' as const, command: '"/home/u/.nodeterm/agent-hooks/codex-hook.cmd"' }]
     }
+    const command = buildManagedCommand('/home/u/.nodeterm/agent-hooks/codex.sh', 'linux')
+    const built = buildCodexHooksAndTrust({ hooks: { Stop: [stale] } }, command, '/h/hooks.json')!
+    expect(built.config.hooks!.Stop).toEqual([{ hooks: [{ type: 'command', command }] }])
+  })
+
+  // Another tool with the same layout is not us. Measured on a Windows desktop: another tool's own
+  // `~/.other/agent-hooks/codex-hook.cmd` entry was stripped by every repair because the matcher
+  // keyed off the bare `agent-hooks/<leaf>` tail.
+  it("keeps another tool's agent-hooks entry with the same leaf name", () => {
+    const other = { hooks: [{ type: 'command' as const, command: 'C:/Users/u/.other/agent-hooks/codex-hook.cmd' }] }
+    const otherPosix = { hooks: [{ type: 'command' as const, command: "sh '/home/u/.other/agent-hooks/codex.sh'" }] }
+    const command = buildManagedCommand('C:\\Users\\u\\.nodeterm\\agent-hooks\\codex.sh', 'win32')
+    const built = buildCodexHooksAndTrust(
+      { hooks: { Stop: [other, otherPosix] } },
+      command,
+      'C:\\Users\\u\\.codex\\hooks.json'
+    )!
+    expect(built.config.hooks!.Stop).toEqual([other, otherPosix, { hooks: [{ type: 'command', command }] }])
+    expect(built.trustEntries.find((e) => e.eventLabel === 'stop')).toMatchObject({ groupIndex: 2 })
+  })
+
+  // The directories we HAVE written to are still ours, so a stale entry from them is replaced.
+  it.each([
+    '/home/u/.nodeterm/agent-hooks/codex.sh',
+    "C:\\Users\\u\\AppData\\Roaming\\node-terminal\\agent-hooks\\codex.sh",
+    '/root/.nodeterm-server/agent-hooks/codex.sh'
+  ])('still sweeps a stale entry of ours at %s', (script) => {
+    const stale = { hooks: [{ type: 'command' as const, command: `sh '${script}'` }] }
     const command = buildManagedCommand('/home/u/.nodeterm/agent-hooks/codex.sh', 'linux')
     const built = buildCodexHooksAndTrust({ hooks: { Stop: [stale] } }, command, '/h/hooks.json')!
     expect(built.config.hooks!.Stop).toEqual([{ hooks: [{ type: 'command', command }] }])

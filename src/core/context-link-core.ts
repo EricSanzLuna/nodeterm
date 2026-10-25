@@ -5,9 +5,17 @@ import type { ContextLinkInfo } from '../shared/types'
 import { sessionName } from './tmux-naming'
 import { HOOK_CURL_HEADERS_SH } from './agents/hook-curl-config-sh'
 import { CODEX_SANDBOX_BLOCKED_LINE, CODEX_SANDBOX_HINT_SH } from './agents/hook-sandbox-hint-sh'
-import { HOOK_ENDPOINT_FALLBACK_SH, STALE_ENDPOINT_HINT } from './agents/hook-endpoint-failover-sh'
+import {
+  HOOK_ENDPOINT_FALLBACK_SH,
+  OWNED_ENDPOINT_FALLBACK_SH,
+  FOREIGN_ENDPOINT_HINT,
+  STALE_ENDPOINT_HINT,
+  TUNNEL_DOWN_HINT,
+  ownerUnreachableGuidanceLines
+} from './agents/hook-endpoint-failover-sh'
 import { NODE_TOKEN_READ_SH } from './agents/node-token-sh'
 import { codexThreadIdentityResolverSh } from './codex-thread-identity-sh'
+import { shimCommand, shimFence, windowsShimNoteLines, type ShimDialect } from '../shared/agents/shim-invocation'
 
 /** The shim's generic transport-failure sentence — exported so the agent-facing docs below can
  *  quote it verbatim and the parity test holds the two ends together. */
@@ -41,7 +49,7 @@ export async function resolveLinkTranscript(
 ): Promise<string> {
   if (link.note != null) return ''
   const agent = link.agentId ?? 'claude'
-  if (agent === 'claude') {
+  if (agent === 'claude' || agent === 'antigravity') {
     const hooked = deps.hooked(link.id)
     if (hooked) return hooked
   }
@@ -63,12 +71,22 @@ export async function resolveLinkTranscript(
 const INSTR_START = '<!-- nodeterm:get-linked-context:start -->'
 const INSTR_END = '<!-- nodeterm:get-linked-context:end -->'
 
+/** The two markers, for the SSH freshness probe (see `CANVAS_CONTROL_MARKERS`). */
+export const LINKED_CONTEXT_MARKERS = { start: INSTR_START, end: INSTR_END } as const
+
+/** The exact bytes the merge below writes from the start marker through the end marker — the one
+ *  definition the SSH freshness probe compares a host's copy against. */
+export function frameInstructionsBlock(block: string): string {
+  return `${INSTR_START}\n${block.trim()}\n${INSTR_END}`
+}
+
 /** Idempotently merge our marker-delimited block into a global instructions file
- *  (~/.codex/AGENTS.md, ~/.gemini/GEMINI.md). Everything outside the markers is preserved. */
+ *  (~/.codex/AGENTS.md, ~/.gemini/GEMINI.md). Everything outside the markers is preserved.
+ *  The end marker is searched AFTER the start marker (see `mergeCanvasControlBlock`). */
 export function mergeInstructionsBlock(existing: string, block: string): string {
-  const full = `${INSTR_START}\n${block.trim()}\n${INSTR_END}`
+  const full = frameInstructionsBlock(block)
   const start = existing.indexOf(INSTR_START)
-  const end = existing.indexOf(INSTR_END)
+  const end = existing.indexOf(INSTR_END, start)
   if (start >= 0 && end > start) {
     return existing.slice(0, start) + full + existing.slice(end + INSTR_END.length)
   }
@@ -76,7 +94,10 @@ export function mergeInstructionsBlock(existing: string, block: string): string 
   return existing + sep + full + '\n'
 }
 
-/** The instructions body telling codex/gemini how to read linked-node context. */
+/** The instructions body telling codex/gemini how to read linked-node context.
+ *  NOT INSTALLED since #744: every agent now gets the get-linked-context SKILL in its own skills
+ *  dir (core/agent-integrations.ts); older builds' copies of this block are stripped. Kept only
+ *  until its parity tests move to the skill body (follow-up). */
 export function buildLinkedContextInstructions(shimPath: string): string {
   return [
     '# Reading linked nodeterm nodes (get-linked-context)',
@@ -94,6 +115,8 @@ export function buildLinkedContextInstructions(shimPath: string): string {
     '',
     'Only meaningful inside nodeterm (NODETERM_NODE_ID set) with a linked edge. If the CLI',
     'says "Not a nodeterm session" or "No linked nodes", there is nothing to read — do not retry.',
+    '',
+    ...ownerUnreachableGuidanceLines(),
     '',
     ...codexSandboxGuidanceLines(CONTEXT_UNREACHABLE_MSG)
   ].join('\n')
@@ -219,6 +242,7 @@ while [ "$nt_i" -lt "$nt_count" ]; do
 done
 
 ${HOOK_ENDPOINT_FALLBACK_SH}
+${OWNED_ENDPOINT_FALLBACK_SH}
 
 nt_out=$(mktemp 2>/dev/null || echo "/tmp/nodeterm-context.$$")
 
@@ -245,8 +269,8 @@ nt_ctx_post() {
       --data-urlencode "nodeId=\${NODETERM_NODE_ID}" "$@" 2>/dev/null)
   fi
 }
-# An answer from the server — any HTTP code — is authoritative; only a dead transport fails over.
-nt_reached() { [ -n "$nt_code" ] && [ "$nt_code" != "000" ]; }
+# Only a dead transport or an explicit wrong-owner (421) answer permits failover; 403 stays final.
+nt_reached() { [ -n "$nt_code" ] && [ "$nt_code" != "000" ] && [ "$nt_code" != "421" ]; }
 
 nt_had_transport=""
 nt_ctx_post "$@"
@@ -256,8 +280,8 @@ nt_ctx_post "$@"
 # creation, so an app quit/restart leaves it posting at a dead port while a live endpoint file sits
 # right next to it. Skipped under a codex sandbox: connect() is denied wholesale there (issue
 # #367), so each candidate would burn a doomed curl and the sandbox hint below is already the
-# right diagnosis.
-if ! nt_reached && [ -z "$CODEX_SANDBOX_NETWORK_DISABLED" ]; then
+# right diagnosis. A 421 proves transport worked and still permits discovery.
+if ! nt_reached && { [ "$nt_code" = "421" ] || [ -z "$CODEX_SANDBOX_NETWORK_DISABLED" ]; }; then
   nt_list=$(nt_candidates "$NODETERM_HOOK_ENDPOINT")
   if [ -n "$nt_list" ]; then
     nt_n=0
@@ -265,12 +289,10 @@ if ! nt_reached && [ -z "$CODEX_SANDBOX_NETWORK_DISABLED" ]; then
     # (and nt_code) survive it. "$@" still holds the translated curl args.
     while IFS= read -r nt_ep; do
       [ -n "$nt_ep" ] || continue
+      [ "$nt_n" -lt "$nt_fallback_max" ] || break
+      nt_adopt_for_node "$nt_ep" || continue
       nt_n=$((nt_n + 1))
-      [ "$nt_n" -le "$nt_fallback_max" ] || break
-      nt_adopt "$nt_ep" || continue
-      # Re-read the token FROM THE ADOPTED ENDPOINT's dir (node-token-sh.ts): the capability must
-      # come from the instance we are about to call, never the one we are walking away from.
-      nt_read_node_token "$nt_ep"
+      nt_probe_endpoint || continue
       nt_ctx_post "$@"
       nt_reached && break
     done <<NT_CANDIDATES
@@ -283,6 +305,9 @@ if [ "$nt_code" = "200" ]; then
   cat "$nt_out" 2>/dev/null
   rm -f "$nt_out"
   exit 0
+fi
+if [ -n "$nt_skipped_foreign_endpoint" ] && ! nt_reached; then
+  echo "${FOREIGN_ENDPOINT_HINT}" >&2
 fi
 cat "$nt_out" >&2 2>/dev/null
 rm -f "$nt_out"
@@ -298,8 +323,15 @@ fi
 echo "${CONTEXT_UNREACHABLE_MSG}" >&2
 # A transport WAS advertised and nothing answered, primary or fallback: name the stale endpoint so
 # the agent stops relinking a healthy canvas (the link is fine; the app behind it is not there).
-if [ -z "$nt_code" ] || [ "$nt_code" = "000" ]; then
-  echo "${STALE_ENDPOINT_HINT}" >&2
+# One piece of advice per failure: when the walk skipped a foreign endpoint, the owner-unreachable
+# sentence above already says what happened and when to retry.
+# An SSH tunnel primary gets the tunnel advice (reconnect), anything else the stale one (restart).
+if { [ -z "$nt_code" ] || [ "$nt_code" = "000" ]; } && [ -z "$nt_skipped_foreign_endpoint" ]; then
+  if [ -n "$nt_primary_tunnel" ]; then
+    echo "${TUNNEL_DOWN_HINT}" >&2
+  else
+    echo "${STALE_ENDPOINT_HINT}" >&2
+  fi
 fi
 exit 1
 `
@@ -322,7 +354,10 @@ export const CONTEXT_SHIM_SCRIPT = buildContextShimScript()
 /** The get-linked-context SKILL.md body, pointing at the shim at `shimPath`. Parameterized
  *  because the same skill is installed twice with different paths: into the desktop's config
  *  dirs, and onto an SSH host for remote agent nodes. */
-export function buildContextLinkSkillBody(shimPath: string): string {
+export function buildContextLinkSkillBody(shimPath: string, dialect: ShimDialect = 'posix'): string {
+  // `dialect` as in buildCanvasSkillBody: only a non-claude agent on a Windows host gets the `.cmd`
+  // line; the default keeps the POSIX and SSH bodies byte-identical.
+  const windowsNote = windowsShimNoteLines(shimPath, dialect)
   return `---
 name: get-linked-context
 description: Read the conversation/transcript, a recent summary, or the terminal output of another agent node (Claude, Codex or Gemini) you are linked to on the nodeterm canvas. Use when you need to know what a connected node has been doing, hand off, or continue its work. Only meaningful inside a nodeterm session with a context-link edge. Also reads sticky notes linked to this node as context.
@@ -330,16 +365,16 @@ description: Read the conversation/transcript, a recent summary, or the terminal
 
 # Get linked context
 
-On the nodeterm canvas, this Claude session may be connected to other agent nodes (Claude, Codex or Gemini) by a
+On the nodeterm canvas, this session may be connected to other agent nodes (Claude, Codex, Gemini, opencode or Grok) by a
 context-link edge. When you are linked, you can READ the other node's context on demand by
 running the local CLI shim below. Nothing is pushed to you automatically — pull what you need.
 
 Run the shim (absolute path):
 
-\`\`\`sh
-sh "${shimPath}" <command> [--node <id|title>] [-n <N>]
+\`\`\`${shimFence(dialect)}
+${shimCommand(shimPath, dialect)} <command> [--node <id|title>] [-n <N>]
 \`\`\`
-
+${windowsNote.length ? `\n${windowsNote.join('\n')}\n` : ''}
 Commands:
 - \`list\` — list the nodes you are linked to (start here).
 - \`summary [--node X] [-n 15]\` — the last N lines of a linked node's conversation.
@@ -353,6 +388,8 @@ since it was first linked).
 \`--node\` is optional when you are linked to exactly one node; otherwise pass the id or title
 from \`list\`. If the CLI says "Not a nodeterm session" or "No linked nodes", there is nothing
 to read — do not retry.
+
+${ownerUnreachableGuidanceLines().join('\n')}
 
 ${codexSandboxGuidanceLines(CONTEXT_UNREACHABLE_MSG).join('\n')}
 `

@@ -2,7 +2,8 @@
 // the NODE to fill the visible canvas — a real resize through the normal resize path, so a
 // terminal reflows and gains rows (the camera never moves; canvas zoom is a CSS transform and
 // magnifying an 80×24 shows no extra line). The second click restores the exact previous rect.
-// Shared by the terminal, editor and diff nodes; the transforms live in state/workspace.ts so
+// Shared by every node kind the node.maximize chord accepts that has a header (terminal, editor,
+// diff, browser, web, video, files); the transforms live in state/workspace.ts so
 // grouped nodes re-fit their ancestor frames in the same tick.
 
 import { useReactFlow, useStoreApi } from '@xyflow/react'
@@ -12,13 +13,15 @@ import { commandTooltip } from '../lib/keybindingOverrides'
 import { markWorkspaceDirty } from '../state/workspaceDirty'
 import { maximizeNodeToRect, restoreMaximizedNode, type CanvasNode } from '../state/workspace'
 import { NODE_MAXIMIZE_MARGIN_PX, maximizeTargetRect } from '../lib/nodeMaximize'
-import { measurePinnedInsets } from '../lib/pinnedInsets'
+import { measureMaximizeInsets } from '../lib/maximizeInsets'
 
-export function MaximizeButton({ id, maximized }: { id: string; maximized: boolean }) {
+/** The maximize/restore transform for one node, for any control that needs it — the header button
+ *  below, and the whiteboard's screenshare mode, which maximizes on entry and restores on exit. */
+export function useNodeMaximize(id: string): (maximized: boolean) => void {
   const { setNodes, getViewport } = useReactFlow()
   const store = useStoreApi()
 
-  const toggle = () => {
+  return (maximized: boolean) => {
     setNodes((ns) => {
       const flow = ns as CanvasNode[]
       if (maximized) return restoreMaximizedNode(flow, id)
@@ -31,7 +34,7 @@ export function MaximizeButton({ id, maximized }: { id: string; maximized: boole
         width,
         height,
         NODE_MAXIMIZE_MARGIN_PX,
-        wrap ? measurePinnedInsets(wrap) : undefined
+        wrap ? measureMaximizeInsets(wrap) : undefined
       )
       return rect ? maximizeNodeToRect(flow, id, rect) : ns
     })
@@ -39,6 +42,11 @@ export function MaximizeButton({ id, maximized }: { id: string; maximized: boole
     // explicitly (same rule as Canvas's onApplyMutation) — else the new rect is lost on restart.
     markWorkspaceDirty()
   }
+}
+
+export function MaximizeButton({ id, maximized }: { id: string; maximized: boolean }) {
+  const setMaximized = useNodeMaximize(id)
+  const toggle = () => setMaximized(maximized)
 
   return (
     <Tooltip

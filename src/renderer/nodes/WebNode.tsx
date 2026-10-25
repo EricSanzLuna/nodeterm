@@ -1,4 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
+import { Tooltip } from '../components/Tooltip'
+import { MaximizeButton } from './MaximizeButton'
+import { IconClose, IconOpenExternal } from '../components/icons'
 import { Handle, NodeResizer, Position, useReactFlow, type NodeProps } from '@xyflow/react'
 import { NODE_MIN_SIZES } from '../lib/nodeSizing'
 import type { CanvasNode } from '../state/workspace'
@@ -10,6 +13,8 @@ import { describeLoadFailure, isReportableFailure, type WebviewLoadFailure } fro
 import { WebviewErrorPlate } from './WebviewErrorPlate'
 import { WebviewLoadingBar } from './WebviewLoadingBar'
 import { useWebviewKeepAlive } from '../state/webviewKeepAlive'
+import { WebviewZoomControls } from '../components/WebviewZoomControls'
+import type { ZoomableWebview } from '@shared/webview-zoom'
 
 /**
  * A web view node. When `data.url` is set it loads that live URL; otherwise it serves the
@@ -30,7 +35,7 @@ export default function WebNode({ id, data, selected }: NodeProps<CanvasNode>) {
   const title = (data.title as string) || url || filePath.split('/').pop() || 'web'
   const rootRef = useRef<HTMLDivElement | null>(null)
   /** The guest, for the audible check only — a local html page can hold a playing <video>. */
-  const wvRef = useRef<(AudibleWebview & ReloadableWebview) | null>(null)
+  const wvRef = useRef<(AudibleWebview & ReloadableWebview & ZoomableWebview) | null>(null)
   // Memory saver — the same shared hook {@link BrowserSurface} uses: hidden long enough, the
   // <webview> is unmounted (its Chromium process exits) and rebuilt on reveal. `revive` is what
   // re-runs the source effect below, so the `nt-media://` grant is re-issued for a local file
@@ -161,12 +166,14 @@ export default function WebNode({ id, data, selected }: NodeProps<CanvasNode>) {
   })
 
   return (
+    <>
     <div
       ref={rootRef}
       className={`term-node web-node${selected ? ' selected' : ''}`}
       style={{ borderTopColor: data.color }}
     >
-      <NodeResizer minWidth={NODE_MIN_SIZES.web.width} minHeight={NODE_MIN_SIZES.web.height} isVisible={selected} color={data.color} />
+      {/* Paint only: the old resize box in its old place (see .nt-resize-ghost in styles.css). */}
+      <NodeResizer isVisible={selected} color={data.color} lineClassName="nt-resize-ghost" handleClassName="nt-resize-ghost" />
       {/* Invisible target handle so a rope from the agent node that opened this can attach. */}
       <Handle
         id="flow-in"
@@ -181,6 +188,7 @@ export default function WebNode({ id, data, selected }: NodeProps<CanvasNode>) {
           {title}
         </span>
         <span className="term-node__spacer" />
+        {live && <WebviewZoomControls target={wvRef} />}
         {live && (
           <button
             className="term-node__close"
@@ -191,24 +199,29 @@ export default function WebNode({ id, data, selected }: NodeProps<CanvasNode>) {
           </button>
         )}
         {url && (
+          <Tooltip label="Open in browser">
+            <button
+              className="term-node__external"
+              aria-label="Open in browser"
+              onClick={() => {
+                const safe = httpUrl(url)
+                if (safe) window.nodeTerminal.shell.openExternal(safe)
+              }}
+            >
+              <IconOpenExternal />
+            </button>
+          </Tooltip>
+        )}
+        <MaximizeButton id={id} maximized={!!data.premaxRect} />
+        <Tooltip label="Close">
           <button
             className="term-node__close"
-            title="Open in browser"
-            onClick={() => {
-              const safe = httpUrl(url)
-              if (safe) window.nodeTerminal.shell.openExternal(safe)
-            }}
+            aria-label="Close"
+            onClick={() => deleteElements({ nodes: [{ id }] })}
           >
-            ↗
+            <IconClose />
           </button>
-        )}
-        <button
-          className="term-node__close"
-          title="Close"
-          onClick={() => deleteElements({ nodes: [{ id }] })}
-        >
-          ×
-        </button>
+        </Tooltip>
       </div>
 
       <div className="editor-node__body">
@@ -220,7 +233,7 @@ export default function WebNode({ id, data, selected }: NodeProps<CanvasNode>) {
               {/* eslint-disable-next-line react/no-unknown-property */}
               <webview
                 ref={(el) => {
-                  wvRef.current = el as unknown as (AudibleWebview & ReloadableWebview) | null
+                  wvRef.current = el as unknown as (AudibleWebview & ReloadableWebview & ZoomableWebview) | null
                 }}
                 src={src}
                 style={{ width: '100%', height: '100%' }}
@@ -236,5 +249,12 @@ export default function WebNode({ id, data, selected }: NodeProps<CanvasNode>) {
         </div>
       </div>
     </div>
+    {/* Sibling of the root, not a child: under Liquid Glass the root has a backdrop-filter,
+        which makes it the containing block for these absolute edges, so they were clipped and
+        covered (only the top edge stayed grabbable). Out here they sit on the node wrapper.
+        AFTER the root, never before it: focus mode reparents the root out of this wrapper, and
+        React inserting a control "before the root" would then throw NotFoundError. */}
+    <NodeResizer minWidth={NODE_MIN_SIZES.web.width} minHeight={NODE_MIN_SIZES.web.height} isVisible={selected} color={data.color} />
+    </>
   )
 }

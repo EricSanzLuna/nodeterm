@@ -6,7 +6,7 @@ import {
   normalizeBindingForCommand,
   getEffectiveBindings,
   bindingIdentity,
-  conflictBucket,
+  conflictBuckets,
   findKeybindingConflicts,
   sanitizeKeybindingOverrides,
   resolveCommandForKeyEvent,
@@ -106,7 +106,11 @@ describe('registry invariants', () => {
         darwin: [], other: [] },
       { id: 'canvas.tidy', title: 'Tidy canvas', group: 'Canvas', scope: 'canvas',
         darwin: ['Cmd+Shift+A'], other: ['Cmd+Shift+A'] },
+      { id: 'canvas.tidyLineage', title: 'Arrange by lineage', group: 'Canvas', scope: 'canvas',
+        darwin: [], other: [] },
       { id: 'canvas.groupSelection', title: 'Group selection', group: 'Canvas', scope: 'canvas',
+        darwin: [], other: [] },
+      { id: 'canvas.toggleLock', title: 'Toggle canvas lock', group: 'Canvas', scope: 'canvas',
         darwin: [], other: [] },
       { id: 'node.newTerminal', title: 'New terminal node', group: 'Nodes', scope: 'canvas',
         darwin: ['Cmd+T'], other: ['Cmd+T'] },
@@ -125,6 +129,10 @@ describe('registry invariants', () => {
         darwin: [], other: [] },
       { id: 'node.newAgent.copilot', title: 'New GitHub Copilot node', group: 'Nodes',
         scope: 'canvas', darwin: [], other: [] },
+      { id: 'node.newAgent.antigravity', title: 'New Antigravity node', group: 'Nodes',
+        scope: 'canvas', darwin: [], other: [] },
+      { id: 'node.newAgent.cursor', title: 'New Cursor node', group: 'Nodes', scope: 'canvas',
+        darwin: [], other: [] },
       { id: 'node.newSticky', title: 'New sticky note', group: 'Nodes', scope: 'canvas',
         darwin: [], other: [] },
       { id: 'node.newBrowser', title: 'New browser node', group: 'Nodes', scope: 'canvas',
@@ -132,6 +140,8 @@ describe('registry invariants', () => {
       { id: 'node.newWebView', title: 'New web view node', group: 'Nodes', scope: 'canvas',
         darwin: [], other: [] },
       { id: 'node.newDino', title: 'New dino node', group: 'Nodes', scope: 'canvas',
+        darwin: [], other: [] },
+      { id: 'node.newWhiteboard', title: 'New whiteboard', group: 'Nodes', scope: 'canvas',
         darwin: [], other: [] },
       { id: 'node.newFile', title: 'New file…', group: 'Nodes', scope: 'canvas',
         darwin: [], other: [] },
@@ -143,6 +153,9 @@ describe('registry invariants', () => {
         darwin: ['Cmd+ArrowUp'], other: ['Ctrl+Shift+ArrowUp'], allowInTerminal: true },
       { id: 'node.focusDown', title: 'Focus node below', group: 'Nodes', scope: 'canvas',
         darwin: ['Cmd+ArrowDown'], other: ['Ctrl+Shift+ArrowDown'], allowInTerminal: true },
+      // Pool only: no default chord on either platform.
+      { id: 'node.nextNeedingYou', title: 'Go to next agent needing you', group: 'Nodes',
+        scope: 'canvas', darwin: [], other: [], allowInTerminal: true },
       { id: 'node.maximize', title: 'Maximize / restore node', group: 'Nodes', scope: 'canvas',
         darwin: ['Cmd+Shift+Enter'], other: ['Cmd+Shift+Enter'], allowInTerminal: true },
       { id: 'node.zoneLeft', title: 'Snap node to left half', group: 'Nodes', scope: 'canvas',
@@ -153,10 +166,34 @@ describe('registry invariants', () => {
         darwin: ['Ctrl+Alt+ArrowUp'], other: [], allowInTerminal: true },
       { id: 'node.zoneDown', title: 'Snap node to bottom half', group: 'Nodes', scope: 'canvas',
         darwin: ['Ctrl+Alt+ArrowDown'], other: [], allowInTerminal: true },
+      { id: 'node.zoneLeftThird', title: 'Snap node to left third', group: 'Nodes',
+        scope: 'canvas', darwin: [], other: [], allowInTerminal: true },
+      { id: 'node.zoneCenterThird', title: 'Snap node to center third', group: 'Nodes',
+        scope: 'canvas', darwin: [], other: [], allowInTerminal: true },
+      { id: 'node.zoneRightThird', title: 'Snap node to right third', group: 'Nodes',
+        scope: 'canvas', darwin: [], other: [], allowInTerminal: true },
+      { id: 'node.zoneTopLeft', title: 'Snap node to top left quarter', group: 'Nodes',
+        scope: 'canvas', darwin: [], other: [], allowInTerminal: true },
+      { id: 'node.zoneTopRight', title: 'Snap node to top right quarter', group: 'Nodes',
+        scope: 'canvas', darwin: [], other: [], allowInTerminal: true },
+      { id: 'node.zoneBottomLeft', title: 'Snap node to bottom left quarter', group: 'Nodes',
+        scope: 'canvas', darwin: [], other: [], allowInTerminal: true },
+      { id: 'node.zoneBottomRight', title: 'Snap node to bottom right quarter', group: 'Nodes',
+        scope: 'canvas', darwin: [], other: [], allowInTerminal: true },
       { id: 'node.close', title: 'Close node / window', group: 'Nodes', scope: 'app',
         darwin: ['Cmd+W'], other: ['Cmd+W'], allowInTerminal: true, allowWhileTyping: true },
       { id: 'node.toggleMarkdown', title: 'Toggle markdown view', group: 'Nodes', scope: 'app',
         darwin: ['Cmd+M'], other: ['Cmd+M'], allowInTerminal: true, allowWhileTyping: true },
+      { id: 'board.openCard', title: 'Open focused card', group: 'Board', scope: 'board',
+        darwin: ['Space'], other: ['Space'] },
+      { id: 'board.nextCard', title: 'Next card', group: 'Board', scope: 'board',
+        darwin: ['J', 'ArrowDown'], other: ['J', 'ArrowDown'] },
+      { id: 'board.prevCard', title: 'Previous card', group: 'Board', scope: 'board',
+        darwin: ['K', 'ArrowUp'], other: ['K', 'ArrowUp'] },
+      { id: 'board.columnLeft', title: 'Card in the column to the left', group: 'Board',
+        scope: 'board', darwin: ['ArrowLeft'], other: ['ArrowLeft'] },
+      { id: 'board.columnRight', title: 'Card in the column to the right', group: 'Board',
+        scope: 'board', darwin: ['ArrowRight'], other: ['ArrowRight'] },
       { id: 'terminal.find', title: 'Find in terminal', group: 'Terminal', scope: 'terminal',
         darwin: ['Cmd+F'], other: ['Cmd+F'] },
       { id: 'terminal.copySelection', title: 'Copy terminal selection', group: 'Terminal',
@@ -196,6 +233,11 @@ describe('registry invariants', () => {
   // Every command this PR added ships with NO default chord — the pool grows, the out-of-box
   // key map does not. A default sneaking in here would shadow an existing binding or steal a
   // key from the terminal for a user who never asked for the command.
+  it('ships "New whiteboard" unbound on both platforms', () => {
+    const d = COMMANDS_BY_ID.get('node.newWhiteboard')
+    expect(d?.defaultBindings).toEqual({ darwin: [], other: [] })
+  })
+
   it('ships the new create commands unbound on both platforms', () => {
     const added: readonly string[] = [
       ...BUILTIN_AGENT_IDS.map((a) => `node.newAgent.${a}`),
@@ -205,7 +247,7 @@ describe('registry invariants', () => {
       'node.newDino',
       'node.newFile'
     ]
-    expect(added).toHaveLength(11)
+    expect(added).toHaveLength(13)
     for (const id of added) {
       const d = COMMANDS_BY_ID.get(id as CommandId)
       expect(d, id).toBeDefined()
@@ -299,22 +341,49 @@ describe('bindingIdentity', () => {
   })
 })
 
-describe('conflictBucket', () => {
-  // The whole mapping, asserted over the REGISTRY rather than a hand-picked example per bucket:
-  // 'app' and 'canvas' share the global keyspace, 'terminal' and 'scm' are their own, and
-  // `speech.dictation` is the one command whose bucket comes from its id instead of its scope.
-  // Kills two mutants a per-bucket sample can miss: a scope-mapping typo (folding 'scm' — or a
-  // scope added later — into 'global', or dropping 'canvas' out of it), and the removal of the
-  // dictation branch, which would send Dictate back into 'global' and re-report the collision
-  // the bucket exists to stop.
-  it('maps every command to its scope bucket, dictation excepted', () => {
+describe('conflictBuckets', () => {
+  // The whole mapping, asserted over the REGISTRY rather than a hand-picked example per bucket.
+  // A bucket is a dispatch CONTEXT: the chords that can resolve at the same moment. 'canvas'
+  // resolves only with the board closed and 'board' only with it open, while 'app' resolves in
+  // both — so an app command sits in both view buckets and a canvas command never meets a board
+  // one. 'terminal' and 'scm' are their own; `speech.dictation` is the one command whose bucket
+  // comes from its id instead of its scope.
+  it('maps every command to the contexts its scope dispatches in, dictation excepted', () => {
+    const expected = {
+      app: ['canvas-view', 'board-view'],
+      canvas: ['canvas-view'],
+      board: ['board-view'],
+      terminal: ['terminal'],
+      scm: ['scm']
+    } as const
     for (const def of COMMAND_DEFINITIONS) {
       if (def.id === 'speech.dictation') continue
-      expect(conflictBucket(def)).toBe(
-        def.scope === 'app' || def.scope === 'canvas' ? 'global' : def.scope
-      )
+      expect(conflictBuckets(def)).toEqual(expected[def.scope])
     }
-    expect(conflictBucket(COMMANDS_BY_ID.get('speech.dictation')!)).toBe('dictation')
+    expect(conflictBuckets(COMMANDS_BY_ID.get('speech.dictation')!)).toEqual(['dictation'])
+  })
+
+  it('agrees with the dispatcher: two scopes share a bucket exactly when both can resolve at once', () => {
+    // Asked of the REAL resolver, never restated: a command can resolve in a context when, bound
+    // alone to a chord nothing else holds, a keydown of that chord resolves to it there.
+    const chord = 'Cmd+Alt+Shift+F12'
+    const press = { metaKey: true, ctrlKey: false, altKey: true, shiftKey: true, key: 'F12' }
+    const resolvesIn = (def: (typeof COMMAND_DEFINITIONS)[number], kanbanOpen: boolean): boolean =>
+      resolveCommandForKeyEvent(
+        press,
+        { typing: false, terminal: false, kanbanOpen, terminalFirst: false },
+        { [def.id]: [chord] },
+        true
+      ) === def.id
+    const views = COMMAND_DEFINITIONS.filter((def) =>
+      def.id !== 'speech.dictation' && (def.scope === 'app' || def.scope === 'canvas' || def.scope === 'board'))
+    for (const a of views) {
+      for (const b of views) {
+        const share = conflictBuckets(a).some((bucket) => conflictBuckets(b).includes(bucket))
+        const together = [true, false].some((open) => resolvesIn(a, open) && resolvesIn(b, open))
+        expect(share, `${a.id} × ${b.id}`).toBe(together)
+      }
+    }
   })
 })
 
@@ -351,11 +420,30 @@ describe('findKeybindingConflicts', () => {
     // terminal.find is Cmd+F in the terminal bucket; an app-bucket Cmd+F is legal.
     expect(findKeybindingConflicts({ 'canvas.fitAll': ['Cmd+F'] }, true)).toEqual([])
   })
-  it('the scm bucket is its own keyspace, not part of global', () => {
-    // scm.commit holds Cmd+Enter; a canvas (global-bucket) override on the same chord is legal,
-    // because Commit dispatches from the focused composer. Reds if conflictBucket folds 'scm'
-    // into 'global'.
+  it('the scm bucket is its own keyspace, not part of a view bucket', () => {
+    // scm.commit holds Cmd+Enter; a canvas (canvas-view bucket) override on the same chord is legal,
+    // because Commit dispatches from the focused composer. Reds if conflictBuckets folds 'scm'
+    // into a view bucket.
     expect(findKeybindingConflicts({ 'canvas.fitAll': ['Cmd+Enter'] }, true)).toEqual([])
+  })
+  it('a canvas override may share a chord with a board command — they never dispatch together', () => {
+    // board.nextCard holds bare ArrowDown and only resolves while a board is up; canvas commands
+    // are inert then. A bare-arrow canvas override used to be stripped at load for this "conflict".
+    expect(findKeybindingConflicts({ 'canvas.deleteSelection': ['ArrowDown'] }, true)).toEqual([])
+    expect(sanitizeKeybindingOverrides({ 'canvas.deleteSelection': ['ArrowDown'] }, true))
+      .toEqual({ overrides: { 'canvas.deleteSelection': ['ArrowDown'] }, warnings: [] })
+    // …and the other direction: a board override on a canvas command's chord.
+    expect(findKeybindingConflicts({ 'board.openCard': ['Cmd+Shift+F'] }, true)).toEqual([])
+  })
+  it('a board override still conflicts with an app command, which dispatches on the board too', () => {
+    expect(findKeybindingConflicts({ 'board.openCard': ['Cmd+K'] }, true)).toEqual([
+      { binding: 'Cmd+K', commandIds: ['app.commandPalette', 'board.openCard'] }
+    ])
+  })
+  it('reports a collision between two app commands once, not once per view', () => {
+    expect(findKeybindingConflicts({ 'app.settings': ['Cmd+K'] }, true)).toEqual([
+      { binding: 'Cmd+K', commandIds: ['app.commandPalette', 'app.settings'] }
+    ])
   })
   it('two disabled commands never conflict', () => {
     expect(
@@ -636,5 +724,57 @@ describe('dictation conflict bucket', () => {
   it('the shipped defaults stay conflict-free under full scrutiny (unchanged invariant)', () => {
     expect(findKeybindingConflicts({}, true, { includeDefaults: true })).toEqual([])
     expect(findKeybindingConflicts({}, false, { includeDefaults: true })).toEqual([])
+  })
+})
+
+
+// The kanban board's keyboard (Space / J / K / arrows). Bare keys are only safe because of WHERE
+// these fire: while a board is up, and never while typing or in a terminal — the refusals below
+// are what make a bare letter a command rather than a character stolen from the user.
+describe('board commands', () => {
+  it('permit bare keys, letters and Space included — for board scope only', () => {
+    expect(normalizeBindingForCommand(def('board.nextCard'), 'j', true)).toEqual({ ok: true, value: 'J' })
+    expect(normalizeBindingForCommand(def('board.openCard'), 'Space', false)).toEqual({ ok: true, value: 'Space' })
+    expect(normalizeBindingForCommand(def('board.prevCard'), 'Shift+K', true)).toEqual({ ok: true, value: 'Shift+K' })
+    // Everyone else keeps the rule: a bare letter would be stolen from whatever the user types.
+    expect(normalizeBindingForCommand(def('node.newTerminal'), 'J', true).ok).toBe(false)
+    expect(normalizeBindingForCommand(def('canvas.deleteSelection'), 'J', true).ok).toBe(false)
+  })
+
+  it('resolve only while a board is open', () => {
+    expect(resolveCommandForKeyEvent(ev({ key: 'j' }), ctx({ kanbanOpen: true }), {}, true)).toBe('board.nextCard')
+    expect(resolveCommandForKeyEvent(ev({ key: 'ArrowDown' }), ctx({ kanbanOpen: true }), {}, false)).toBe('board.nextCard')
+    expect(resolveCommandForKeyEvent(ev({ key: 'k' }), ctx({ kanbanOpen: true }), {}, true)).toBe('board.prevCard')
+    expect(resolveCommandForKeyEvent(ev({ key: ' ' }), ctx({ kanbanOpen: true }), {}, true)).toBe('board.openCard')
+    expect(resolveCommandForKeyEvent(ev({ key: 'ArrowLeft' }), ctx({ kanbanOpen: true }), {}, true)).toBe('board.columnLeft')
+    expect(resolveCommandForKeyEvent(ev({ key: 'j' }), ctx(), {}, true)).toBeNull()
+    expect(resolveCommandForKeyEvent(ev({ key: ' ' }), ctx(), {}, true)).toBeNull()
+  })
+
+  it('are refused inside a text surface (the comment box, a rename field, the chat composer)', () => {
+    for (const key of ['j', 'k', ' ', 'ArrowDown', 'ArrowRight']) {
+      expect(resolveCommandForKeyEvent(ev({ key }), ctx({ kanbanOpen: true, typing: true }), {}, true)).toBeNull()
+    }
+  })
+
+  it('are refused while a terminal has focus — the card modal\'s terminal owns its keys', () => {
+    for (const terminalFirst of [false, true]) {
+      for (const key of ['j', 'k', ' ', 'ArrowUp']) {
+        expect(
+          resolveCommandForKeyEvent(ev({ key }), ctx({ kanbanOpen: true, terminal: true, terminalFirst }), {}, true)
+        ).toBeNull()
+      }
+    }
+  })
+
+  it('a held modifier is a different chord (Cmd+J is not J)', () => {
+    expect(resolveCommandForKeyEvent(ev({ key: 'j', metaKey: true }), ctx({ kanbanOpen: true }), {}, true)).toBeNull()
+  })
+
+  it('follow a remap and a disable', () => {
+    const o = { 'board.nextCard': ['N'], 'board.openCard': [] as string[] }
+    expect(resolveCommandForKeyEvent(ev({ key: 'n' }), ctx({ kanbanOpen: true }), o, true)).toBe('board.nextCard')
+    expect(resolveCommandForKeyEvent(ev({ key: 'j' }), ctx({ kanbanOpen: true }), o, true)).toBeNull()
+    expect(resolveCommandForKeyEvent(ev({ key: ' ' }), ctx({ kanbanOpen: true }), o, true)).toBeNull()
   })
 })

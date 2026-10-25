@@ -1,10 +1,15 @@
 import { useEffect, useState } from 'react'
+import { Tooltip } from '../components/Tooltip'
+import { IconChevronDown, IconChevronRight, IconClose } from '../components/icons'
 import { Handle, NodeResizer, Position, useReactFlow, type NodeProps } from '@xyflow/react'
 import { NODE_MIN_SIZES } from '../lib/nodeSizing'
-import { COLLAPSED_HEIGHT, NODE_COLORS, type CanvasNode } from '../state/workspace'
+import { toggleCollapsed, type CanvasNode } from '../state/workspace'
+import { NodeColorSwatches } from '../components/NodeColorSwatches'
 import { ColumnPill } from '../components/kanban/ColumnPill'
 import { NoteMarkdown } from '../components/NoteMarkdown'
 import { relativeTime } from '../lib/relativeTime'
+import { useSettings } from '../state/settings'
+import { backedFillStyle } from '@shared/canvas-backing'
 
 /**
  * A sticky note node: a colored, resizable card with free-text content.
@@ -13,6 +18,8 @@ import { relativeTime } from '../lib/relativeTime'
 export function StickyNode({ id, data, selected }: NodeProps<CanvasNode>) {
   const { updateNodeData, deleteElements, setNodes } = useReactFlow()
   const [showColors, setShowColors] = useState(false)
+  // Settings → Appearance → Sticky note background (issue #1113); 0 = the old see-through look.
+  const backing = useSettings((s) => s.settings.stickyNoteBacking)
   /**
    * The title is a plain SPAN until it is clicked, exactly as on a terminal node.
    *
@@ -44,22 +51,7 @@ export function StickyNode({ id, data, selected }: NodeProps<CanvasNode>) {
     return () => clearInterval(t)
   }, [stampAt])
 
-  const toggleCollapse = () =>
-    setNodes((ns) =>
-      ns.map((n) => {
-        if (n.id !== id) return n
-        const next = !n.data.collapsed
-        const expandedHeight =
-          (n.data.expandedHeight as number) ?? n.measured?.height ?? (n.height as number) ?? 200
-        const height = next ? COLLAPSED_HEIGHT : expandedHeight
-        return {
-          ...n,
-          height,
-          style: { ...n.style, height },
-          data: { ...n.data, collapsed: next, expandedHeight }
-        }
-      })
-    )
+  const toggleCollapse = () => setNodes((ns) => toggleCollapsed(ns as CanvasNode[], [id]))
 
   return (
     <>
@@ -67,7 +59,7 @@ export function StickyNode({ id, data, selected }: NodeProps<CanvasNode>) {
     <ColumnPill nodeId={id} />
     <div
       className={`sticky-node${selected ? ' selected' : ''}${collapsed ? ' collapsed' : ''}`}
-      style={{ background: `${data.color}22`, borderColor: data.color }}
+      style={{ ...backedFillStyle(data.color, '22', backing), borderColor: data.color }}
     >
       <NodeResizer minWidth={NODE_MIN_SIZES.sticky.width} minHeight={NODE_MIN_SIZES.sticky.height} isVisible={selected && !collapsed} color={data.color} />
 
@@ -88,28 +80,32 @@ export function StickyNode({ id, data, selected }: NodeProps<CanvasNode>) {
       />
 
       <div className="sticky-node__header" style={{ background: `${data.color}33` }}>
-        <button className="term-node__collapse" title={collapsed ? 'Expand' : 'Collapse'} onClick={toggleCollapse}>
-          {collapsed ? '▸' : '▾'}
-        </button>
-        <button
-          className="term-node__color"
-          style={{ background: data.color }}
-          title="Color"
-          onClick={() => setShowColors((v) => !v)}
-        />
+        <Tooltip label={collapsed ? 'Expand' : 'Collapse'}>
+          <button
+            className="term-node__collapse"
+            aria-label={collapsed ? 'Expand' : 'Collapse'}
+            onClick={toggleCollapse}
+          >
+            {collapsed ? <IconChevronRight /> : <IconChevronDown />}
+          </button>
+        </Tooltip>
+        <Tooltip label="Color">
+          <button
+            className="term-node__color"
+            style={{ background: data.color }}
+            aria-label="Color"
+            onClick={() => setShowColors((v) => !v)}
+          />
+        </Tooltip>
         {showColors && (
-          <div className="color-popover">
-            {NODE_COLORS.map((c) => (
-              <button
-                key={c}
-                style={{ background: c }}
-                onClick={() => {
-                  updateNodeData(id, { color: c })
-                  setShowColors(false)
-                }}
-              />
-            ))}
-          </div>
+          <NodeColorSwatches
+            className="color-popover"
+            selected={data.color as string | undefined}
+            onPick={(c) => {
+              updateNodeData(id, { color: c })
+              setShowColors(false)
+            }}
+          />
         )}
         {editingTitle ? (
           <input
@@ -149,13 +145,15 @@ export function StickyNode({ id, data, selected }: NodeProps<CanvasNode>) {
             up by. That grab area is what the permanent full-width input used to swallow. Absent
             while editing, since the input takes the `flex: 1` role itself. */}
         {!editingTitle && <span className="term-node__spacer" />}
-        <button
-          className="term-node__close"
-          title="Close"
-          onClick={() => deleteElements({ nodes: [{ id }] })}
-        >
-          ×
-        </button>
+        <Tooltip label="Close">
+          <button
+            className="term-node__close"
+            aria-label="Close"
+            onClick={() => deleteElements({ nodes: [{ id }] })}
+          >
+            <IconClose />
+          </button>
+        </Tooltip>
       </div>
 
       {editingText ? (

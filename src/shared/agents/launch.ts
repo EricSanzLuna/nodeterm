@@ -25,9 +25,10 @@ import {
   type AgentId,
   type AgentPermissionMode
 } from './config'
-import { withPermissionMode } from './approval-mode'
+import { withPermissionMode, type ApprovalCaps } from './approval-mode'
 import { resolveAgentConfig } from './custom-agent'
 import { withAgentModel } from './model-gateway'
+import { withCodexNoDaemon } from './codex-daemon'
 
 export interface LaunchInputs {
   agentId: AgentId
@@ -65,6 +66,10 @@ export interface LaunchInputs {
    *  CLI? The caller's answer to "will the launcher actually be there?" — false (the default) emits
    *  the bare command byte-for-byte. A remote node must pass false (the host has no launcher). */
   sharedIdentity?: boolean
+  /** What the CLI that will RUN this session accepts, so a flag value it does not have is never
+   *  emitted (codex dropped `untrusted` in 0.149.0 and clap EXITS on an unknown value). Omitted =
+   *  the baseline vocabulary, which is the pre-probe command line — see `ApprovalCaps`. */
+  approvalCaps?: ApprovalCaps
 }
 
 export interface ResumeInputs {
@@ -81,6 +86,10 @@ export interface ResumeInputs {
   /** Should a SHARED_IDENTITY_CAPABLE agent (codex) name its managed launcher on resume? Same
    *  semantics as `LaunchInputs.sharedIdentity`. */
   sharedIdentity?: boolean
+  /** What the CLI that will RUN this session accepts, so a flag value it does not have is never
+   *  emitted (codex dropped `untrusted` in 0.149.0 and clap EXITS on an unknown value). Omitted =
+   *  the baseline vocabulary, which is the pre-probe command line — see `ApprovalCaps`. */
+  approvalCaps?: ApprovalCaps
 }
 
 export interface AssembledCommand {
@@ -206,7 +215,7 @@ export function assembleLaunchCommand(
     eff.promptInjectionMode === 'flag-prompt'
       ? '--prompt'
       : eff.promptInjectionMode === 'flag-interactive'
-        ? '--interactive'
+        ? (eff.promptFlag ?? '--interactive')
         : null
   const isFlagPrompt = !!promptFlag
   const usesSep = !!promptArg && !!sep && !isFlagPrompt
@@ -218,7 +227,7 @@ export function assembleLaunchCommand(
 
   const flagged = (cmd: string): string => {
     const withMode = inputs.permissionMode
-      ? withPermissionMode(cmd, capId, inputs.permissionMode)
+      ? withPermissionMode(cmd, capId, inputs.permissionMode, inputs.approvalCaps ?? {})
       : cmd
     // Session-id minting: claude-base + CLI supports the flag. On resume this branch is never
     // taken (assembleResumeCommand does not pass sessionId).
@@ -228,7 +237,9 @@ export function assembleLaunchCommand(
     return withAgentModel(withMode, capId, inputs.model)
   }
 
-  const command = usesSep ? `${flagged(baseCmd)} ${sep} ${promptArg}` : flagged(withPrompt)
+  const composed = usesSep ? `${flagged(baseCmd)} ${sep} ${promptArg}` : flagged(withPrompt)
+  // Codex has no prompt separator, so the flag lands last like its approval flag. See codex-daemon.
+  const command = withCodexNoDaemon(composed, capId, inputs.approvalCaps ?? {})
   return { command, missingEnv: [...m1, ...m2] }
 }
 
@@ -261,8 +272,12 @@ export function assembleResumeCommand(
   const resumeBase = inputs.sessionId ? resumeCommandWith(baseCmd, capId, inputs.sessionId) : null
   const base = resumeBase ?? baseCmd
   const withMode = inputs.permissionMode
-    ? withPermissionMode(base, capId, inputs.permissionMode)
+    ? withPermissionMode(base, capId, inputs.permissionMode, inputs.approvalCaps ?? {})
     : base
-  const command = withAgentModel(withMode, capId, inputs.model)
+  const command = withCodexNoDaemon(
+    withAgentModel(withMode, capId, inputs.model),
+    capId,
+    inputs.approvalCaps ?? {}
+  )
   return { command, missingEnv: [...m1, ...m2] }
 }

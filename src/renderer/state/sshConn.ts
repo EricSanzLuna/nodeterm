@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { SshConnection } from '@shared/ssh'
+import type { RemoteCodexNoDaemon } from '@shared/types'
 
 /** Live connection coordinates for one connection scope, returned by `sshProject.connect`.
  *  A scope is an SSH PROJECT's id, or a host ATTACHMENT id — see `sshConnectionIdForProject`. */
@@ -24,6 +25,8 @@ export interface SshConnInfo {
   /** The probed remote `claude --version` output (`null` = probe ran, claude not found). Feeds
    *  the tab menu's Auto hint; only present on a reused (already probed) connection. */
   remoteClaudeVersion?: string | null
+  /** The host's `--no-daemon` answer, when the connection had already probed it (reused conns). */
+  remoteCodexNoDaemon?: RemoteCodexNoDaemon
   /** Absolute remote path of the uploaded `nodeterm-codex` launcher (`chmod 700`). Present only
    *  when `installRemoteCodexRuntime` found node+codex+curl and staged the runtime. Absent ⇒ this
    *  host cannot host managed Codex accounts (the renderer keeps Codex nodes on the system login). */
@@ -77,6 +80,18 @@ export type SshAutoPermAnswer = 'yes' | 'no' | 'unknown'
  */
 interface SshConnState {
   byProject: Record<string, SshConnInfo>
+  /**
+   * Connection scope → the ControlMaster path published the moment `ssh -O check` answered, i.e.
+   * BEFORE the connect's remote setup chain finished (`SshProjectStatusEvent.masterControlPath`).
+   *
+   * Kept in its OWN map, deliberately: `byProject[id]` is read all over the app as "this project is
+   * connected" (the usage pill, the RAM pill, Source Control, the accounts picker), and an early
+   * entry there would make every one of them claim a connection whose remote setup has not run.
+   * The ONE consumer is `resolveSshRemote`'s early-attach path, which additionally requires the
+   * node's remote tmux session to be confirmed present. Dropped the instant the full info lands
+   * (it supersedes this) and on any status that means the master is gone.
+   */
+  earlyByProject: Record<string, string>
   /** Attachment scope id → how to reach it and whose canvas it serves. Written BEFORE the dial
    *  (see `registerAttachment`), so it outlives a failed connect. */
   attachments: Record<string, SshAttachment>
@@ -87,7 +102,22 @@ interface SshConnState {
   /** project id → the probed remote `claude --version` output (`null` = claude not found). Kept
    *  beside `autoPermByProject` (same lifecycle) so the tab-menu hint can name the version. */
   remoteClaudeVersionByProject: Record<string, string | null>
+  /** `user@host` → that host's `codex` accepts `--no-daemon`. Keyed by HOST, not scope: it is a
+   *  fact about the binary on that machine, shared by every project and attachment pointed at it,
+   *  and a repointed project changes its key rather than inheriting a stale answer. */
+  codexNoDaemonByHost: Record<string, boolean>
+  /** Record a host's `--no-daemon` answer (a `connected` status event, or a reused connect). */
+  setRemoteCodexNoDaemon(answer: RemoteCodexNoDaemon): void
+  /** True ONLY when that host's codex was probed and advertised `--no-daemon`. */
+  remoteCodexNoDaemon(hostKey: string): boolean
   setConn(projectId: string, info: SshConnInfo): void
+  /** Record the early (pre-setup) ControlMaster path for a scope. Ignored once the full info for
+   *  that scope has landed — the full entry is strictly better and must not be walked back. */
+  setEarlyControlPath(projectId: string, controlPath: string): void
+  /** The early ControlMaster path for a scope, if one was published and not yet superseded. */
+  getEarlyControlPath(projectId: string): string | undefined
+  /** Forget a scope's early path (the master is gone: disconnected / reconnecting / error). */
+  clearEarlyControlPath(projectId: string): void
   /** Record the remote CLI probe's answer (pushed on a `connected` status event once it lands).
    *  `version` rides the same event; undefined leaves the cached version untouched. */
   setClaudeAutoPermissionMode(projectId: string, supported: boolean, version?: string | null): void
@@ -136,14 +166,39 @@ interface SshConnState {
   attachmentScopesOf(ownerProjectId: string): string[]
 }
 
+/** Return `map` without `key` — a fresh object, or the SAME one when the key was never there (so a
+ *  no-op write cannot re-render every subscriber). */
+function dropKey<T>(map: Record<string, T>, key: string): Record<string, T> {
+  if (!(key in map)) return map
+  const next = { ...map }
+  delete next[key]
+  return next
+}
+
 export const useSshConn = create<SshConnState>((set, get) => ({
   byProject: {},
+  earlyByProject: {},
   attachments: {},
   autoPermByProject: {},
   remoteClaudeVersionByProject: {},
+  codexNoDaemonByHost: {},
+  setRemoteCodexNoDaemon({ hostKey, supported }) {
+    set((s) =>
+      s.codexNoDaemonByHost[hostKey] === supported
+        ? s
+        : { codexNoDaemonByHost: { ...s.codexNoDaemonByHost, [hostKey]: supported } }
+    )
+  },
+  remoteCodexNoDaemon(hostKey) {
+    return get().codexNoDaemonByHost[hostKey] === true
+  },
   setConn(projectId, info) {
+    if (info.remoteCodexNoDaemon) get().setRemoteCodexNoDaemon(info.remoteCodexNoDaemon)
     set((s) => ({
       byProject: { ...s.byProject, [projectId]: info },
+      // The full info supersedes the early path — keeping both would leave a stale socket string
+      // behind for the rest of the app run.
+      earlyByProject: dropKey(s.earlyByProject, projectId),
       // A reused (already probed) connection returns the answer with the connect result.
       autoPermByProject:
         info.claudeAutoPermissionMode === undefined
@@ -163,6 +218,21 @@ export const useSshConn = create<SshConnState>((set, get) => ({
           ? s.remoteClaudeVersionByProject
           : { ...s.remoteClaudeVersionByProject, [projectId]: version }
     }))
+  },
+  setEarlyControlPath(projectId, controlPath) {
+    set((s) =>
+      s.byProject[projectId] || s.earlyByProject[projectId] === controlPath
+        ? s
+        : { earlyByProject: { ...s.earlyByProject, [projectId]: controlPath } }
+    )
+  },
+  getEarlyControlPath(projectId) {
+    return get().earlyByProject[projectId]
+  },
+  clearEarlyControlPath(projectId) {
+    set((s) =>
+      projectId in s.earlyByProject ? { earlyByProject: dropKey(s.earlyByProject, projectId) } : s
+    )
   },
   getControlPath(projectId) {
     return get().byProject[projectId]?.controlPath
@@ -199,7 +269,7 @@ export const useSshConn = create<SshConnState>((set, get) => ({
       delete next[scopeId]
       const conns = { ...s.byProject }
       delete conns[scopeId]
-      return { attachments: next, byProject: conns }
+      return { attachments: next, byProject: conns, earlyByProject: dropKey(s.earlyByProject, scopeId) }
     })
   },
   supportsAutoPermissionMode(projectId) {
@@ -232,7 +302,12 @@ export const useSshConn = create<SshConnState>((set, get) => ({
       delete nextAuto[projectId]
       const nextVersion = { ...s.remoteClaudeVersionByProject }
       delete nextVersion[projectId]
-      return { byProject: next, autoPermByProject: nextAuto, remoteClaudeVersionByProject: nextVersion }
+      return {
+        byProject: next,
+        earlyByProject: dropKey(s.earlyByProject, projectId),
+        autoPermByProject: nextAuto,
+        remoteClaudeVersionByProject: nextVersion
+      }
     })
   },
   attachmentScopesOf(ownerProjectId) {

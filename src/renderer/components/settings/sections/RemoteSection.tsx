@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { useEntitlement } from '../../../state/entitlement'
 import { useProjects } from '../../../state/projects'
-import { hostShareOptions } from '../../../lib/relayHostShare'
+import { relayShareGrantCopy } from '../../../lib/relayHostShare'
+import { useHostShareChoice } from '../../../lib/useHostShareChoice'
 import { thisMachine } from '../../../lib/machineName'
 import { SettingsSection } from '../SettingsSection'
 import { SearchableRow } from '../SearchableRow'
@@ -38,12 +39,15 @@ export function RemoteSection({
 
   // Which project this host shares with the joiner. Default = the active project (hoisted first
   // by hostShareOptions); the user can pick any other OPEN project before minting the offer.
-  const shareOptions = hostShareOptions(projects, activeProjectId)
-  const [shareId, setShareId] = useState('')
-  const effectiveShareId = shareOptions.some((o) => o.id === shareId)
-    ? shareId
-    : (shareOptions[0]?.id ?? '')
-  const sharedName = shareOptions.find((o) => o.id === effectiveShareId)?.name ?? ''
+  // A project whose folder is the disk root or the home directory (or contains it) is offered
+  // disabled with the host's reason, and never falls back to an unscoped invite (useHostShareChoice).
+  const {
+    options: shareOptions,
+    shareId: effectiveShareId,
+    setShareId,
+    sharedName,
+    refusal: shareRefusal
+  } = useHostShareChoice(projects, activeProjectId)
   // HOST side — the NEW relay tunnel (`relayHost`). `start()` returns the single-use pairing offer;
   // a connecting peer's approval + canvas sync are handled globally by Canvas (`relayHost.onPeerPending`
   // / `relayHost.confirm`, and the CorePlatform seq-stamped reflector — no old canvas-mirror flag).
@@ -93,9 +97,13 @@ export function RemoteSection({
             hostOffer ? (
               <div className="space-y-2">
                 <p className="text-sm text-muted">
-                  Sharing <strong className="text-text">{sharedName || 'this project'}</strong> —
-                  the joiner will see this project and can run commands on {thisMachine()}. Share
-                  this pairing code with the other device (single use):
+                  {sharedName ? (
+                    <>
+                      Sharing <strong className="text-text">{sharedName}</strong>.{' '}
+                    </>
+                  ) : null}
+                  {relayShareGrantCopy(sharedName || null, thisMachine())} Share this pairing code
+                  with the other device (single use):
                 </p>
                 <FieldRow
                   label="Pairing code"
@@ -125,20 +133,24 @@ export function RemoteSection({
                         onChange={(e) => setShareId(e.target.value)}
                       >
                         {shareOptions.map((o) => (
-                          <option key={o.id} value={o.id}>
-                            {o.name}
+                          <option key={o.id} value={o.id} disabled={!!o.refusal}>
+                            {o.refusal ? `${o.name} (cannot be shared)` : o.name}
                           </option>
                         ))}
                       </Select>
                     }
                   />
-                ) : (
-                  <p className="text-sm text-muted">
-                    Sharing <strong className="text-text">{sharedName || 'this project'}</strong> —
-                    the joiner sees this project and can run commands on {thisMachine()}.
-                  </p>
-                )}
-                <Button disabled={hostBusy} onClick={() => void startHosting()}>
+                ) : null}
+                <p className="text-sm text-muted">
+                  {sharedName && shareOptions.length <= 1 ? (
+                    <>
+                      Sharing <strong className="text-text">{sharedName}</strong>.{' '}
+                    </>
+                  ) : null}
+                  {relayShareGrantCopy(sharedName || null, thisMachine())}
+                </p>
+                {shareRefusal ? <p className="text-sm text-danger">{shareRefusal}</p> : null}
+                <Button disabled={hostBusy || !!shareRefusal} onClick={() => void startHosting()}>
                   {hostBusy ? 'Starting…' : 'Allow remote access'}
                 </Button>
               </div>
@@ -175,7 +187,7 @@ export function RemoteSection({
             )}
           </Button>
           {remoteError ? (
-            <p className="text-sm" style={{ color: '#ff9f0a' }}>
+            <p className="text-sm" style={{ color: 'var(--warn)' }}>
               {remoteError}
             </p>
           ) : null}

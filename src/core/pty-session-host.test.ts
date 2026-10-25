@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { IPC } from '../shared/ipc'
 import { initPlatform, resetPlatformForTests } from './platform'
 import { fakePlatform, type FakePlatform } from './platform-fake'
+import { DEFAULT_SETTINGS } from '../shared/types'
 
 const backend = vi.hoisted(() => ({
   supported: vi.fn(() => true),
@@ -56,8 +57,13 @@ function fakeSessionHostPty(ready = Promise.resolve({ fresh: true })) {
   let dataCb: ((data: string) => void) | undefined
   let exitCb: ((e: { exitCode: number }) => void) | undefined
   let attachErrorCb: ((error: Error) => void) | undefined
+  let sizeCb: ((size: { cols: number; rows: number }) => void) | undefined
   return {
     ready,
+    onSize: vi.fn((cb: (size: { cols: number; rows: number }) => void) => {
+      sizeCb = cb
+    }),
+    emitSize: (cols: number, rows: number) => sizeCb?.({ cols, rows }),
     onData: vi.fn((cb: (data: string) => void) => {
       dataCb = cb
     }),
@@ -82,6 +88,15 @@ function fakeSessionHostPty(ready = Promise.resolve({ fresh: true })) {
 describe('PtyManager session-host contracts', () => {
   let manager: import('./pty-manager').PtyManager | undefined
   let host: FakePlatform
+  let PtyManagerCtor: typeof import('./pty-manager').PtyManager
+
+  // The first dynamic import of pty-manager is cold and heavy (~5 s on the windows-latest runner).
+  // Paying it inside makeManager() charged it to whichever test ran first, which then hit the
+  // default 5 s test timeout (the #914 size test failed that way twice). Load it once, here, under
+  // a hook timeout sized for a cold import; every test then only constructs.
+  beforeAll(async () => {
+    PtyManagerCtor = (await import('./pty-manager')).PtyManager
+  }, 60_000)
 
   beforeEach(() => {
     host = fakePlatform()
@@ -104,10 +119,94 @@ describe('PtyManager session-host contracts', () => {
   })
 
   async function makeManager() {
-    const { PtyManager } = await import('./pty-manager')
-    manager = new PtyManager()
+    manager = new PtyManagerCtor()
     return manager
   }
+
+  describe('shared size follows the backend (issue #914)', () => {
+    function sizesSent(sessionId: string): Array<{ to: number | 'broadcast'; size: unknown }> {
+      return host.sent
+        .filter((message) => message.channel === IPC.ptySize(sessionId))
+        .map((message) => ({ to: message.to, size: message.args[0] }))
+    }
+
+    it('tells each view the size the host reports, once, and re-corrects a view that re-fits', async () => {
+      const shim = fakeSessionHostPty()
+      backend.create.mockReturnValue(shim)
+      const m = await makeManager()
+      m.registerIpc()
+      await host.handlers[IPC.ptyCreate](7, { cols: 80, rows: 24, persistKey: 'node-geo' })
+
+      // Another viewer of the session is the active one: the pty runs at ITS size.
+      shim.emitSize(100, 30)
+      shim.emitSize(100, 30)
+      expect(sizesSent('pty-1')).toEqual([{ to: 7, size: { cols: 100, rows: 30 } }])
+
+      // The view re-fits to its own grid. That is only a vote now — no local min broadcast — and
+      // the backend's answer (unchanged, the other viewer is still active) corrects it again.
+      m.resize(7, 'pty-1', 90, 20)
+      expect(shim.resize).toHaveBeenLastCalledWith(90, 20, false)
+      expect(sizesSent('pty-1')).toHaveLength(1)
+      shim.emitSize(100, 30)
+      expect(sizesSent('pty-1')).toEqual([
+        { to: 7, size: { cols: 100, rows: 30 } },
+        { to: 7, size: { cols: 100, rows: 30 } }
+      ])
+    })
+
+    it('re-sends the last answer when a view re-fits but the vote does not move', async () => {
+      const shim = fakeSessionHostPty()
+      backend.create.mockReturnValue(shim)
+      const m = await makeManager()
+      m.registerIpc()
+      await host.handlers[IPC.ptyCreate](7, { cols: 80, rows: 24, persistKey: 'node-geo-2' })
+      shim.emitSize(100, 30)
+      const resizes = shim.resize.mock.calls.length
+      // Same vote as the spawn size: nothing goes to the backend, so nothing would come back.
+      m.resize(7, 'pty-1', 80, 24)
+      expect(shim.resize.mock.calls.length).toBe(resizes)
+      expect(sizesSent('pty-1').at(-1)).toEqual({ to: 7, size: { cols: 100, rows: 30 } })
+      expect(sizesSent('pty-1')).toHaveLength(2)
+    })
+
+    it('makes a relay sink a ceiling unless it renders Resized, and forwards the answer to it', async () => {
+      const bounded = fakeSessionHostPty()
+      const adaptive = fakeSessionHostPty()
+      backend.create.mockReturnValueOnce(bounded).mockReturnValueOnce(adaptive)
+      const m = await makeManager()
+      const phoneSizes: unknown[] = []
+      const sid = m.createDetached(
+        { cols: 80, rows: 24, persistKey: 'node-phone' },
+        { onData: () => {}, onExit: () => {}, onSize: (size) => phoneSizes.push(size) }
+      )
+      m.resize(null, sid, 45, 40)
+      expect(bounded.resize).toHaveBeenLastCalledWith(45, 40, true)
+      bounded.emitSize(45, 30)
+      bounded.emitSize(45, 30)
+      expect(phoneSizes).toEqual([{ cols: 45, rows: 30 }])
+
+      // Every report from the phone is answered, even when the answer has not changed: the phone
+      // clears its "sized to another screen" hint on each resize it sends and needs the host to
+      // restate the truth — here an unchanged vote, re-answered from the last backend size.
+      m.resize(null, sid, 45, 40)
+      expect(phoneSizes).toEqual([
+        { cols: 45, rows: 30 },
+        { cols: 45, rows: 30 }
+      ])
+      // A changed vote is answered by the backend, and forwarded even when it equals the report.
+      m.resize(null, sid, 45, 38)
+      bounded.emitSize(45, 38)
+      expect(phoneSizes.at(-1)).toEqual({ cols: 45, rows: 38 })
+      expect(phoneSizes).toHaveLength(3)
+
+      const other = m.createDetached(
+        { cols: 80, rows: 24, persistKey: 'node-phone-2' },
+        { onData: () => {}, onExit: () => {}, adaptsToSize: true }
+      )
+      m.resize(null, other, 45, 40)
+      expect(adaptive.resize).toHaveBeenLastCalledWith(45, 40, false)
+    })
+  })
 
   it('asks the session host whether a no-tmux persisted session exists', async () => {
     const m = await makeManager()
@@ -148,6 +247,89 @@ describe('PtyManager session-host contracts', () => {
       expect(spawn.shell).toBe(process.env.SHELL || 'bash')
     }
     expect(spawn.args).toEqual([])
+  })
+
+  it('caps the session-host emulator at the renderer scrollback cap, not tmux history-limit', async () => {
+    const { PtyManager } = await import('./pty-manager')
+    for (const [tmuxScrollback, expected] of [
+      [50000, 10000],
+      [2000, 2000],
+      [500, 1000]
+    ] as const) {
+      backend.create.mockClear()
+      const m = new PtyManager({ runtimePlatform: 'win32' })
+      ;(m as unknown as { getSettings: () => unknown }).getSettings = () => ({
+        ...DEFAULT_SETTINGS,
+        tmuxScrollback
+      })
+      m.createDetached(
+        { cols: 80, rows: 24, persistKey: `node-sb-${tmuxScrollback}` },
+        { onData: () => {}, onExit: () => {} }
+      )
+      expect(backend.create).toHaveBeenCalledTimes(1)
+      expect(backend.create.mock.calls[0][2]).toBe(expected)
+      await m.killAll()
+    }
+  })
+
+  it('sends no launch dialect from a POSIX core, so its spawn request is unchanged', async () => {
+    const { PtyManager } = await import('./pty-manager')
+    for (const runtimePlatform of ['darwin', 'linux'] as const) {
+      backend.create.mockClear()
+      const m = new PtyManager({ runtimePlatform })
+      ;(m as unknown as { getSettings: () => unknown }).getSettings = () => ({
+        ...DEFAULT_SETTINGS,
+        defaultShell: 'pwsh'
+      })
+      m.createDetached({ cols: 80, rows: 24, persistKey: `node-${runtimePlatform}` }, { onData: () => {}, onExit: () => {} })
+      const spawn = backend.create.mock.calls[0][1] as Record<string, unknown>
+      expect('launchDialect' in spawn).toBe(false)
+      await m.killAll()
+    }
+  })
+
+  const PS = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
+
+  it('records the Windows-native dialect at spawn and keeps the HOST-reported one for execute-launch', async () => {
+    const { PtyManager } = await import('./pty-manager')
+    // The host answers with its own record of the generation's parser (a warm attach reports what
+    // the shell WAS spawned as) — that, not the spawn request, is what the launch is encoded for.
+    backend.create.mockImplementation(() =>
+      fakeSessionHostPty(Promise.resolve({ fresh: true, launchDialect: 'cmd' }) as never)
+    )
+    const m = new PtyManager({ runtimePlatform: 'win32' })
+    manager = m
+    ;(m as unknown as { getSettings: () => unknown }).getSettings = () => ({
+      ...DEFAULT_SETTINGS,
+      defaultShell: 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'
+    })
+    m.registerIpc()
+    await host.handlers[IPC.ptyCreate](7, { cols: 80, rows: 24, persistKey: 'node-win', agentId: 'claude' })
+    const spawn = backend.create.mock.calls[0][1] as { launchDialect?: string }
+    expect(spawn.launchDialect).toBe('pwsh')
+
+    const execute = vi.fn(async () => ({ status: 'executed' as const }))
+    ;(m as unknown as { launchIntentDepsOverride: Record<string, unknown> }).launchIntentDepsOverride = {
+      customAgents: () => [],
+      sharedIdentityAvailable: async () => false,
+      codexCaps: async () => ({ approvalValues: null, noDaemon: null }),
+      exists: (c: string) => c === 'C:\\Tools\\claude.exe' || c === PS,
+      systemRoot: 'C:\\Windows',
+      execute
+    }
+    // The spawn PATH recorded here is this POSIX test host's; point it at a Windows directory.
+    ;(m as unknown as { sessions: Map<string, { launchPath?: string }> }).sessions.forEach((s) => {
+      s.launchPath = 'C:\\Tools'
+    })
+    const result = await host.handlers[IPC.ptyExecuteLaunch]('node-win', {
+      launchId: '123e4567-e89b-42d3-a456-426614174000',
+      intent: { kind: 'agent', action: 'start', agentId: 'claude', prompt: "it's" }
+    })
+    expect(result).toEqual({ ok: true })
+    // Encoded for `cmd` (the host's word), not `pwsh` (the request): the ASCII-only wrapper line.
+    const plan = (execute.mock.calls[0] as unknown[])[2] as { command: string }
+    expect(plan.command.startsWith(`"${PS}" -NoLogo -NoProfile -EncodedCommand `)).toBe(true)
+    expect(plan.command).not.toContain("it's")
   })
 
   it('fails a create closed, parks racing followers, and publishes only the recovered generation', async () => {
@@ -532,6 +714,51 @@ describe('PtyManager session-host contracts', () => {
     })
     await expect(create(8, options)).resolves.toMatchObject({ sessionId: 'pty-1', fresh: false })
     expect(backend.create).toHaveBeenCalledTimes(1)
+  })
+
+  it('never tells a session-host joiner to enter the alternate screen (its scrollback is its history)', async () => {
+    backend.create.mockReturnValue(fakeSessionHostPty())
+    const m = await makeManager()
+    m.registerIpc()
+    const create = host.handlers[IPC.ptyCreate]
+    const options = { cols: 80, rows: 24, persistKey: 'node-alt-screen' }
+
+    const spawned = (await create(7, options)) as { tmuxClient?: boolean }
+    // Not a tmux client either, so a resync repaint re-applies no alt screen / tmux mouse.
+    expect(spawned.tmuxClient).toBeUndefined()
+    const joined = (await create(8, options)) as {
+      fresh: boolean
+      coAttachAltScreen?: boolean
+      tmuxClient?: boolean
+    }
+    expect(joined.fresh).toBe(false) // it did join the live session…
+    expect(joined.coAttachAltScreen).toBeUndefined() // …but there is no tmux alt screen to restore
+    expect(joined.tmuxClient).toBeUndefined()
+  })
+
+  it('never tells a session-host joiner to enable tmux mouse tracking (no tmux runs `mouse on` there)', async () => {
+    // Was gated on `persistKey`, which a session-host session carries: the joiner (card modal,
+    // reloaded node, teammate) entered ?1000/?1002/?1006 tracking with no tmux behind it, so the
+    // wheel and drags went to the shell as SGR reports instead of scrolling and selecting.
+    backend.create.mockReturnValue(fakeSessionHostPty())
+    const m = await makeManager()
+    m.registerIpc()
+    const create = host.handlers[IPC.ptyCreate]
+    const options = { cols: 80, rows: 24, persistKey: 'node-mouse' }
+
+    await create(7, options)
+    const joined = (await create(8, options)) as {
+      fresh: boolean
+      persistent?: boolean
+      coAttachMouse?: boolean
+      coAttachAltScreen?: boolean
+      tmuxClient?: boolean
+    }
+    expect(joined.fresh).toBe(false)
+    expect(joined.persistent).toBe(true) // still a session that outlives its clients…
+    expect(joined.coAttachMouse).toBeUndefined() // …but with no tmux mouse to turn on
+    expect(joined.coAttachAltScreen).toBeUndefined()
+    expect(joined.tmuxClient).toBeUndefined()
   })
 
   it('leaves the live generation joinable when the confirmed backend kill rejects', async () => {

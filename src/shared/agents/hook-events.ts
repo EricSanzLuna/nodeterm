@@ -19,7 +19,21 @@
  * claude/codex/gemini stay plain strings, so their emitted config is byte-identical to what it has
  * always been.
  */
-export type ManagedHookEvent = string | { event: string; matcher: string }
+export type ManagedHookEvent = string | { event: string; matcher?: string; timeout?: number }
+
+/** A subscription's event name, whichever form it was declared in. */
+export function managedEventName(e: ManagedHookEvent): string {
+  return typeof e === 'string' ? e : e.event
+}
+
+/**
+ * The `timeout` (seconds) we write on claude's PermissionRequest handler. Claude's command-hook
+ * default is 600 s today, but a held plan/question waits up to `PERM_WAIT_SECS_INTERACTIVE` (540 s,
+ * core/agents/permission-decision.ts) — so the bound the hold is sized against is written down in
+ * the user's settings instead of borrowed from a CLI default that could change under us. Existing
+ * installs pick it up at the next install (the managed entry is always rewritten fresh).
+ */
+export const PERMISSION_REQUEST_HOOK_TIMEOUT_SECS = 600
 
 /** Claude Code hook events. Each maps to a `NormalizedAgentEvent` in shared/agents/normalize.ts. */
 export const CLAUDE_HOOK_EVENTS = [
@@ -30,12 +44,21 @@ export const CLAUDE_HOOK_EVENTS = [
   // status badge sticks on "working" after any errored turn.
   'StopFailure',
   'Notification',
-  // Dedicated permission-prompt signal (→ blocked), more direct than Notification.
-  'PermissionRequest',
+  // Dedicated permission-prompt signal (→ blocked), more direct than Notification. Carries an
+  // explicit timeout because the managed hook HOLDS it (hook-reply approvals, up to 540 s).
+  { event: 'PermissionRequest', timeout: PERMISSION_REQUEST_HOOK_TIMEOUT_SECS },
   'SessionEnd',
   'PreToolUse',
-  'PostToolUse'
-] as const
+  'PostToolUse',
+  // Claude's own subagent lifecycle (since 2.0.43), keyed by the child's agent_id — the authority
+  // for subagent cards whenever a session sends it (core/claude-subagent-lifecycle.ts). The
+  // PreToolUse/PostToolUse pair above stays: it is the fallback for a CLI or hook snapshot without
+  // these, and the source of the task label. Both are no-ops for the CLI: the managed script prints
+  // nothing (SubagentStart stdout would be added to the child's context) and exits 0 (a
+  // SubagentStop decision could block the child from stopping).
+  'SubagentStart',
+  'SubagentStop'
+] as const satisfies readonly ManagedHookEvent[]
 
 /**
  * Gemini CLI hook events (→ normalizeGemini) — its own names, NOT Claude's.
@@ -92,3 +115,68 @@ export const COPILOT_HOOK_EVENTS = [
   'Notification',
   'SessionEnd'
 ] as const
+
+/**
+ * Cursor Agent CLI hook events (→ normalizeCursor), written into `~/.cursor/hooks.json` as flat
+ * `{command}` entries. Cursor's names are camelCase, and it publishes 21 of them
+ * (`cursor-agent` 2026.09.28 bundle); these are the five that move the badge, plus `sessionEnd`.
+ *
+ * Left out on purpose:
+ *   - `sessionStart`: does not fire on `--resume` (measured), so it cannot be relied on. Measured
+ *     again on 2026.10.01: a plain `cursor-agent` fires it before any prompt (with
+ *     `conversation_id`), but nodeterm launches every node as `--resume <minted id>`, which fired
+ *     nothing until `/quit` (two runs). Subscribing it would not give a fresh node a status.
+ *   (`sessionEnd` IS subscribed: interactive `/quit` fires it, measured; it puts cursor in
+ *   `SESSION_END_CAPABLE`. Dropping it here would make every quit read as a DROPPED crash.)
+ *   - `afterAgentResponse`, `afterAgentThought`, `beforeShellExecution`, `afterShellExecution`,
+ *     `afterFileEdit`, `beforeReadFile`, `beforeMCPExecution`, `afterMCPExecution`: three headless
+ *     runs with all of these subscribed (and a claude-format project file beside them) lost the
+ *     agent stream after the first reply ("Connection lost… WritableIterable is closed"), while a
+ *     run with only the five below plus sessionStart/sessionEnd finished clean. Which of the
+ *     differences broke it is unknown (docs/cursor-agent.md §3), so none is added without a run
+ *     that isolates it.
+ *   - `preToolUse` is a GATE (Cursor reads its stdout as a permission decision), so our command must
+ *     stay silent with exit 0, see `buildManagedHookCommand`'s `silent`.
+ */
+export const CURSOR_HOOK_EVENTS = [
+  'beforeSubmitPrompt',
+  'preToolUse',
+  'postToolUse',
+  'postToolUseFailure',
+  'stop',
+  'sessionEnd'
+] as const
+
+/**
+ * Antigravity CLI (`agy`) hook events (→ normalizeAntigravity), subscribed in
+ * `~/.gemini/config/hooks.json` under our own bundle key (core/agents/hooks/antigravity.ts).
+ *
+ * `agy` 1.2.3 publishes five events in TWO shapes (its bundled `hooks.md`, "Supported Event
+ * Types"): the tool events are GROUPED (`{matcher, hooks: [...]}`) and the lifecycle events are a
+ * FLAT list of handlers. The `{event, matcher}` form here marks the grouped ones; a plain string is
+ * a flat one. The matcher is `*`, which is the value every capture of agy 1.2.3 ran with
+ * and saw match every tool.
+ *
+ * FOUR of the five, and the choice is a cost the user accepted, not an accident:
+ *   - `PreInvocation` fires before every model call → `working`.
+ *   - `PreToolUse` / `PostToolUse` bracket each tool execution; `ask_question` between them is the
+ *     only NEEDS YOU a hook can see. SUBSCRIBING TO `PreToolUse` MAKES OUR HOOK A SYNCHRONOUS GATE
+ *     IN FRONT OF EVERY TOOL CALL OF EVERY `agy` ON THIS MACHINE, inside and outside nodeterm — see
+ *     `antigravityDecisionFor` for the stdout contract that keeps that gate open.
+ *   - `Stop` ends the loop; `fullyIdle` says whether it really ended.
+ *   - `PostInvocation` is left out: it adds no state the four above do not give, and every
+ *     subscribed event is one more SYNCHRONOUS hook process per occurrence.
+ *
+ * COST, measured on Windows 11 (20 runs, dispatched as agy does): the answer reaches stdout in ~100 ms, but agy waits for the PROCESS to exit, and that takes
+ * ~520 ms per event inside a nodeterm node (Git Bash forks ~55 ms each for the token read, the temp
+ * file and the path conversion before the POST is backgrounded) and ~155 ms in a plain terminal.
+ * A tool step fires three of these four events, so ~1.6 s of hook per step inside nodeterm. The
+ * earlier "~100 ms" figure measured a bare `.cmd` stand-in, not this script. Accepted for
+ * now; backgrounding everything after the stdin read is a tracked follow-up.
+ */
+export const ANTIGRAVITY_HOOK_EVENTS: readonly ManagedHookEvent[] = [
+  'PreInvocation',
+  { event: 'PreToolUse', matcher: '*' },
+  { event: 'PostToolUse', matcher: '*' },
+  'Stop'
+]

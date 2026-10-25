@@ -8,8 +8,16 @@ import {
   hiddenLinkIds,
   linkIdsCoveredByRopes,
   pairKey,
-  planBridges
+  planBridges,
+  appendBridgeEdges,
+  bridgeToEdge,
+  contextLinkForEdge,
+  edgeToBridge,
+  linkReadPairs,
+  isCurrentLinkDirection,
+  usesLinkedContextSkill
 } from './noteLink'
+import { setCustomAgentBaseResolver } from '@shared/agents/config'
 import type { CanvasNodeState } from '@shared/types'
 
 const term = (contextCapable = false) => ({ kind: 'terminal', contextCapable })
@@ -67,7 +75,21 @@ describe('planBridges', () => {
     expect(plan.edges).toEqual([])
     expect(plan.skipped).toEqual([
       { id: 'n1', why: 'same node' },
-      { id: 'ghost', why: 'no such node' }
+      { id: 'ghost', why: 'node not found in this project; cross-project linking is not supported' }
+    ])
+  })
+
+  it('refuses an outside-project id without claiming it does not exist or granting a link', () => {
+    // The target is known to the caller (e.g. returned by open-agent --project), but lookup
+    // is deliberately scoped to the calling project, for both live and stored canvases.
+    const projects = { caller: canvas, elsewhere: { remote: term(true) } }
+    const plan = planBridges('n1', ['remote', 'ghost', 'n2'],
+      (id) => projects.caller[id] ?? null, [])
+    expect(plan.linked).toEqual(['n2'])
+    expect(plan.edges).toEqual([{ id: 'bridge-n1-n2', source: 'n1', target: 'n2' }])
+    expect(plan.skipped).toEqual([
+      { id: 'remote', why: 'node not found in this project; cross-project linking is not supported' },
+      { id: 'ghost', why: 'node not found in this project; cross-project linking is not supported' }
     ])
   })
 
@@ -93,7 +115,7 @@ describe('planBridges', () => {
   it('refuses everything when the source node does not exist', () => {
     const plan = planBridges('ghost', ['n2'], lookup, [])
     expect(plan.edges).toEqual([])
-    expect(plan.skipped).toEqual([{ id: 'n2', why: 'no such node' }])
+    expect(plan.skipped).toEqual([{ id: 'n2', why: 'node not found in this project; cross-project linking is not supported' }])
   })
 })
 
@@ -205,11 +227,44 @@ describe('buildContextLinkNote', () => {
     expect(msg).toContain('[nodeterm] You are now linked to "Builder"')
     expect(msg).toContain('get-linked-context skill')
   })
+  it('cursor (reads ~/.claude/skills) gets the skill wording; grok, unverified, keeps the CLI', () => {
+    expect(buildContextLinkNote('cursor', 'Builder', '/x/context.sh')).toContain('get-linked-context skill')
+    expect(buildNotePushMessage('N', 'x'.repeat(3000), 'cursor')).toContain('get-linked-context skill')
+    expect(buildContextLinkNote('grok', 'Builder', '/x/context.sh')).toContain('sh "/x/context.sh"')
+  })
+  it('a custom agent words it as its base does: claude-base and cursor-base alike (LINKED_CONTEXT_SKILL_AGENTS)', () => {
+    setCustomAgentBaseResolver((id) => (id === 'my-claude' ? 'claude' : id === 'my-cursor' ? 'cursor' : id === 'my-grok' ? 'grok' : undefined))
+    try {
+      for (const id of ['my-claude', 'my-cursor']) {
+        expect(usesLinkedContextSkill(id), id).toBe(true)
+        expect(buildContextLinkNote(id, 'Builder', '/x/context.sh'), id).toContain('get-linked-context skill')
+      }
+      expect(usesLinkedContextSkill('my-grok')).toBe(false)
+    } finally {
+      setCustomAgentBaseResolver(null)
+    }
+  })
   it('codex/gemini get the inline CLI command, single line', () => {
     const msg = buildContextLinkNote('codex', 'Builder', '/x/context.sh')
     expect(msg).toContain('sh "/x/context.sh"')
     expect(msg).toContain('Builder')
     expect(msg).not.toContain('\n')
+  })
+  it('a Windows core: codex/gemini are told to run the .cmd launcher; claude keeps the skill line', () => {
+    const msg = buildContextLinkNote('codex', 'Builder', 'C:\\d\\context.sh', 'win32')
+    expect(msg).toContain('run: & "C:\\d\\context.cmd" list')
+    expect(msg).not.toContain('sh "')
+    expect(msg).not.toContain('\n')
+    expect(buildContextLinkNote('claude', 'Builder', 'C:\\d\\context.sh', 'win32')).toBe(
+      buildContextLinkNote('claude', 'Builder', 'C:\\d\\context.sh')
+    )
+  })
+  it('a POSIX or unknown core (remote node, older core) keeps the exact sh line', () => {
+    for (const host of [undefined, 'linux', 'darwin']) {
+      expect(buildContextLinkNote('gemini', 'Builder', '/x/context.sh', host)).toBe(
+        buildContextLinkNote('gemini', 'Builder', '/x/context.sh')
+      )
+    }
   })
   it('every variant says the note is informational — no action now', () => {
     // The message is injected + submitted as a prompt, so an agent that reads it as a task
@@ -394,5 +449,98 @@ describe('the note builders cannot be made to submit a second line', () => {
     )
     // The readable ⏎ collapse still owns the ordinary multi-line note.
     expect(buildNotePushMessage('T', 'one\ntwo')).toContain('one ⏎ two')
+  })
+})
+
+describe('bridge ⇄ React Flow edge (issue #852)', () => {
+  it('a reader-less bridge round-trips with no data field (old project.json unchanged)', () => {
+    const b = { id: 'bridge-a-b', source: 'a', target: 'b' }
+    const e = bridgeToEdge(b)
+    expect(e).toEqual(b)
+    expect(edgeToBridge(e)).toEqual(b)
+  })
+
+  it('a one-way bridge carries its reader in edge.data and back', () => {
+    const b = { id: 'bridge-a-b', source: 'a', target: 'b', reader: 'b' }
+    const e = bridgeToEdge(b)
+    expect(e).toEqual({ id: 'bridge-a-b', source: 'a', target: 'b', data: { reader: 'b' } })
+    expect(edgeToBridge(e)).toEqual(b)
+  })
+
+  it('drops display-only edge fields', () => {
+    expect(
+      edgeToBridge({ id: 'x', source: 'a', target: 'b', selected: true, data: { anchor: 'h' } } as never)
+    ).toEqual({ id: 'x', source: 'a', target: 'b' })
+  })
+
+  // A present-but-invalid reader is a restriction nobody can satisfy, and it must STAY one: if a
+  // conversion dropped it, the next save would write an unrestricted two-way link.
+  it.each([null, 42, '', 'z', { x: 1 }])('keeps an invalid reader %j through load and save', (reader) => {
+    const b = { id: 'bridge-a-b', source: 'a', target: 'b', reader } as never
+    const back = edgeToBridge(bridgeToEdge(b))
+    expect(back).toEqual(b)
+    expect(linkReadPairs(back)).toEqual([])
+  })
+})
+
+describe('appendBridgeEdges (issue #852 review P1)', () => {
+  it('a one-way bridge from planBridges keeps its reader once it is a live edge', () => {
+    const lookup = () => ({ kind: 'terminal', contextCapable: true })
+    const plan = planBridges('n1', ['n2'], lookup, [], { oneWay: true })
+    const live = appendBridgeEdges([], plan.edges)
+    expect(live).toEqual([{ id: 'bridge-n1-n2', source: 'n1', target: 'n2', data: { reader: 'n1' } }])
+    expect(live.map(edgeToBridge)).toEqual(plan.edges)
+  })
+
+  it('never mutates the existing edge array', () => {
+    const es = [{ id: 'e', source: 'a', target: 'b' }]
+    const out = appendBridgeEdges(es, [{ id: 'f', source: 'c', target: 'd' }])
+    expect(es).toHaveLength(1)
+    expect(out).toHaveLength(2)
+  })
+})
+
+describe('contextLinkForEdge (issue #852 review P2b)', () => {
+  const links = [{ id: 'bridge-a-b', source: 'a', target: 'b' }]
+  const ropes = [
+    { id: 'ctrl-b-a', source: 'b', target: 'a' },
+    { id: 'ctrl-a-c', source: 'a', target: 'c' }
+  ]
+
+  it('a context link resolves to itself', () => {
+    expect(contextLinkForEdge('bridge-a-b', links, ropes)?.id).toBe('bridge-a-b')
+  })
+
+  it('a rope resolves to the context link it covers (by endpoint pair, either direction)', () => {
+    expect(contextLinkForEdge('ctrl-b-a', links, ropes)?.id).toBe('bridge-a-b')
+  })
+
+  it('a rope with no underlying context link resolves to nothing', () => {
+    expect(contextLinkForEdge('ctrl-a-c', links, ropes)).toBeNull()
+  })
+
+  it('an unknown (ephemeral) edge resolves to nothing', () => {
+    expect(contextLinkForEdge('sub-x', links, ropes)).toBeNull()
+  })
+})
+
+
+// The edge menu's ✓ (issue #852). A malformed reader authorizes nobody, so it must not read as
+// "both read" — that ticked and DISABLED the one option that repairs the link.
+describe('isCurrentLinkDirection', () => {
+  const base = { id: 'x', source: 'a', target: 'b' }
+  it('ticks both-read only for a reader-less bridge', () => {
+    expect(isCurrentLinkDirection(base, null)).toBe(true)
+    expect(isCurrentLinkDirection({ ...base, reader: 'a' }, null)).toBe(false)
+    expect(isCurrentLinkDirection({ ...base, reader: 'a' }, 'a')).toBe(true)
+    expect(isCurrentLinkDirection({ ...base, reader: 'a' }, 'b')).toBe(false)
+  })
+  it('ticks nothing for a malformed reader (null / non-string / names neither endpoint)', () => {
+    for (const reader of [null, 7, 'zzz'] as unknown as string[]) {
+      const bad = { ...base, reader }
+      expect(isCurrentLinkDirection(bad, null)).toBe(false)
+      expect(isCurrentLinkDirection(bad, 'a')).toBe(false)
+      expect(isCurrentLinkDirection(bad, 'b')).toBe(false)
+    }
   })
 })

@@ -77,6 +77,8 @@ function mount(over: Partial<ReturnType<typeof useSessionMemory.getState>> = {})
     rows: ROWS,
     loadedScope: '',
     loading: false,
+    host: undefined,
+    app: undefined,
     refreshFull,
     startHostPoll,
     stopHostPoll,
@@ -156,6 +158,38 @@ describe('SessionMemoryPanel', () => {
     mount()
     // 900 + 500 + 120 + 40 = 1560 MB. Summing `selfMb` instead would print 1.2 GB.
     expect(host.querySelector('.sessmem-panel__total')?.textContent).toBe('1.5 GB')
+  })
+
+  describe("the Windows session host's own cost", () => {
+    const HOST = { pid: 900, selfMb: 300, consoleMb: 40, consoleCount: 4, totalMb: 340 }
+    const line = (): Element | null => host.querySelector('.sessmem-host')
+
+    it('renders a non-killable line, adds to the total, and is not a session', () => {
+      mount({ host: HOST })
+      expect(line()?.textContent).toContain('nodeterm session host (4 consoles)')
+      expect(line()?.querySelector('button')).toBeNull()
+      // 1560 + 340 = 1900 MB.
+      expect(host.querySelector('.sessmem-panel__total')?.textContent).toBe('1.9 GB')
+      expect(host.querySelector('.sessmem-panel__count')?.textContent).toBe('4 sessions')
+      expect(rowsOf()).toHaveLength(4)
+    })
+
+    it('shows beside "no sessions" too — an idle host still costs memory', () => {
+      mount({ rows: [], host: { ...HOST, consoleCount: 1 } })
+      expect(text()).toContain('No sessions are running here.')
+      expect(line()?.textContent).toContain('(1 console)')
+    })
+
+    it('never renders unmeasured: absent, failed, or not yet measured', () => {
+      mount()
+      expect(line()).toBeNull()
+      act(() => root.unmount())
+      mount({ ok: false, host: HOST })
+      expect(line()).toBeNull()
+      act(() => root.unmount())
+      mount({ loadedScope: null, host: HOST })
+      expect(line()).toBeNull()
+    })
   })
 
   it("resolves a CLOSED project's session to its real title", () => {
@@ -410,6 +444,34 @@ describe('SessionMemoryPanel', () => {
       expect(pauseOf(0)!.title).toBe('Open this session on its canvas')
     })
 
+    it('draws the shared power icon, and the shared spinner while the pause is in flight', async () => {
+      // The panel's pause is the SAME action as the node menu's "Pause session", which draws
+      // `IconPower` — one action seen in two places must not speak in two voices.
+      let settle = (): void => {}
+      onPauseSession.mockImplementation(
+        () =>
+          new Promise<void>((res) => {
+            settle = () => res()
+          })
+      )
+      pauseOffer = () => ({ show: true, disabled: false, hint: 'Pause session' })
+      mount()
+      const btn = pauseOf(0)!
+      expect(btn.querySelector('svg')).not.toBeNull()
+      expect(btn.querySelector('.ui-spinner')).toBeNull()
+
+      act(() => btn.click())
+      expect(btn.querySelector('.ui-spinner')).not.toBeNull()
+      expect(btn.querySelector('svg')).toBeNull()
+
+      // Settle inside `act` so the icon is back before the test ends — a promise still pending at
+      // teardown resolves into an unmounted tree.
+      await act(async () => {
+        settle()
+      })
+      expect(pauseOf(0)!.querySelector('svg')).not.toBeNull()
+    })
+
     it('asks per row, so one row may offer a pause while another does not', () => {
       pauseOffer = (id) =>
         id === ROWS[0].nodeId
@@ -418,6 +480,63 @@ describe('SessionMemoryPanel', () => {
       mount()
       expect(pauseOf(0)).not.toBeNull()
       expect(pauseOf(1)).toBeNull()
+    })
+  })
+
+  describe('"nodeterm itself"', () => {
+    const APP = {
+      ok: true,
+      groups: [
+        { kind: 'gpu' as const, count: 1, mb: 1600, cpuSeconds: 3725 },
+        { kind: 'renderer' as const, count: 2, mb: 340 },
+        { kind: 'main' as const, count: 1 }
+      ]
+    }
+    const appBlock = (): HTMLElement | null => host.querySelector('.sessmem-app')
+
+    it('lists the app groups below the rows, OUT of the session total', () => {
+      mount({ app: { ...APP, totalMb: 2000 } })
+      const t = appBlock()?.textContent ?? ''
+      expect(t).toContain('nodeterm itself')
+      expect(t).toContain('GPU')
+      expect(t).toContain('1.6 GB')
+      expect(t).toContain('CPU 1h 02m')
+      expect(t).toContain('Renderers ×2')
+      // The main process was not measured: said so, never "0 B".
+      expect(t).toContain('not measured')
+      expect(t).not.toMatch(/\b0 B\b/)
+      // The header is still the sessions' 1.5 GB, not 1.5 + 2.0.
+      expect(host.querySelector('.sessmem-panel__total')?.textContent).toBe('1.5 GB')
+    })
+
+    it('a partial group set prints no app total rather than an understated one', () => {
+      mount({ app: APP })
+      expect(appBlock()?.querySelector('.sessmem-host__mb')?.textContent).toBe('—')
+    })
+
+    it('ok:false says it could not measure — never a zero', () => {
+      mount({ app: { ok: false, groups: [] } })
+      expect(appBlock()?.textContent).toMatch(/could not measure nodeterm/i)
+      expect(appBlock()?.textContent).not.toMatch(/\d/)
+    })
+
+    it('absent (Server Edition) draws nothing', () => {
+      mount()
+      expect(appBlock()).toBeNull()
+    })
+
+    it('never appears on an SSH scope, even with a stale group in the store', () => {
+      useProjects.setState({
+        projects: [project({ id: 'ssh1', name: 'Box', ssh: { server: { host: 'box', user: 'enes', port: 22 } as never, remoteCwd: '/srv' } })],
+        activeProjectId: 'ssh1'
+      })
+      mount({ loadedScope: 'enes@box', app: { ...APP, totalMb: 2000 } })
+      expect(appBlock()).toBeNull()
+    })
+
+    it('waits for this scope\'s answer like every other figure', () => {
+      mount({ loadedScope: null, app: { ...APP, totalMb: 2000 } })
+      expect(appBlock()).toBeNull()
     })
   })
 })

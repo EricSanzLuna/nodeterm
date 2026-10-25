@@ -34,7 +34,8 @@ function firstCwd(rawText: string): string {
 }
 
 export function extractEntryFields(rawText: string): { cwd: string; title: string; text: string } {
-  const lines = parseTranscriptLines(rawText)
+  // Pastes stay as recorded (no code fences in a title), as before the ⌘M view fenced them.
+  const lines = parseTranscriptLines(rawText, { expandPastes: false })
   const firstUser = lines.find((l) => l.role === 'user')
   const title = (firstUser?.text ?? '').replace(/\s+/g, ' ').trim().slice(0, 80)
   let text = lines.map((l) => l.text).join('\n')
@@ -42,8 +43,30 @@ export function extractEntryFields(rawText: string): { cwd: string; title: strin
   return { cwd: firstCwd(rawText), title, text }
 }
 
-export function makeSnippet(text: string, query: string): string {
-  const i = text.toLowerCase().indexOf(query.toLowerCase())
+// One case-insensitive matcher per query, shared by the filter and the snippet. The previous
+// `e.text.toLowerCase().includes(q)` built a lowered copy of every entry on every debounced
+// keystroke: on the user's 16 MB / 235-entry index that measured 20-52 ms and 7-15 MB of garbage
+// per search on the main thread; this RegExp measured 2-13 ms and 0 MB.
+// Storing a lowered copy instead would retain +32 MB — don't.
+//
+// `iu`, not `i`: neither flag reproduces `toLowerCase().includes` exactly, so the criterion is "no
+// match the old code found is lost". Over every BMP case pair, plain `i` disagreed 160 times and
+// LOST hits (Kelvin sign K, Ångström Å, ẞ, Ohm Ω all stopped matching k/å/ß/ω); `iu` disagreed 94
+// times, every one an EXTRA hit (ſ~s, µ~μ, Greek symbol variants, final ς~σ), and also folds astral
+// pairs (Deseret) that `i` misses. Turkish İ (U+0130) is the one LOST hit `iu` still has: it
+// lowers to `i` + U+0307, so the old copy matched `türki` in `TÜRKİYE`, while case folding maps İ
+// only to itself. Every i/I of the escaped query is therefore widened to `[iİ]` (safe: the escape
+// below never emits a letter, so each i/I in its output is a literal one).
+// The escape set is exactly SyntaxCharacter plus `/` — the only identity escapes `u` mode accepts;
+// escaping anything else (`-`, say) is a SyntaxError there. No `g`: `test` would turn stateful.
+export function queryRegExp(query: string): RegExp {
+  const escaped = query.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
+  return new RegExp(escaped.replace(/[iI]/g, '[iİ]'), 'iu')
+}
+
+export function makeSnippet(text: string, query: string | RegExp): string {
+  // Same matcher as the filter, so a hit never gets a head-of-text snippet because the two disagreed.
+  const i = (typeof query === 'string' ? queryRegExp(query) : query).exec(text)?.index ?? -1
   if (i < 0) return text.slice(0, 160).replace(/\s+/g, ' ').trim()
   const start = Math.max(0, i - 60)
   return (
@@ -55,21 +78,26 @@ export function makeSnippet(text: string, query: string): string {
 export function searchEntries(
   entries: TranscriptIndexEntry[],
   query: string,
-  limit = 20
+  limit = 20,
+  /** The managed/linked account whose root holds a transcript (undefined = system). A resume of the
+   *  hit must run under that account, or the CLI answers "No conversation found". */
+  accountOf?: (transcriptPath: string) => string | undefined
 ): TranscriptHit[] {
-  const q = query.trim().toLowerCase()
+  const q = query.trim()
   if (q.length < 2) return []
+  const re = queryRegExp(q)
   return entries
-    .filter((e) => e.title.toLowerCase().includes(q) || e.text.toLowerCase().includes(q))
+    .filter((e) => re.test(e.title) || re.test(e.text))
     .sort((a, b) => b.mtime - a.mtime)
     .slice(0, limit)
     .map((e) => ({
       sessionId: e.sessionId,
       title: e.title || e.sessionId,
-      snippet: makeSnippet(`${e.title}\n${e.text}`, q),
+      snippet: makeSnippet(`${e.title}\n${e.text}`, re),
       cwd: e.cwd,
       projectLabel: e.cwd ? e.cwd.split('/').filter(Boolean).pop() ?? e.cwd : '',
-      mtime: e.mtime
+      mtime: e.mtime,
+      ...((a) => (a ? { accountId: a } : {}))(accountOf?.(e.transcriptPath))
     }))
 }
 

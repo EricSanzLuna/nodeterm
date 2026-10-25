@@ -14,7 +14,27 @@
 // that reads and changes nothing, answer straight out of its serialized nodes).
 
 import { canControlCanvas, type AgentId } from '@shared/agents/config'
+import { formatIssueRef } from '@shared/github-issue-ref'
+import { formatPrWaits, normalizePrWaitHold } from '@shared/pr-wait'
+import {
+  normalizeSuccessWaitHold,
+  outcomeOf,
+  successWaitStatus,
+  successWaitSummary,
+  type StationOutcomeRecord
+} from '@shared/station-outcome'
+import { prHoldExpired } from './prWait'
+import {
+  controlLaunchState,
+  handedOverDeps,
+  holdReason,
+  successDepFacts,
+  type HandoverById,
+  type LaunchDelivery,
+  type StatusById
+} from './pendingLaunch'
 import { projectTravel } from './presenceTravel'
+import { geometryText, storedNodeGeometry, type NodeGeometry } from './nodeGeometry'
 import {
   projectCapabilityGrantedFor,
   type CapabilityAckMap
@@ -33,6 +53,18 @@ export interface StoredNode {
   id: string
   kind?: string
   title?: string
+  pendingLaunch?: unknown
+  agentId?: string
+  /** The GitHub issue the session was started on — hostile until `formatIssueRef` says otherwise. */
+  issueRef?: unknown
+  /** Persisted geometry (`CanvasNodeState`): an off-screen project's rows derive their place and
+   *  size from these (`storedNodeGeometry`). */
+  position?: { x: number; y: number }
+  size?: { width: number; height: number }
+  parentId?: string
+  collapsed?: boolean
+  /** Precomputed by the LIVE canvas (`liveNodeGeometry` — measured sizes); wins over the fields above. */
+  geometry?: NodeGeometry
 }
 
 /**
@@ -70,106 +102,21 @@ export function routeControlSource(
 }
 
 /**
- * Verbs that are answered from the SERIALIZED store instead of the live canvas.
- *
- * `list` reads names only, and it is the verb an agent calls most — answering it out of the store
- * keeps a background agent's polling from yanking the user's view to another project tab on every
- * call.
- *
- * `send`/`reply` are here for a stronger reason than politeness, and it is worth being precise
- * about WHICH travel this prevents: routing here is by SOURCE
- * (`routeControlSource(projects, activeId, sourceNodeId)`), so what the declaration stops is a trip
- * to the SENDER's project — which an off-canvas orchestrator would otherwise trigger on every
- * message it sent, hijacking the human's view on a background agent's say-so and clearing that
- * node's unread badge via `setActive` on the way (G5). A delivery goes to a tmux PANE, not to a
- * canvas, so it needs no live canvas at either end.
- *
- * The other half — never travelling to the TARGET's project — is not this function's doing. It
- * comes from `resolveDeliveryScope` (`src/core/agents/agent-message-scope.ts`) taking the
- * serialized store and having no live-node parameter at all, so there is nothing to travel toward.
- *
- * LIVE AS OF PR 5: Canvas.tsx's dispatch handles `send`/`reply` BEFORE its source-routing
- * machinery, so neither `routeControlSource` nor any travel runs for them — the declaration here
- * and that early-exit are the same decision stated once each, and `controlRouting.test.ts` pins
- * this half.
+ * The off-screen verb table lives in `@shared/control-off-screen` because CORE renders the
+ * agent-facing help from it and core cannot import the renderer. Re-exported here so every
+ * renderer caller keeps one import for "how does canvas control route".
  */
-/*
- * `sticky` is store-answered for the send/reply reason, not the list reason: its headline use is
- * a SCHEDULED agent rewriting one note every few minutes, and routing is by SOURCE — so a live
- * requirement would yank the human's view to the sync agent's project on every run (G5), which is
- * exactly the behaviour that gets the sync loop turned off. The write lands in the owning
- * project's serialized nodes (`applyNodeMutation`, the same path peer mutations take) when that
- * project is not the active one; the live canvas handles it when it is.
- */
-/*
- * `open-project` (issue #338) is store-answered for the G5 reason in its sharpest form: its
- * headline caller is a background orchestrator registering one repo after another, and routing is
- * by SOURCE — a live requirement would yank the human's view to the CALLER's project on every
- * registration (and clear its unread badge via `setActive` on the way). The verb acts on the
- * projects STORE through the non-activating `registerProject`, and its consent dialog is
- * app-global (`ConfirmState` overlays the window), so no live canvas is needed at either end.
- * Canvas.tsx handles it BEFORE the source-routing machinery — this declaration and that
- * early-exit are the same decision stated once each (spec §2.3, P6), pinned by
- * `controlRouting.test.ts`.
- */
-const STORE_ANSWERED_VERBS: ReadonlySet<string> = new Set([
-  'list',
-  'send',
-  'reply',
-  'sticky',
-  'open-project'
-])
-
-/**
- * Does this verb have to run against the LIVE canvas? Everything that creates, moves, writes to or
- * closes a node does.
- */
-export function needsLiveCanvas(verb: string): boolean {
-  return !STORE_ANSWERED_VERBS.has(verb)
-}
-
-/**
- * Verbs that CREATE a session and can therefore be answered by writing into the owning project's
- * SERIALIZED nodes instead of activating its tab.
- *
- * The relationship to `STORE_ANSWERED_VERBS` is the whole point, and the two sets are disjoint
- * (pinned in `controlRouting.test.ts`):
- *
- *   - `STORE_ANSWERED_VERBS` — "no canvas is needed at either end". `list` reads names, `send`/
- *     `reply` deliver into a tmux PANE, `sticky` rewrites a note, `open-project` acts on the
- *     projects store. `needsLiveCanvas` is false for them and they never route at all.
- *   - `COLD_OPENABLE_VERBS` — "a canvas IS needed, but the serialized one will do". The node these
- *     verbs create is INERT until its project is next shown: the launch command moves into
- *     `pendingLaunch` (`armForColdOpen`), the node is upserted through `applyNodeMutation`, and the
- *     project's own mount path spawns the PTY and fires the armed launch. `needsLiveCanvas` stays
- *     TRUE for them — they do need a canvas — which is exactly why this is a second, narrower set
- *     rather than four more entries in the first one.
- *
- * WHY (the bug): routing is by SOURCE, so `open-claude` from an agent in a project the user is not
- * looking at travelled the user's view to that project — the camera jumped, the tab switched and
- * the target project's saved viewport was applied, all on a background agent's say-so. That is the
- * same G5 hijack `send`/`reply`/`sticky` are declared here to avoid; the difference is only that an
- * open needs somewhere to put the node, and a project's serialized nodes are somewhere.
- *
- * Deliberately NOT here: every verb that acts on nodes that already exist (`write`, `close`,
- * `group`, `move`, `arrange`, `align`, `verify`, `spawn-team`, `open-worktree`, `open-browser`,
- * `show-*`). They read live canvas state — measured node sizes, worktree staleness, the React Flow
- * edge arrays — that the serialized copy does not carry, so they keep travelling.
- */
-const COLD_OPENABLE_VERBS: ReadonlySet<string> = new Set([
-  'open-terminal',
-  'open-claude',
-  'open-agent'
-])
-
-export function canColdOpen(verb: string): boolean {
-  return COLD_OPENABLE_VERBS.has(verb)
-}
-
-/** Test-only view of the two sets, so their disjointness can be asserted rather than eyeballed. */
-export function controlVerbSetsForTests(): { storeAnswered: string[]; coldOpenable: string[] } {
-  return { storeAnswered: [...STORE_ANSWERED_VERBS], coldOpenable: [...COLD_OPENABLE_VERBS] }
-}
+export {
+  needsLiveCanvas,
+  canColdOpen,
+  answersOffCanvas,
+  answersFromStoredNodes,
+  offScreenDisposition,
+  offScreenRefusal,
+  offScreenGuidanceLines,
+  controlVerbSetsForTests,
+  type OffScreenDisposition
+} from '@shared/control-off-screen'
 
 /**
  * The capability half of the guard: may a session in this node drive the canvas?
@@ -241,7 +188,9 @@ export function answerBrowserResolve(
     // LIVE read — the drive-time capability check the whole feature's safety rests on. A project.json
     // hand-edit that flipped the switch off is reflected here the next time an agent drives, which is
     // exactly drive time.
-    capabilityOn: projectCapabilityGrantedFor(project, 'agentBrowserControl'),
+    // `{}`: browser control has no machine default (CAPABILITY_MACHINE_DEFAULTS) — an absent switch is
+    // off, and no setting on this machine can change that.
+    capabilityOn: projectCapabilityGrantedFor(project, 'agentBrowserControl', {}),
     sourceTitle: typeof node.title === 'string' ? node.title : '',
     browserTitle: typeof browserNode?.title === 'string' ? browserNode.title : ''
   }
@@ -250,7 +199,155 @@ export function answerBrowserResolve(
 /** `list`'s rows, built from serialized nodes — the same shape the live canvas answers with
  *  (`n.type` is the persisted `kind`, `n.data.title` the persisted `title`). */
 export function storedNodeListing(
-  nodes: readonly StoredNode[]
-): { id: string; kind: string; title: string }[] {
-  return nodes.map((n) => ({ id: n.id, kind: n.kind ?? 'terminal', title: n.title ?? '' }))
+  nodes: readonly StoredNode[],
+  statuses: StatusById & Record<string, { dropped?: boolean } | undefined> = {},
+  deliveries: Record<string, LaunchDelivery | undefined> = {},
+  now: number = Date.now(),
+  /** Every station's latest task report (`report-outcome`, core's store mirrored). */
+  outcomes: Readonly<Record<string, StationOutcomeRecord>> = {},
+  /** Stations with unfinished handed-over work (core/station-handover.ts, mirrored). */
+  handovers: HandoverById = {}
+) {
+  const live = new Set(nodes.map((n) => n.id))
+  // Every row carries its geometry (issue #1288), so a script needs no flag to read it; the TEXT form
+  // shows it only behind `list --geometry on`. A row of the live canvas arrives with it measured; a
+  // stored row's is derived here from the persisted fields, parent chain included.
+  const placed = nodes.filter(
+    (n): n is StoredNode & { position: { x: number; y: number }; size: { width: number; height: number } } =>
+      !!n.position && !!n.size
+  )
+  const geometryOf = (n: StoredNode): NodeGeometry | undefined =>
+    n.geometry ?? (n.position && n.size ? storedNodeGeometry({ ...n, position: n.position, size: n.size }, placed) : undefined)
+  const titleOf = (id: string): string => {
+    const t = nodes.find((n) => n.id === id)?.title
+    return t ? `${id} "${t}"` : id
+  }
+  return nodes.map((n) => {
+    const status = statuses[n.id]
+    // `--after-pr`: the row names what the node waits on (the pull request STATUS is the canvas's
+    // to judge; `list` states the wait and whether its deadline has passed, which needs no board).
+    const prHold = normalizePrWaitHold((n.pendingLaunch as { afterPr?: unknown } | undefined)?.afterPr)
+    const prExpired = !!prHold && prHoldExpired(prHold, now)
+    // `--after-success`: judged here in full — every fact it needs (the stations' reports, their
+    // turn state, whether they still exist) is already in hand, so the row can say WAITING FOR
+    // SUCCESS, BLOCKED BY FAILURE or EXPIRED and name the station and its note.
+    const successHold = normalizeSuccessWaitHold(
+      (n.pendingLaunch as { afterSuccess?: unknown } | undefined)?.afterSuccess
+    )
+    const successFacts = (d: string) =>
+      successDepFacts(d, statuses, live, outcomes, handovers)
+    const successState = successHold ? successWaitStatus(successHold, successFacts, now) : undefined
+    // Every agent row names its state: an unlabelled row used to mean idle, waiting on a person, or
+    // not an agent at all, so an orchestrator read a station stuck on a permission prompt as finished.
+    const launchState = controlLaunchState(!!n.pendingLaunch, deliveries[n.id] ?? ((n.pendingLaunch as { manualOnly?: boolean } | undefined)?.manualOnly ? { kind: 'failed', attempts: 1, at: 0 } : undefined), status, prExpired, successState) ??
+      (n.agentId ? agentRowState(status?.state) : undefined)
+    // A session started on an issue is told so on its OWN row, so `list` is enough for an agent to
+    // learn it is bound (and which card to move). Only a reference `formatIssueRef` vouches for.
+    const issue = formatIssueRef(n.issueRef)
+    // What this node said about its OWN task, if anything — so an orchestrator reads every
+    // station's verdict in the one call it already makes.
+    const reported = outcomeOf(outcomes, n.id)
+    const successWait =
+      successHold && !successHold.invalid && successState !== 'met'
+        ? successWaitSummary(successHold, successFacts, titleOf)
+        : undefined
+    // Plain `--after` deps whose `done` is from BEFORE the work just handed to them: named, so an
+    // orchestrator reading QUEUED next to a station that reads idle knows what it is waiting for.
+    // (`pendingLaunch` is unvalidated here: only a list of strings is read.)
+    const rawAfter = (n.pendingLaunch as { after?: unknown } | undefined)?.after
+    const handedOver = Array.isArray(rawAfter)
+      ? handedOverDeps(
+          {
+            id: n.id,
+            data: {
+              pendingLaunch: {
+                after: rawAfter.filter((d): d is string => typeof d === 'string'),
+                command: ''
+              }
+            }
+          },
+          live,
+          handovers
+        )
+      : []
+    const geometry = geometryOf(n)
+    return {
+      id: n.id, kind: n.kind ?? 'terminal', title: n.title ?? '',
+      ...(geometry ?? {}),
+      ...(issue ? { issue } : {}),
+      ...(status?.lastTurnError ? { lastTurnErrored: true } : {}),
+      ...(status?.lastTurnInterrupted && !status.lastTurnError ? { lastTurnInterrupted: true } : {}),
+      ...(launchState ? { launchState } : {}),
+      ...(launchState === 'queued' && prHold && !prHold.invalid ? { prWait: formatPrWaits(prHold) } : {}),
+      ...(successWait ? { successWait } : {}),
+      ...(handedOver.some((d) => holdReason(handovers[d]) === 'work')
+        ? { handoverWait: handedOver.filter((d) => holdReason(handovers[d]) === 'work').map(titleOf).join(', ') }
+        : {}),
+      ...(handedOver.some((d) => holdReason(handovers[d]) === 'background')
+        ? { backgroundWait: handedOver.filter((d) => holdReason(handovers[d]) === 'background').map(titleOf).join(', ') }
+        : {}),
+      ...(reported
+        ? {
+            outcome: reported.outcome,
+            ...(reported.note ? { outcomeNote: reported.note } : {}),
+            ...(reported.workPending ? { outcomeSuperseded: true } : {})
+          }
+        : {})
+    }
+  })
+}
+
+/** An agent row with no launch or drop to report: its live state, in the canvas badge's words. */
+function agentRowState(state: string | undefined): 'idle' | 'needs-you' | 'unconfirmed' {
+  if (state === 'done') return 'idle'
+  if (state === 'waiting' || state === 'blocked') return 'needs-you'
+  return 'unconfirmed'
+}
+
+const launchLabels = {
+  idle: 'IDLE',
+  'needs-you': 'NEEDS YOU',
+  queued: 'QUEUED',
+  failed: 'LAUNCH FAILED',
+  stalled: 'QUEUED (terminal not ready)',
+  starting: 'STARTING',
+  'brief-missing': 'HELD (its prompt file no longer exists; run it with `run` to start without it)',
+  dropped: 'DROPPED',
+  working: 'WORKING',
+  unconfirmed: 'AGENT STATUS UNCONFIRMED',
+  expired: 'EXPIRED (PR wait deadline passed; run it with `run`)',
+  'success-expired': 'EXPIRED (success wait deadline passed; run it with `run`)',
+  'waiting-success': 'WAITING FOR SUCCESS',
+  'blocked-failure': 'BLOCKED BY FAILURE (will not start on its own; run it with `run`)'
+} as const
+
+/** The `--geometry on` suffix of one row (`storedNodeListing` spreads the geometry flat), or '' for a
+ *  row that has none. */
+function rowGeometryText(n: ReturnType<typeof storedNodeListing>[number]): string {
+  const g = n as Partial<NodeGeometry>
+  if (typeof g.x !== 'number' || typeof g.y !== 'number' || typeof g.width !== 'number' || typeof g.height !== 'number') {
+    return ''
+  }
+  return geometryText({ x: g.x, y: g.y, width: g.width, height: g.height, parent: g.parent ?? null, collapsed: g.collapsed, expandedHeight: g.expandedHeight })
+}
+
+/** `list`'s text answer. `geometry` (`list --geometry on`) adds each node's place and size; off by
+ *  default so the line an agent reads most stays short. */
+export function controlListingText(
+  rows: ReturnType<typeof storedNodeListing>,
+  opts: { geometry?: boolean } = {}
+): string {
+  return rows.map((n) => `${n.id} [${n.kind}] ${n.title}` +
+    (opts.geometry ? rowGeometryText(n) : '') +
+    (n.issue ? ` — issue ${n.issue}` : '') +
+    (n.launchState ? ` — ${launchLabels[n.launchState]}` : '') +
+    (n.prWait ? ` — waits on ${n.prWait}` : '') +
+    (n.successWait ? ` — needs success from: ${n.successWait}` : '') +
+    (n.handoverWait ? ` — waiting for ${n.handoverWait} to finish the work handed to it` : '') +
+    (n.backgroundWait ? ` — waiting for ${n.backgroundWait} to finish the tasks still running in its background` : '') +
+    (n.outcome ? ` — REPORTED ${n.outcome === 'succeeded' ? 'SUCCESS' : 'FAILURE'}${n.outcomeNote ? ` ("${n.outcomeNote}")` : ''}` : '') +
+    (n.outcomeSuperseded ? ' (before new work queued for it; not counted until it reports again)' : '') +
+    (n.lastTurnErrored ? ' — LAST TURN ERRORED' : '') +
+    (n.lastTurnInterrupted ? ' — LAST TURN INTERRUPTED' : '')
+  ).join('\n')
 }

@@ -1,5 +1,6 @@
 import path from 'path'
 import { healPathAsName } from '../shared/project-name'
+import { neutralSshProjectNodes, routeSshProjectNodes } from '../shared/ssh-project-nodes'
 import type { AgentPermissionMode } from '../shared/agents/config'
 import { collisionSeed, derivedProjectId, legacyFileId } from '../shared/project-id'
 import {
@@ -8,12 +9,20 @@ import {
   stripSharedNodeExec,
   type LocalNodeExecMap
 } from '../shared/node-exec'
+import { sanitizeViews } from '../shared/kanban-views'
 import { CLOSED_SESSIONS_CAP } from '../shared/types'
-import type { BridgeLink, CanvasNodeState, ClosedSessionEntry, NavStop, Project, ProjectKanban, Viewport, Workspace } from '../shared/types'
+import type { BridgeLink, CanvasNodeState, ClosedSessionEntry, HandedOffTo, NavStop, Project, ProjectKanban, Viewport, Workspace } from '../shared/types'
 import { projectCapabilityFields, readProjectCapabilities } from '../shared/project-capabilities'
 import { loadedAgentBrowserPartition } from '../shared/browser-partition'
 import { sanitizeProjectIcon, type ProjectIcon } from '../shared/project-icon'
 import { sanitizeTriggerSpec } from '../shared/trigger'
+import {
+  pruneLayoutViewports,
+  sanitizeLayouts,
+  type CanvasLayout,
+  type LayoutViewports
+} from '../shared/canvas-layout'
+import { isRecord } from '../shared/is-record'
 
 /**
  * Drop a browser node's persisted `partition` unless it is exactly the jar THIS project (its
@@ -145,8 +154,23 @@ export interface ProjectFileV1 {
   /** Per-project capability switch (@shared/project-capabilities): agents may message other agent
    *  nodes in this project. Git-shared like `agentBrowserControl`, read with the same strictness. */
   agentMessaging?: boolean
+  /** Per-project capability switch (@shared/project-capabilities): agents may file GitHub issues
+   *  for product gaps they hit. Git-shared like the two above, read with the same strictness —
+   *  and the only one of the three whose effect leaves this machine, so a stranger's `true` here
+   *  buys nothing until this machine's user answers its notice. */
+  agentIssueReporting?: boolean
   dinoHighScore?: number
   kanban?: ProjectKanban
+  /**
+   * Named geometry snapshots for this canvas (@shared/canvas-layout). CONTENT, exactly like
+   * `kanban`: an arrangement is a fact about the nodes this file already carries, and restoring
+   * one writes those same node fields, so a teammate's checkout is entitled to it.
+   *
+   * Re-sanitized in BOTH directions (`fileToProject` on the way in, `projectToFile` on the way
+   * out), see `sanitizeLayouts`. The per-layout CAMERA is not here and never will be: it is
+   * machine-local and rides `IndexEntryV3.layoutViewports`, the same rule as `viewport`.
+   */
+  layouts?: CanvasLayout[]
   // NOTE: closedSessions is deliberately NOT here — see `Project.closedSessions` /
   // `IndexEntryV3.closedSessions`. It is machine-local, like `viewport`/`breadcrumbs`.
 }
@@ -187,6 +211,9 @@ export interface IndexEntryV3 {
   closed?: boolean
   /** Set alongside `closed: true` — see `Project.closedAt`. */
   closedAt?: number
+  /** See `HandedOffTo`. Index-only; never written to the shared project.json. Validated on every
+   *  load (`sanitizeHandedOffTo`): workspace.json is hand-editable input. */
+  handedOffTo?: HandedOffTo
   /** MACHINE-LOCAL camera for a ref'd project (local folder or ssh). Where this user is looking is
    *  not something a repo shares — the file's copy churned the git diff on every pan. */
   viewport?: Viewport
@@ -204,6 +231,14 @@ export interface IndexEntryV3 {
    *  user's "where was I" is not something a repo shares. See NavStop. */
   breadcrumbs?: NavStop[]
   /**
+   * MACHINE-LOCAL camera per canvas layout, keyed by layout id (@shared/canvas-layout). The
+   * layouts themselves are shared CONTENT in the project file; where THIS user was looking when
+   * they saved one is not, same rule as `viewport` and `breadcrumbs` above. Pruned against the
+   * live layouts on every load and save (`pruneLayoutViewports`), because workspace.json is
+   * forever and a canvas churns through ids.
+   */
+  layoutViewports?: LayoutViewports
+  /**
    * MACHINE-LOCAL closed-session history for a ref'd project (folder or ssh) — see
    * `Project.closedSessions`. Whose trash can holds what deleted nodes is a per-machine fact, not
    * shared content: a delete's full node-state blob would otherwise churn a committed,
@@ -218,7 +253,13 @@ export interface IndexEntryV3 {
   /**
    * This entry is a LOCAL-DATA ref: its content lives in `userData/inline-projects/<id>.json` and
    * THAT FILE is the source of truth. Absent = the pre-file shape, where `project` below IS the
-   * content. Never set together with `cwd`/`ssh`.
+   * content. Never set together with `ssh`.
+   *
+   * Set together with `cwd` it is a FOLDER-DATA-REF (issue #1145): a folder project whose canvas
+   * is kept here instead of in `<cwd>/.nodeterm/project.json` (`Project.storeInAppData`). The
+   * folder is the project's working directory only — nothing reads or writes its `.nodeterm/`, and
+   * the watcher does not watch it. `project` (the cache) is stored without `cwd`, so a build that
+   * predates the kind opens it as a plain inline canvas instead of writing into the folder.
    *
    * A build that predates this field ignores it and reads `project`, which is why the two are
    * written together for one release (the downgrade contract).
@@ -265,6 +306,32 @@ export interface IndexEntryV3 {
    * the hoist. See `hoistLegacyNodeExec`.
    */
   execMigrated?: boolean
+}
+
+/**
+ * A folder project's canvas as a folder-data-ref stores it — in its data file and its index cache:
+ * the project WITHOUT `cwd` (node cwds stay absolute; an older build reads the cache as a plain
+ * inline canvas) and without the runtime-only flags. ONE definition for `splitWorkspace` and for
+ * the store's "the move into the folder did not land" path.
+ */
+export function appDataCanvas(p: Project): Project {
+  const { unavailable: _u, cwd: _cwd, storeInAppData: _s, ...inline } = p
+  return inline
+}
+
+/** A folder project whose canvas lives in app data (issue #1145) — see `IndexEntryV3.dataFile`. */
+export function isFolderDataRef(e: Pick<IndexEntryV3, 'cwd' | 'ssh' | 'dataFile'>): boolean {
+  return !!(e.dataFile && e.cwd && !e.ssh)
+}
+
+/**
+ * The folder whose `.nodeterm/project.json` holds this entry's CONTENT, or undefined. Not the same
+ * question as "does it have a cwd": a folder-data-ref has a working directory and keeps its canvas
+ * in app data, so every reader or writer of the folder FILE asks this, and everything that only
+ * needs where terminals run keeps reading `cwd`.
+ */
+export function folderFileCwd(e: Pick<IndexEntryV3, 'cwd' | 'ssh' | 'dataFile'>): string | undefined {
+  return e.cwd && !e.dataFile ? e.cwd : undefined
 }
 
 export interface WorkspaceIndexV3 {
@@ -324,9 +391,25 @@ export function projectToFile(
   // reached the live nodes some other way (a peer mutation, a hand edit) is never written into
   // the shared file as if it were ours.
   const nodes = sanitizeNodeTriggers(
-    stripSharedNodeExec(p.cwd ? toPortableNodes(p.nodes, p.cwd) : p.nodes)
+    stripSharedNodeExec(
+      p.cwd
+        ? toPortableNodes(p.nodes, p.cwd)
+        : // The SSH mirror records shared LAYOUT, not where this machine runs a node: the host's own
+          // desktop opens the same file as a local project (issue #1186). Re-derived on every load.
+          neutralSshProjectNodes(p.nodes, p.ssh)
+    )
   )
   const icon = sanitizeProjectIcon(p.icon)
+  // The SECOND seam for layouts. Live project data is reachable by a peer canvas mutation and by a
+  // hand edit that already got past a read, and whatever we write is what the next machine trusts:
+  // the same reason `normalizeNodeIcon` and `sanitizeNodeTriggers` validate on the way OUT as well
+  // as IN. Validating one direction only passes every round-trip test while leaving the other one
+  // open. See @shared/canvas-layout.
+  const layouts = sanitizeLayouts(p.layouts)
+  // Same two-seam rule for the board (see `sanitizeKanban`).
+  const kanban = p.kanban ? sanitizeKanban(p.kanban) : undefined
+  const bridges = p.bridges ? sanitizeLinks(p.bridges) : undefined
+  const ropes = p.ropes ? sanitizeLinks(p.ropes) : undefined
   return {
     version: 1,
     rev,
@@ -337,15 +420,19 @@ export function projectToFile(
     viewport: framingViewport(nodes),
     nodes,
     ...(icon ? { icon } : {}),
-    ...(p.bridges ? { bridges: p.bridges } : {}),
-    ...(p.ropes ? { ropes: p.ropes } : {}),
+    // The same two-seam rule as the board: what we write is what the next machine trusts.
+    ...(bridges ? { bridges } : {}),
+    ...(ropes ? { ropes } : {}),
     ...(p.defaultPermissionMode ? { defaultPermissionMode: p.defaultPermissionMode } : {}),
     // Strict-normalised (literal true only, known keys only) and omitted when off — an off
     // capability adds no bytes to the committed file. `capabilityAck` is deliberately NOT here:
     // the acknowledgment is machine-local (IndexEntryV3.capabilityAck) and must never travel.
     ...projectCapabilityFields(p),
     ...(p.dinoHighScore ? { dinoHighScore: p.dinoHighScore } : {}),
-    ...(p.kanban ? { kanban: p.kanban } : {})
+    ...(kanban ? { kanban } : {}),
+    // `layoutViewports` is deliberately absent: a field of that name in the shared file is a
+    // forgery (a repo carrying one person's camera), and `fileToProject` never reads one.
+    ...(layouts ? { layouts } : {})
   }
 }
 
@@ -359,6 +446,130 @@ export function validKanban(k: unknown): k is ProjectKanban {
     Array.isArray((k as ProjectKanban).columns) &&
     Array.isArray((k as ProjectKanban).assignments)
   )
+}
+
+/**
+ * A project's `bridges` / `ropes` as they may be ADMITTED. Both come straight out of the git-shared,
+ * hand-editable project file, and every reader treats them as `BridgeLink[]`: the canvas restores
+ * them with `ropes.map((r) => ropeEdge(r.id, r.source, r.target))`, the server-change merge maps
+ * their ids, the headless factory spreads them. A non-list, or one `null` entry, threw on project
+ * load. The rule: a non-list is dropped; an entry that is not an object with non-empty string `id`,
+ * `source` and `target` is dropped; every other field an entry carries round-trips untouched.
+ *
+ * Returns the SAME array when nothing needed repair, so a clean file is never rewritten, and
+ * `undefined` for a non-list. Used on every seam `sanitizeKanban` is.
+ */
+export function sanitizeLinks(links: unknown): BridgeLink[] | undefined {
+  if (!Array.isArray(links)) return undefined
+  const ok = (l: unknown): l is BridgeLink =>
+    isRecord(l) &&
+    typeof l.id === 'string' && l.id !== '' &&
+    typeof l.source === 'string' && l.source !== '' &&
+    typeof l.target === 'string' && l.target !== ''
+  return links.every(ok) ? (links as BridgeLink[]) : links.filter(ok)
+}
+
+/**
+ * The board as it may be ADMITTED: `validKanban`'s shape rule plus the per-entry repairs a
+ * hand-edited, git-shared file needs before a renderer touches it — a render throw on a bad board
+ * boot-loops the app (the board view choice persists in localStorage).
+ *
+ * Repairs, never inventions:
+ *  - a column that is not an object with a string `id` and `title` is dropped (React cannot render
+ *    an object title, and `resolveColumnRef` lower-cases it);
+ *  - a column's `category` that is not a STRING is dropped. An unknown string is KEPT: it may be a
+ *    category a newer build added, and dropping it here would erase that build's data from the
+ *    shared file on our next save. Readers treat it as absent (`columnCategory`);
+ *  - an assignment that is not an object with string `nodeId` and `columnId` is dropped, so is a
+ *    card's SECOND assignment (a clean git merge can leave two; the first is what readers use), and
+ *    a non-string `rank` (a rank string readers cannot use is kept, like an unknown category);
+ *  - a card's `assignees` that is not a list is dropped, and entries without a string name and
+ *    colour are filtered out of one that is (`cardAssignees` is the matching reader);
+ *  - `views` go through `sanitizeViews` (a non-list is dropped, bad entries repaired or dropped).
+ * Every other field — known or not — round-trips untouched.
+ *
+ * Returns the SAME object when nothing needed repair, so a clean file is never rewritten, and
+ * `undefined` for anything `validKanban` refuses. Used on every seam: `fileToProject` (in),
+ * `projectToFile` (out), and the inline-project branch of the store, which bypasses both.
+ */
+export function sanitizeKanban(k: unknown): ProjectKanban | undefined {
+  if (!validKanban(k)) return undefined
+  let changed = false
+  const columns: ProjectKanban['columns'] = []
+  for (const c of k.columns as unknown[]) {
+    if (!isRecord(c) || typeof c.id !== 'string' || typeof c.title !== 'string') {
+      changed = true
+      continue
+    }
+    if ('category' in c && typeof c.category !== 'string') {
+      const { category: _drop, ...rest } = c
+      columns.push(rest as unknown as ProjectKanban['columns'][number])
+      changed = true
+      continue
+    }
+    columns.push(c as unknown as ProjectKanban['columns'][number])
+  }
+  const assignments: ProjectKanban['assignments'] = []
+  const assigned = new Set<string>()
+  for (const a of k.assignments as unknown[]) {
+    if (!isRecord(a) || typeof a.nodeId !== 'string' || typeof a.columnId !== 'string') {
+      changed = true
+      continue
+    }
+    // A clean git merge can leave one card assigned twice; the first copy is the one every reader
+    // (`columnForNode`) has always answered with, so it is the one kept.
+    if (assigned.has(a.nodeId)) {
+      changed = true
+      continue
+    }
+    assigned.add(a.nodeId)
+    // Same rule as `category`: a rank STRING the readers cannot use is kept (they treat it as
+    // absent, and the next write into that column re-keys it — @shared/kanban-order); a non-string
+    // is dropped.
+    if ('rank' in a && typeof a.rank !== 'string') {
+      const { rank: _drop, ...rest } = a
+      assignments.push(rest as unknown as ProjectKanban['assignments'][number])
+      changed = true
+      continue
+    }
+    assignments.push(a as unknown as ProjectKanban['assignments'][number])
+  }
+  // Card assignees: iterated by the board, the card and the log diff. A non-list is dropped and an
+  // entry without a string name + colour filtered (`cardAssignees` is the matching reader).
+  let meta: unknown = k.meta
+  if (Array.isArray(k.meta)) {
+    let metaChanged = false
+    const out = (k.meta as unknown[]).map((m) => {
+      if (!isRecord(m) || !('assignees' in m)) return m
+      const list = m.assignees
+      if (!Array.isArray(list)) {
+        metaChanged = true
+        const { assignees: _drop, ...rest } = m
+        return rest
+      }
+      const valid = list.filter(
+        (x) => isRecord(x) && typeof x.name === 'string' && typeof x.color === 'string'
+      )
+      if (valid.length === list.length) return m
+      metaChanged = true
+      return { ...m, assignees: valid }
+    })
+    if (metaChanged) {
+      meta = out
+      changed = true
+    }
+  }
+  // Saved views: their own tolerant reader (@shared/kanban-views), same identity discipline.
+  let views: ProjectKanban['views'] | undefined = k.views
+  if ('views' in k) {
+    views = sanitizeViews(k.views)
+    if (views !== k.views) changed = true
+  }
+  if (!changed) return k
+  const next: ProjectKanban = { ...k, columns, assignments, ...(meta !== undefined ? { meta: meta as ProjectKanban['meta'] } : {}) }
+  if (views) next.views = views
+  else delete next.views
+  return next
 }
 
 /** A `{x, y}` point, checked at the boundary because the file is hostile input. */
@@ -427,6 +638,21 @@ export function sanitizeLoadedClosedSessions(x: unknown): ClosedSessionEntry[] |
   })
 }
 
+/** The index is hand-editable: keep only a well-formed record. A record without a finite `at` is
+ *  not one at all (the project is an ordinary SSH project again); a malformed or oversized
+ *  `hostId`/`projectId` is dropped on its own, which still leaves the guard in place. */
+export function sanitizeHandedOffTo(v: unknown): HandedOffTo | undefined {
+  if (!v || typeof v !== 'object') return undefined
+  const o = v as Record<string, unknown>
+  if (typeof o.at !== 'number' || !Number.isFinite(o.at)) return undefined
+  const ok = (s: unknown, max: number): s is string => typeof s === 'string' && s.length > 0 && s.length <= max
+  return {
+    at: o.at,
+    ...(ok(o.hostId, 64) ? { hostId: o.hostId } : {}),
+    ...(ok(o.projectId, 128) ? { projectId: o.projectId } : {})
+  }
+}
+
 /**
  * The shared file plus this machine's own half of the project.
  *
@@ -444,6 +670,8 @@ export function fileToProject(
     ssh?: Project['ssh']
     closed?: boolean
     closedAt?: number
+    /** This machine's "Share with team" handover record (index entry only; never from the file). */
+    handedOffTo?: HandedOffTo
     /** This machine's camera. Falls back to the file's legacy one (a pre-change file, or a
      *  teammate's) and then to a frame that puts the canvas on screen. */
     viewport?: Viewport
@@ -453,6 +681,10 @@ export function fileToProject(
     capabilityAck?: import('../shared/project-capability-consent').CapabilityAckMap
     /** This machine's navigation history for this entry (never from the file). */
     breadcrumbs?: NavStop[]
+    /** This machine's camera per canvas layout for this entry. Taken from the index entry ONLY: a
+     *  field of this name in the shared file is a forgery and is never read. Pruned below against
+     *  the layouts the file actually carries. */
+    layoutViewports?: LayoutViewports
     /** This machine's closed-session history for this entry (never from the file) — already
      *  validated/capped/trigger-sanitized by the caller (`sanitizeLoadedClosedSessions`). */
     closedSessions?: ClosedSessionEntry[]
@@ -464,6 +696,14 @@ export function fileToProject(
 ): Project {
   const defaultAccountId = base.defaultAccountId ?? f.defaultAccountId
   const icon = sanitizeProjectIcon(f.icon)
+  const layouts = sanitizeLayouts(f.layouts)
+  // A camera for a layout the file no longer carries names nothing: a teammate deleted the layout
+  // (they are shared content, the cameras are not), or a hand edit dropped it. Pruning on the way
+  // in as well as out is what stops workspace.json accumulating orphans forever.
+  const layoutViewports = pruneLayoutViewports(base.layoutViewports, layouts)
+  const kanban = sanitizeKanban(f.kanban)
+  const bridges = f.bridges ? sanitizeLinks(f.bridges) : undefined
+  const ropes = f.ropes ? sanitizeLinks(f.ropes) : undefined
   return {
     id: base.id,
     // A project whose stored name IS its own path is one this machine (or a teammate's) created
@@ -483,23 +723,35 @@ export function fileToProject(
     // loadedAgentBrowserPartition; without it a cloned project.json forges another project's jar.
     nodes: sanitizeNodeTriggers(
       sanitizeBrowserPartitions(
-        applyLocalNodeExec(base.cwd ? resolveNodes(f.nodes, base.cwd) : f.nodes, base.localExec),
+        applyLocalNodeExec(
+          base.cwd
+            ? resolveNodes(f.nodes, base.cwd)
+            : // An SSH project's nodes run on ITS host, whatever the shared file says (issue #1186):
+              // the host's own desktop, a teammate or git writes nodes into that file without this
+              // machine's routing fields. See @shared/ssh-project-nodes.
+              routeSshProjectNodes(f.nodes, base.ssh),
+          base.localExec
+        ),
         base.id
       )
     ),
-    ...(f.bridges ? { bridges: f.bridges } : {}),
-    ...(f.ropes ? { ropes: f.ropes } : {}),
+    // Hostile input like the rest of the file: a non-list or a malformed entry threw on load.
+    ...(bridges ? { bridges } : {}),
+    ...(ropes ? { ropes } : {}),
     ...(defaultAccountId ? { defaultAccountId } : {}),
     ...(f.defaultPermissionMode ? { defaultPermissionMode: f.defaultPermissionMode } : {}),
     // The file is hostile input: only a literal `true` under a known key survives the read
     // (readProjectCapabilities). `"true"`, 1, {} et al. vanish here, at the boundary.
     ...readProjectCapabilities(f),
     ...(f.dinoHighScore ? { dinoHighScore: f.dinoHighScore } : {}),
-    ...(validKanban(f.kanban) ? { kanban: f.kanban } : {}),
+    ...(kanban ? { kanban } : {}),
     ...(base.cwd ? { cwd: base.cwd } : {}),
     ...(base.ssh ? { ssh: base.ssh } : {}),
     ...(base.closed ? { closed: true } : {}),
     ...(base.closedAt ? { closedAt: base.closedAt } : {}),
+    // Machine-local, from the index entry ONLY: a file field named `handedOffTo` is not this
+    // machine's record and is never read.
+    ...(base.handedOffTo ? { handedOffTo: base.handedOffTo } : {}),
     // Machine-local, from the index entry ONLY: a file field named `capabilityAck` is a forgery
     // attempt (the shared file cannot carry this machine's consent) and is simply never read.
     ...(base.capabilityAck ? { capabilityAck: base.capabilityAck } : {}),
@@ -508,7 +760,10 @@ export function fileToProject(
     ...(base.breadcrumbs?.length ? { breadcrumbs: base.breadcrumbs } : {}),
     // Machine-local, from the index entry ONLY, same rule as `breadcrumbs`: a file field named
     // `closedSessions` is never read here — the shared file cannot carry this machine's trash can.
-    ...(base.closedSessions?.length ? { closedSessions: base.closedSessions } : {})
+    ...(base.closedSessions?.length ? { closedSessions: base.closedSessions } : {}),
+    ...(layouts ? { layouts } : {}),
+    // Machine-local, from the index entry ONLY, same rule as `breadcrumbs`.
+    ...(layoutViewports ? { layoutViewports } : {})
   }
 }
 
@@ -600,7 +855,10 @@ export function splitWorkspace(
     const header = {
       id: p.id, name: p.name, color: p.color,
       ...(p.closed ? { closed: true } : {}),
-      ...(p.closedAt ? { closedAt: p.closedAt } : {})
+      ...(p.closedAt ? { closedAt: p.closedAt } : {}),
+      // On the header so even an unavailable placeholder's entry keeps it: the guard must hold
+      // while the server is unreachable too.
+      ...(p.handedOffTo ? { handedOffTo: p.handedOffTo } : {})
     }
     // The machine-local half of a REF'd project (a folder or an ssh endpoint), which used to ride
     // the shared file: this user's camera and this machine's default managed account. Deliberately
@@ -608,6 +866,7 @@ export function splitWorkspace(
     // empty stand-in, and writing it would forget where the user actually was; `WorkspaceStore.save`
     // restores both from the previous entry instead, exactly as it does for `cache`/`localExec`.
     // Inline entries need none of this: they store the whole Project verbatim.
+    const layoutViews = pruneLayoutViewports(p.layoutViewports, sanitizeLayouts(p.layouts))
     const localState = {
       ...(p.viewport ? { viewport: p.viewport } : {}),
       ...(p.defaultAccountId ? { defaultAccountId: p.defaultAccountId } : {}),
@@ -620,13 +879,19 @@ export function splitWorkspace(
       // written back uncapped.
       ...(p.closedSessions?.length
         ? { closedSessions: p.closedSessions.slice(0, CLOSED_SESSIONS_CAP) }
-        : {})
+        : {}),
+      // The layouts themselves are content and ride the file; only this machine's camera per
+      // layout is kept here, pruned against the layouts that will actually be written.
+      ...(layoutViews ? { layoutViewports: layoutViews } : {})
     }
     if (p.unavailable) {
       // Placeholder (folder missing / server unreachable at load): its nodes:[] is not real
       // data. Emit a header-only ref preserving the ref shape — NEVER a file and NEVER an ssh
       // cache built from the placeholder, so a later save can't clobber the on-disk source.
       if (p.ssh) entries.push({ ...header, ssh: p.ssh })
+      // A folder-data-ref placeholder keeps `dataFile`: without it the next load would read the
+      // folder's own `.nodeterm/project.json` — a stale or a teammate's canvas — as this project.
+      else if (p.cwd && p.storeInAppData) entries.push({ ...header, cwd: p.cwd, dataFile: true })
       else if (p.cwd) entries.push({ ...header, cwd: p.cwd })
       else {
         const { unavailable: _u, ...inline } = p
@@ -651,6 +916,21 @@ export function splitWorkspace(
         // file. It is no longer identity even there: `fileToProject` is handed `e.id` regardless.
         cache: projectToFile(p, revOf(p.id), savedAt, p.id)
       })
+    } else if (p.cwd && p.storeInAppData) {
+      // The FOLDER-DATA-REF (issue #1145): a folder project whose canvas lives in
+      // `userData/inline-projects/<id>.json`, so nothing is written into the folder. It is stored
+      // exactly like a cwd-less canvas — the file and its `project` cache both hold the project
+      // WITHOUT `cwd`, so node cwds stay absolute and the inline load/write paths serve it
+      // unchanged — and the entry adds the `cwd` back. Two consequences are deliberate:
+      //  - It never claims `files` for its cwd, so it can sit beside a folder ref on the same
+      //    folder without either being demoted to the second-tab branch below.
+      //  - A build that predates the kind reads the cwd-less cache and sees an ordinary inline
+      //    canvas: it loses the folder binding but never writes into the folder.
+      //  - A hand-edited id we will not turn into a path gets no file — the cache IS the storage,
+      //    as for the pre-file inline shape — but it still never falls through to the folder.
+      const inline = appDataCanvas(p)
+      if (isInlineProjectFileId(p.id)) dataFiles.set(p.id, projectToFile(inline, revOf(p.id), savedAt))
+      entries.push({ ...header, ...localState, ...localRef, cwd: p.cwd, dataFile: true, project: inline })
     } else if (p.cwd && !files.has(p.cwd)) {
       files.set(p.cwd, projectToFile(p, revOf(p.id), savedAt))
       entries.push({ ...header, ...localState, ...localRef, cwd: p.cwd })

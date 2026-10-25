@@ -7,6 +7,8 @@ interface SettingsState {
   hydrated: boolean
   hydrate(): Promise<void>
   update(patch: Partial<Settings>): void
+  /** Publish current settings before an operation whose core-side decision depends on them. */
+  flush(): Promise<void>
 }
 
 // Coalesce disk writes: the settings inputs fire update() per keystroke/step-click, and each
@@ -24,6 +26,12 @@ function scheduleSave(next: Settings): void {
   if (saveTimer) return
   saveTimer = setTimeout(() => {
     saveTimer = null
+    // Re-checked at fire time: a jsdom test file can end inside the coalesce window, and vitest
+    // deletes `window` from the globals while this Node timer is still pending. Drop the save.
+    if (typeof window === 'undefined') {
+      pendingSave = null
+      return
+    }
     if (pendingSave) void window.nodeTerminal.settings.save(pendingSave)
     pendingSave = null
   }, SAVE_COALESCE_MS)
@@ -41,6 +49,15 @@ export const useSettings = create<SettingsState>((set, get) => ({
   settings: DEFAULT_SETTINGS,
   hydrated: false,
 
+  async flush() {
+    if (saveTimer) clearTimeout(saveTimer)
+    saveTimer = null
+    pendingSave = null
+    // Always send the current snapshot, even if the timer already dispatched an older save.
+    // Core's FIFO writer makes this acknowledgement a barrier for that earlier write too.
+    await window.nodeTerminal.settings.save(get().settings)
+  },
+
   async hydrate() {
     const s = await window.nodeTerminal.settings.load()
     set({ settings: { ...DEFAULT_SETTINGS, ...s }, hydrated: true })
@@ -48,6 +65,13 @@ export const useSettings = create<SettingsState>((set, get) => ({
 
   update(patch) {
     const next = { ...get().settings, ...patch }
+    // `vanillaLaunchDefault` is the one-release downgrade mirror for `agentLaunchMode`: an older
+    // build reads the boolean, so when the user picks a mode here the mirror must follow. (The
+    // read path in core settings-store keeps them in lockstep on load; this keeps them in lockstep
+    // on write.) `'subscription'` ⇒ true (strip env), anything else ⇒ false.
+    if ('agentLaunchMode' in patch) {
+      next.vanillaLaunchDefault = patch.agentLaunchMode === 'subscription'
+    }
     set({ settings: next })
     scheduleSave(next)
   }

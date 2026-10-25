@@ -14,7 +14,7 @@ import { useSettings } from '../../../state/settings'
 import { useSystemAccount } from '../../../state/systemAccount'
 import { markWorkspaceDirty } from '../../../state/workspaceDirty'
 import {
-  NODE_COLORS,
+  SYSTEM_NODE_COLORS,
   accountsForProject,
   sshAccountsHint,
   systemAccountDisplay
@@ -28,6 +28,7 @@ import { useSettingsSearch } from '../context'
 import { projectSectionId } from '../project-settings-targets'
 import { matchesQuery, type SettingsSearchEntry } from '../search'
 import { useProjectSettings } from '../useProjectSettings'
+import { PROJECT_NAME_MAX, clampProjectName } from '@shared/project-name'
 
 /**
  * Persists an identity/defaults edit. The store setters (`renameProject`, `setProjectColor`,
@@ -178,8 +179,11 @@ function EditableProjectSection({
   const accountsHint = sshAccountsHint(project, accounts)
 
   // Editors commit on BLUR, never per keystroke: each commit is a disk write.
-  const [nameDraft, setNameDraft] = useState(project.name)
-  useEffect(() => setNameDraft(project.name), [project.name])
+  // Shown cut to what a rename would store (issue #940); an unedited field writes nothing, so
+  // merely visiting it does not cut an existing over-long name.
+  const shownName = clampProjectName(project.name)
+  const [nameDraft, setNameDraft] = useState(shownName)
+  useEffect(() => setNameDraft(shownName), [shownName])
 
   const snapshot = settings.snapshot
   // A git-conflicted settings.json is left untouched for the user to resolve, so every editor of
@@ -189,8 +193,8 @@ function EditableProjectSection({
 
   const commitName = (): void => {
     const next = nameDraft.trim()
-    if (!next || next === project.name) {
-      setNameDraft(project.name)
+    if (!next || next === shownName) {
+      setNameDraft(shownName)
       return
     }
     useProjects.getState().renameProject(project.id, next)
@@ -201,7 +205,11 @@ function EditableProjectSection({
     <SettingsSection
       id={projectSectionId(project.id)}
       title={project.name}
-      description={`Settings for this project only. Name, color and defaults live in ${project.ssh ? 'the project file on the server' : '.nodeterm/project.json'}, which is shared with anyone who has the repo.`}
+      description={
+        project.storeInAppData && !project.ssh
+          ? 'Settings for this project only. They are stored in app data on this machine, not in the folder.'
+          : `Settings for this project only. Name, color and defaults live in ${project.ssh ? 'the project file on the server' : '.nodeterm/project.json'}, which is shared with anyone who has the repo.`
+      }
       isActive={isActive}
       searchEntries={entries}
       forceVisible={forceVisible}
@@ -228,12 +236,13 @@ function EditableProjectSection({
               id={`project-name-${project.id}`}
               className="w-72"
               value={nameDraft}
+              maxLength={PROJECT_NAME_MAX}
               aria-label="Project name"
               onChange={(e) => setNameDraft(e.target.value)}
               onBlur={commitName}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') e.currentTarget.blur()
-                if (e.key === 'Escape') setNameDraft(project.name)
+                if (e.key === 'Escape') setNameDraft(shownName)
               }}
             />
           }
@@ -268,7 +277,7 @@ function EditableProjectSection({
             name={project.name}
             icon={project.icon}
             color={project.color}
-            colors={NODE_COLORS}
+            colors={SYSTEM_NODE_COLORS}
             dark={appTheme === 'dark'}
             // Only the section the user is actually viewing probes the (uncached, live) GitHub
             // avatar. During a settings SEARCH many sections are VISIBLE-but-not-active — gating

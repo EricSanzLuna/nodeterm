@@ -17,7 +17,21 @@ interface ConfirmDialogProps {
   alert?: boolean
   /** An explicit opt-in shown above the buttons (e.g. "Delete the worktree directory from disk
    *  too"). The caller owns the value, so it can also swap the confirm label / danger styling. */
-  option?: { label: string; checked: boolean; onChange: (checked: boolean) => void }
+  option?: {
+    label: string
+    checked: boolean
+    onChange: (checked: boolean) => void
+  }
+  /** A required pick among alternatives, shown from the start with `value` selected (e.g. the reason
+   *  a GitHub issue is closed, or the canvas-control "don't ask again" reach). Unlike `option`,
+   *  there is no "off": the caller always gets a value, so it owns a sensible default — which, for
+   *  a waiver, is the choice that grants nothing. */
+  choice?: {
+    label: string
+    options: { value: string; label: string }[]
+    value: string
+    onChange: (value: string) => void
+  }
   /**
    * May Enter confirm this dialog? Default true — the user asked for it. Pass FALSE for a dialog
    * the app raised on someone ELSE's behalf (an agent verb like `close-worktree`): the user never
@@ -60,6 +74,7 @@ export function ConfirmDialog({
   danger: dangerProp,
   alert = false,
   option,
+  choice,
   enterConfirms = true,
   autoFocusButtons = true,
   onConfirm,
@@ -114,6 +129,22 @@ export function ConfirmDialog({
       <div className="confirm" ref={boxRef} onClick={(e) => e.stopPropagation()}>
         {body}
         <p className="confirm__msg">{message}</p>
+        {choice && (
+          <div className="confirm__scopes" role="radiogroup" aria-label={choice.label}>
+            {choice.options.map((item) => (
+              <label key={item.value} className="confirm__scope">
+                <input
+                  type="radio"
+                  name={`${id}-choice`}
+                  value={item.value}
+                  checked={choice.value === item.value}
+                  onChange={() => choice.onChange(item.value)}
+                />
+                {item.label}
+              </label>
+            ))}
+          </div>
+        )}
         {option && (
           <label className="confirm__option">
             <input

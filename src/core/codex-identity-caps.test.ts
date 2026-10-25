@@ -8,6 +8,7 @@ import {
   codexIdentityCaps,
   codexManagedRuntimeInstalled,
   codexManagedRuntimePath,
+  probeCodexRemoteFlagAt,
   refreshCodexIdentityCaps,
   resetCodexIdentityCapsForTests
 } from './codex-identity-caps'
@@ -16,6 +17,9 @@ import {
 const remote = (yes: boolean) => () => Promise.resolve(yes)
 /** Stand-in for the managed-runtime stat — "can this INSTALL run an app-server at all?". */
 const appServer = (yes: boolean) => () => yes
+/** The probes only run off Windows; pinning the host keeps these rows meaning the same on a
+ *  Windows CI runner (where the answer is the deliberate `unsupported-platform` gate below). */
+const POSIX = 'linux'
 import {
   resetCodexThreadIdentityAuthSecret,
   setCodexThreadIdentityAuthSecret
@@ -43,7 +47,7 @@ afterEach(() => {
 describe('codexIdentityCaps', () => {
   it('says yes, and installs the launcher, once the secret is in and the CLI has --remote', async () => {
     setCodexThreadIdentityAuthSecret(randomBytes(32))
-    const caps = await refreshCodexIdentityCaps(remote(true), appServer(true))
+    const caps = await refreshCodexIdentityCaps(remote(true), appServer(true), POSIX)
     expect(caps.shared).toBe(true)
     expect(fs.existsSync(caps.launcherPath as string)).toBe(true)
   })
@@ -51,7 +55,7 @@ describe('codexIdentityCaps', () => {
   it('says no without the secret, and installs nothing', () => {
     // Half-armed is the state to avoid: a launcher on PATH with no capability to present would
     // reach the routes, be refused, and fall back one process later. Better to never name it.
-    return refreshCodexIdentityCaps(remote(true), appServer(true)).then((caps) => {
+    return refreshCodexIdentityCaps(remote(true), appServer(true), POSIX).then((caps) => {
       expect(caps).toEqual({
         shared: false,
         launcherPath: null,
@@ -67,7 +71,7 @@ describe('codexIdentityCaps', () => {
     // app-server but no --remote dies on a usage error where nothing can fall back. Answering it
     // here turns a dead node into a plain-codex node on every machine, not just the tester's.
     setCodexThreadIdentityAuthSecret(randomBytes(32))
-    const caps = await refreshCodexIdentityCaps(remote(false), appServer(true))
+    const caps = await refreshCodexIdentityCaps(remote(false), appServer(true), POSIX)
     expect(caps).toEqual({
       shared: false,
       launcherPath: null,
@@ -87,7 +91,7 @@ describe('codexIdentityCaps', () => {
   // not, and this row is what keeps it inert.
   it('says no on an npm install — `--remote` in help, no standalone runtime — and writes no launcher', async () => {
     setCodexThreadIdentityAuthSecret(randomBytes(32))
-    const caps = await refreshCodexIdentityCaps(remote(true), appServer(false))
+    const caps = await refreshCodexIdentityCaps(remote(true), appServer(false), POSIX)
     expect(caps).toEqual({
       shared: false,
       launcherPath: null,
@@ -105,7 +109,7 @@ describe('codexIdentityCaps', () => {
     await refreshCodexIdentityCaps(() => {
       asked += 1
       return Promise.resolve(true)
-    }, appServer(false))
+    }, appServer(false), POSIX)
     expect(asked).toBe(0)
   })
 
@@ -115,7 +119,7 @@ describe('codexIdentityCaps', () => {
     setCodexThreadIdentityAuthSecret(randomBytes(32))
     const threw = await refreshCodexIdentityCaps(remote(true), () => {
       throw new Error('stat failed')
-    })
+    }, POSIX)
     expect(threw).toEqual({
       shared: false,
       launcherPath: null,
@@ -124,7 +128,8 @@ describe('codexIdentityCaps', () => {
     })
     resetCodexIdentityCapsForTests()
     const rejected = await refreshCodexIdentityCaps(remote(true), () =>
-      Promise.reject(new Error('probe timed out'))
+      Promise.reject(new Error('probe timed out')),
+      POSIX
     )
     expect(rejected.shared).toBe(false)
     expect(fs.existsSync(path.join(dir, 'codex-bin', 'nodeterm-codex'))).toBe(false)
@@ -140,18 +145,54 @@ describe('codexIdentityCaps', () => {
     await Promise.resolve()
     expect(settled).toBe(false)
     setCodexThreadIdentityAuthSecret(randomBytes(32))
-    await refreshCodexIdentityCaps(remote(true), appServer(true))
+    await refreshCodexIdentityCaps(remote(true), appServer(true), POSIX)
     expect((await asked).shared).toBe(true)
   })
 
   it('answers immediately once refreshed', async () => {
-    await refreshCodexIdentityCaps(remote(false), appServer(true))
+    await refreshCodexIdentityCaps(remote(false), appServer(true), POSIX)
     expect(await codexIdentityCaps()).toEqual({
       shared: false,
       launcherPath: null,
       remoteFlag: false,
       appServer: true
     })
+  })
+})
+
+describe('codexIdentityCaps — Windows (phase 1: deliberately off, and saying so)', () => {
+  it('answers unsupported-platform without probing anything or writing a launcher', async () => {
+    setCodexThreadIdentityAuthSecret(randomBytes(32))
+    let probed = 0
+    const caps = await refreshCodexIdentityCaps(
+      () => {
+        probed += 1
+        return Promise.resolve(true)
+      },
+      () => {
+        probed += 1
+        return true
+      },
+      'win32'
+    )
+    expect(probed).toBe(0)
+    expect(caps).toEqual({
+      shared: false,
+      launcherPath: null,
+      remoteFlag: false,
+      appServer: false,
+      unavailableReason: 'unsupported-platform'
+    })
+    expect(fs.existsSync(path.join(dir, 'codex-bin', 'nodeterm-codex'))).toBe(false)
+    expect(await codexIdentityCaps()).toEqual(caps)
+  })
+
+  it('every other platform carries no reason (unchanged shape)', async () => {
+    for (const p of ['darwin', 'linux']) {
+      resetCodexIdentityCapsForTests()
+      const caps = await refreshCodexIdentityCaps(remote(false), appServer(true), p)
+      expect(caps).not.toHaveProperty('unavailableReason')
+    }
   })
 })
 
@@ -164,18 +205,22 @@ describe('codexManagedRuntimeInstalled', () => {
     )
   })
 
-  it('answers yes only for an executable runtime at that path', () => {
-    // An npm install has ~/.codex (auth, config, sessions) and no `packages/` at all — which is
-    // exactly the shape measured on the machine this fix was written on.
-    expect(codexManagedRuntimeInstalled(dir)).toBe(false)
-    const runtime = codexManagedRuntimePath(dir)
-    fs.mkdirSync(path.dirname(runtime), { recursive: true })
-    fs.writeFileSync(runtime, '#!/bin/sh\nexit 0\n', { mode: 0o644 })
-    // Present but not executable is not a runtime the daemon can exec, so it is still no.
-    expect(codexManagedRuntimeInstalled(dir)).toBe(false)
-    fs.chmodSync(runtime, 0o755)
-    expect(codexManagedRuntimeInstalled(dir)).toBe(true)
-  })
+  it.skipIf(process.platform === 'win32')(
+    'answers yes only for an executable runtime at that path',
+    () => {
+      // An npm install has ~/.codex (auth, config, sessions) and no `packages/` at all — which is
+      // exactly the shape measured on the machine this fix was written on.
+      // Windows ignores the executable bit, so `X_OK` cannot distinguish the two fixture modes.
+      expect(codexManagedRuntimeInstalled(dir)).toBe(false)
+      const runtime = codexManagedRuntimePath(dir)
+      fs.mkdirSync(path.dirname(runtime), { recursive: true })
+      fs.writeFileSync(runtime, '#!/bin/sh\nexit 0\n', { mode: 0o644 })
+      // Present but not executable is not a runtime the daemon can exec, so it is still no.
+      expect(codexManagedRuntimeInstalled(dir)).toBe(false)
+      fs.chmodSync(runtime, 0o755)
+      expect(codexManagedRuntimeInstalled(dir)).toBe(true)
+    }
+  )
 })
 
 describe('codexCliSupportsRemote', () => {
@@ -191,5 +236,23 @@ describe('codexCliSupportsRemote', () => {
   it('accepts an answer from either help page', () => {
     // Some CLIs list a global flag only under the subcommand that takes it.
     expect(codexCliSupportsRemote('no flags here', '  --remote <URL>')).toBe(true)
+  })
+})
+
+describe.skipIf(process.platform !== 'win32')('probeCodexRemoteFlagAt — Windows npm shim', () => {
+  it('uses cmd.exe for both help probes', async () => {
+    const cmd = path.join(dir, 'codex.cmd')
+    const script = path.join(dir, 'codex.js')
+    fs.writeFileSync(
+      script,
+      [
+        "if (process.argv[2] === '--help') console.log('no flag')",
+        "else if (process.argv[2] === 'resume' && process.argv[3] === '--help') console.log('  --remote <URL>')",
+        'else process.exitCode = 92'
+      ].join('\n')
+    )
+    fs.writeFileSync(cmd, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`)
+
+    await expect(probeCodexRemoteFlagAt(cmd)).resolves.toBe(true)
   })
 })

@@ -3,11 +3,12 @@ import {
   coldGroupChildCount,
   coldGroupCwd,
   coldOpenMessage,
-  coldPlaceBelow,
   coldResolveAfter,
   coldResolveGroup,
   groupSizeFor,
   groupSlot,
+  offCanvasNoticeText,
+  offCanvasReplyClause,
   storedAgentIdOf,
   type ColdNode
 } from './coldOpen'
@@ -153,31 +154,6 @@ describe('coldResolveAfter', () => {
   })
 })
 
-describe('coldPlaceBelow — the live path’s placeBelow, off persisted geometry', () => {
-  it('centers below the source and fans siblings right', () => {
-    const src = N('src', { position: { x: 100, y: 200 }, size: { width: 600, height: 400 } })
-    expect(coldPlaceBelow([src], src, 0)).toEqual({ x: 400, y: 890 })
-    expect(coldPlaceBelow([src], src, 1)).toEqual({ x: 860, y: 890 })
-  })
-
-  it('resolves a grouped source to ROOT space', () => {
-    // A stored child's position is frame-relative; placing off it directly would land the new
-    // node by the frame's own offset away from the agent it hangs from.
-    const frame = N('g', { kind: 'group', position: { x: 1000, y: 1000 } })
-    const src = N('src', {
-      parentId: 'g',
-      position: { x: 10, y: 20 },
-      size: { width: 600, height: 400 }
-    })
-    expect(coldPlaceBelow([frame, src], src, 0)).toEqual({ x: 1310, y: 1710 })
-  })
-
-  it('falls back to the default node size when none is persisted', () => {
-    const src = N('src', { position: { x: 0, y: 0 } })
-    expect(coldPlaceBelow([src], src, 0)).toEqual({ x: 300, y: 690 })
-  })
-})
-
 describe('group grid geometry (shared with the live addGrouped path)', () => {
   it('lays children out in two columns under the frame header', () => {
     expect(groupSlot(0, 600, 400)).toEqual({ x: 24, y: 56 })
@@ -205,7 +181,8 @@ describe('group grid geometry (shared with the live addGrouped path)', () => {
 describe('coldOpenMessage — ONE sentence for both cold-open sites', () => {
   it('names the count, the agent, the project and the ids, and says when it starts', () => {
     expect(coldOpenMessage(2, 'claude', 'Backend', ['t1', 't2'])).toBe(
-      'opened 2 claude session(s) in "Backend" (t1, t2) — queued; starts when that project is next viewed'
+      'opened 2 claude session(s) in "Backend" (t1, t2) — queued; starts when that project is next viewed' +
+        ', or at once with the `run` verb (or pass --run-now when opening)'
     )
   })
 
@@ -216,5 +193,44 @@ describe('coldOpenMessage — ONE sentence for both cold-open sites', () => {
     const closed = coldOpenMessage(1, 'terminal', 'Docs', ['t1'], { closed: true })
     expect(closed.startsWith(open)).toBe(true)
     expect(closed).toContain('that project is closed')
+  })
+})
+
+describe('offCanvasReplyClause — the display verbs\' half of the same event', () => {
+  it('is a CLAUSE, so the verb keeps saying what it made', () => {
+    // Appended to `showing web nt-3f2a`, not instead of it: only the WHERE is new, which is what
+    // lets the four case bodies stay ignorant of routing.
+    expect(offCanvasReplyClause('api')).toBe(
+      ' — placed in "api"; that project is not on screen'
+    )
+  })
+
+  it('adds — and only adds — a clause when the project is CLOSED', () => {
+    const open = offCanvasReplyClause('api')
+    const closed = offCanvasReplyClause('api', { closed: true })
+    expect(closed.startsWith(open)).toBe(true)
+    expect(closed).toContain('reopen it from the welcome screen')
+  })
+
+  it('never claims the node is queued — it is complete when written', () => {
+    // The distinction this builder exists for. A cold-opened SESSION has not started; a page, a
+    // video or an image has. Telling a caller its screenshot is "queued" invites it to wait for
+    // something that already happened.
+    expect(offCanvasReplyClause('api')).not.toContain('queued')
+    expect(offCanvasReplyClause('api')).not.toContain('starts when')
+  })
+})
+
+describe('offCanvasNoticeText — the HUMAN half', () => {
+  it('is an active-voice sentence naming the actor and the project', () => {
+    expect(offCanvasNoticeText('api', 1)).toBe(
+      'An agent opened a node in "api". That project is not on screen.'
+    )
+  })
+
+  it('counts, rather than saying "a node" for five', () => {
+    expect(offCanvasNoticeText('api', 3)).toBe(
+      'An agent opened 3 nodes in "api". That project is not on screen.'
+    )
   })
 })

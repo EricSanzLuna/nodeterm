@@ -38,6 +38,14 @@ export const IconNote = () => (
   </svg>
 )
 
+export const IconWhiteboard = () => (
+  <svg {...S}>
+    <rect x="3" y="4" width="18" height="13" rx="1.5" />
+    <path d="M7 13c1.5-3 3-3 4-1s2.5 2 4-2" />
+    <path d="M9 21l3-4 3 4" />
+  </svg>
+)
+
 export const IconDino = () => (
   <svg width={16} height={16} viewBox="0 0 24 24" fill="currentColor" stroke="none">
     {/* Blocky right-facing T-Rex silhouette (tail, body, head+snout, arm, legs). */}
@@ -61,6 +69,21 @@ export const IconChat = () => (
 export const IconPlus = () => (
   <svg {...S}>
     <path d="M12 5v14M5 12h14" />
+  </svg>
+)
+
+export const IconMinus = () => (
+  <svg {...S}>
+    <path d="M5 12h14" />
+  </svg>
+)
+
+/** Minimap — a map frame with the viewport rectangle inside it: the minimized minimap's restore
+ *  button. */
+export const IconMinimap = () => (
+  <svg {...S}>
+    <rect x="3" y="5" width="18" height="14" rx="2" />
+    <rect x="11" y="9" width="6" height="6" rx="1" />
   </svg>
 )
 
@@ -99,6 +122,16 @@ export const IconSmiley = () => (
 export const IconGrid = () => (
   <svg {...S}>
     <path d="M4 9h16M4 15h16M9 4v16M15 4v16" />
+  </svg>
+)
+
+/** Layer bands with a shared opener above them: the lineage tidy. */
+export const IconLineage = () => (
+  <svg {...S}>
+    <rect x="9.5" y="3" width="5" height="4" rx="1" />
+    <rect x="3" y="17" width="5" height="4" rx="1" />
+    <rect x="16" y="17" width="5" height="4" rx="1" />
+    <path d="M12 7v4M5.5 17v-2.5h13V17" />
   </svg>
 )
 
@@ -169,6 +202,16 @@ export const IconReload = () => (
   </svg>
 )
 
+/** Two chasing arrows — the title-bar "Update" button (an app update is waiting). */
+export const IconUpdate = () => (
+  <svg {...S}>
+    <path d="M20 11a8 8 0 0 0-14.3-4.9L4 8" />
+    <path d="M4 4v4h4" />
+    <path d="M4 13a8 8 0 0 0 14.3 4.9L20 16" />
+    <path d="M20 20v-4h-4" />
+  </svg>
+)
+
 /** Power symbol — restarting a PROCESS (the agent CLI), as opposed to IconReload's
  *  circular arrow, which reloads a VIEW. The two restart actions must not share a glyph. */
 export const IconPower = () => (
@@ -191,6 +234,16 @@ export const IconEye = () => (
   <svg {...S}>
     <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z" />
     <circle cx="12" cy="12" r="3" />
+  </svg>
+)
+
+/** "Share live link" — a dot inside two pairs of arcs (the Settings → Live links glyph, at this
+ *  set's 24-unit scale). Deliberately NOT `IconEye`: that already means "Hide cards & connections"
+ *  in the same node header, and one glyph must not mean two things. */
+export const IconBroadcast = () => (
+  <svg {...S}>
+    <circle cx="12" cy="12" r="2.4" />
+    <path d="M7.8 7.8a6 6 0 0 0 0 8.4M16.2 7.8a6 6 0 0 1 0 8.4M4.95 4.95a9.9 9.9 0 0 0 0 14.1M19.05 4.95a9.9 9.9 0 0 1 0 14.1" />
   </svg>
 )
 
@@ -257,6 +310,15 @@ export const IconExternal = () => (
   </svg>
 )
 
+/** Box with an arrow leaving it: hand this off to another app (the system browser). Distinct from
+ *  IconExternal above, whose two corner brackets read as expand/fullscreen. */
+export const IconOpenExternal = () => (
+  <svg {...S}>
+    <path d="M18 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5" />
+    <path d="M14 4h6v6M20 4l-8 8" />
+  </svg>
+)
+
 export const IconAgent = () => (
   <svg {...S}>
     <path d="M12 3l1.8 4.2L18 9l-4.2 1.8L12 15l-1.8-4.2L6 9l4.2-1.8z" />
@@ -273,10 +335,10 @@ export const IconMic = () => (
 
 export const IconSessions = () => (
   <svg {...S}>
-    <rect x="3" y="4" width="18" height="5" rx="1.5" />
-    <rect x="3" y="11" width="18" height="5" rx="1.5" />
-    <line x1="6" y1="6.5" x2="6" y2="6.5" />
-    <line x1="6" y1="13.5" x2="6" y2="13.5" />
+    <rect x="3" y="4" width="18" height="6" rx="2" />
+    <rect x="3" y="14" width="18" height="6" rx="2" />
+    <circle cx="6.5" cy="7" r="0.9" fill="currentColor" stroke="none" />
+    <circle cx="6.5" cy="17" r="0.9" fill="currentColor" stroke="none" />
   </svg>
 )
 
@@ -294,23 +356,35 @@ export const IconCircleCheck = () => (
   </svg>
 )
 
-/* Filled padlocks (like the bell below): they live in the React Flow controls, whose
-   default icons are filled glyphs capped at 12px — a stroked lock collapses there. */
+/* Stroked padlocks: the canvas lock moved out of the React Flow controls (whose filled 12px
+   glyph set is why these used to be filled) into the dock, where every icon is an outline. */
+/** A clock face — when something ends (the live-link dialog's "Expires" row). */
+export const IconClock = () => (
+  <svg {...S}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 7v5l3 2" />
+  </svg>
+)
+
+/** One person — who someone is shown as (the live-link dialog's name row). */
+export const IconUser = () => (
+  <svg {...S}>
+    <circle cx="12" cy="8" r="4" />
+    <path d="M4.5 20a7.5 7.5 0 0 1 15 0" />
+  </svg>
+)
+
 export const IconLock = () => (
-  <svg width={16} height={16} viewBox="0 0 24 24" fill="currentColor" stroke="none">
-    <path
-      fillRule="evenodd"
-      d="M6 10V7a6 6 0 0 1 12 0v3h.5A2.5 2.5 0 0 1 21 12.5v7A2.5 2.5 0 0 1 18.5 22h-13A2.5 2.5 0 0 1 3 19.5v-7A2.5 2.5 0 0 1 5.5 10H6zm2.4 0h7.2V7a3.6 3.6 0 0 0-7.2 0v3zM12 14.2a1.8 1.8 0 0 0-.9 3.36V19a.9.9 0 0 0 1.8 0v-1.44a1.8 1.8 0 0 0-.9-3.36z"
-    />
+  <svg {...S}>
+    <rect x="4.5" y="10.5" width="15" height="10.5" rx="2.5" />
+    <path d="M8 10.5V7a4 4 0 0 1 8 0v3.5" />
   </svg>
 )
 
 export const IconUnlock = () => (
-  <svg width={16} height={16} viewBox="0 0 24 24" fill="currentColor" stroke="none">
-    <path
-      fillRule="evenodd"
-      d="M6 10V7a6 6 0 0 1 11.7-1.9l-2.3.8A3.6 3.6 0 0 0 8.4 7v3h10.1A2.5 2.5 0 0 1 21 12.5v7A2.5 2.5 0 0 1 18.5 22h-13A2.5 2.5 0 0 1 3 19.5v-7A2.5 2.5 0 0 1 5.5 10H6zM12 14.2a1.8 1.8 0 0 0-.9 3.36V19a.9.9 0 0 0 1.8 0v-1.44a1.8 1.8 0 0 0-.9-3.36z"
-    />
+  <svg {...S}>
+    <rect x="4.5" y="10.5" width="15" height="10.5" rx="2.5" />
+    <path d="M8 10.5V7a4 4 0 0 1 7.7-1.5" />
   </svg>
 )
 
@@ -340,6 +414,117 @@ export const IconKanban = () => (
   </svg>
 )
 
+/** Four-point sparkle: the "name this with AI" action. Replaces a literal ✦, which sat on a text
+ *  baseline among the header's SVGs and could not be centered with them. */
+export const IconSparkle = () => (
+  <svg {...S}>
+    <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z" />
+    <path d="M18.5 15.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z" />
+  </svg>
+)
+
+/** Arrow entering a folder: move this node's session into the worktree bound to its group. */
+export const IconMoveTo = () => (
+  <svg {...S}>
+    <path d="M4 7a2 2 0 0 1 2-2h3.5l1.5 2H18a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z" />
+    <path d="M9 13h6M12.5 10.5l2.5 2.5-2.5 2.5" />
+  </svg>
+)
+
+/** Solid play triangle: run a queued launch now, replay a loop iteration. Filled on purpose, the
+ *  way a transport control is drawn; an outlined triangle reads as a shape, not as "go". */
+export const IconPlay = () => (
+  <svg {...S} fill="currentColor" stroke="none">
+    <path d="M8 5.5v13l11-6.5z" />
+  </svg>
+)
+
+export const IconArrowUp = () => (
+  <svg {...S}>
+    <path d="M12 19V5M6 11l6-6 6 6" />
+  </svg>
+)
+
+export const IconArrowDown = () => (
+  <svg {...S}>
+    <path d="M12 5v14M6 13l6 6 6-6" />
+  </svg>
+)
+
+export const IconArrowLeft = () => (
+  <svg {...S}>
+    <path d="M19 12H5M11 6l-6 6 6 6" />
+  </svg>
+)
+
+export const IconArrowRight = () => (
+  <svg {...S}>
+    <path d="M5 12h14M13 6l6 6-6 6" />
+  </svg>
+)
+
+/** Undo curve: discard a file's changes. Same shape as the dock's undo, which is the same idea. */
+export const IconUndo = () => (
+  <svg {...S}>
+    <path d="M9 14L4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H10" />
+  </svg>
+)
+
+/** Horizontal ellipsis: opens an overflow menu. */
+export const IconMore = () => (
+  <svg {...S} fill="currentColor" stroke="none">
+    <circle cx="5.5" cy="12" r="1.6" />
+    <circle cx="12" cy="12" r="1.6" />
+    <circle cx="18.5" cy="12" r="1.6" />
+  </svg>
+)
+
+/** Vertical ellipsis: the per-row overflow menu, where a horizontal one would read as a separator
+ *  between the label beside it and what follows. */
+export const IconMoreVertical = () => (
+  <svg {...S} fill="currentColor" stroke="none">
+    <circle cx="12" cy="5.5" r="1.6" />
+    <circle cx="12" cy="12" r="1.6" />
+    <circle cx="12" cy="18.5" r="1.6" />
+  </svg>
+)
+
+/** Two overlapping sheets: copy to the clipboard (the ⌘M thread's per-turn Copy). */
+export const IconCopy = () => (
+  <svg {...S}>
+    <rect x="9" y="9" width="11" height="11" rx="2" />
+    <path d="M5 15V6a2 2 0 0 1 2-2h9" />
+  </svg>
+)
+
+/** Bare checkmark. IconCircleCheck is the badged variant and means something else: a completed
+ *  thing, not a selected one. */
+export const IconCheck = () => (
+  <svg {...S}>
+    <path d="M5 12.5l4.5 4.5L19 7" />
+  </svg>
+)
+
+/* On the shared 24 viewBox like every icon above, not a 16 one: two viewBoxes in one row cannot be
+   made to match by setting equal pixel sizes, because the shapes fill their boxes differently. */
+export const IconChevronDown = () => (
+  <svg {...S}>
+    <path d="M6 9.5l6 6 6-6" />
+  </svg>
+)
+
+export const IconChevronRight = () => (
+  <svg {...S}>
+    <path d="M9.5 6l6 6-6 6" />
+  </svg>
+)
+
+export const IconClose = () => (
+  <svg {...S}>
+    <path d="M6 6l12 12M18 6L6 18" />
+  </svg>
+)
+
 export const IconCanvasView = () => (
   <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
     <rect x="1.5" y="1.5" width="6" height="5" rx="1" />
@@ -366,5 +551,25 @@ export const IconRestoreSize = () => (
     <path d="M20 4l-6 6" />
     <path d="M4 14h6v6" />
     <path d="M4 20l6-6" />
+  </svg>
+)
+
+/** GitHub mark, drawn in the same 24px/2px stroke grid as the lucide glyphs it sits beside (the
+ *  project-icon picker's Avatar tab). Ours because lucide-react 1.x removed its brand icons. */
+export const IconGithub = ({ className }: { className?: string }) => (
+  <svg
+    width={24}
+    height={24}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={2}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    aria-hidden="true"
+  >
+    <path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4" />
+    <path d="M9 18c-4.51 2-5-2-7-2" />
   </svg>
 )

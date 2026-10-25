@@ -7,11 +7,16 @@ import { ConfirmDialog } from '../../ConfirmDialog'
 import { ProCompare } from './ProCompare'
 import { Button } from '@renderer/ui/Button'
 import { machineNoun, otherMachines, thisMachine } from '@renderer/lib/machineName'
+import { mobileStoreNames, STRIPE_BILLING_PORTAL_URL } from '@renderer/lib/links'
+import { isBrowserRuntime } from '@renderer/bridge/runtime'
+import type { SettingsSectionId } from '../nav'
 import { Input } from '@renderer/ui/Input'
 import {
   licenseSentence,
+  proStatusLine,
   canReleaseDevices,
   canUseKeyElsewhere,
+  offersBillingPortal,
   releaseFailureSentence,
   activationErrorSentence
 } from '@renderer/lib/licenseCopy'
@@ -36,13 +41,66 @@ const ROWS = {
       'devices',
       'seats',
       'release',
-      'copy key'
+      'copy key',
+      'app store',
+      'iphone',
+      'google play',
+      'android',
+      'pairing',
+      'billing',
+      'invoice',
+      'invoices',
+      'receipt',
+      'payment',
+      'card',
+      'cancel',
+      'stripe'
     ]
   }
 }
 const ENTRIES = Object.values(ROWS)
 
-export function LicenseSection({ isActive }: { isActive: boolean }): React.JSX.Element {
+// Pairing can expose an existing entitlement; it cannot repair a purchase without a linked
+// phone identity (nodeterm-ios#31). Keep the same qualification beside both purchase routes.
+function AppStorePairingHint(): React.JSX.Element {
+  return (
+    <p className="text-sm text-muted">
+      Already have Pro from {mobileStoreNames()}? Pairing the phone with that subscription can unlock Pro
+      in the desktop app without a license key.{' '}
+      {isBrowserRuntime()
+        ? 'In the desktop app, open Settings → Phone to pair. Server Edition does not support this activation route. '
+        : 'Open Settings → Phone to pair. '}
+      Some purchases cannot be linked by pairing; if Pro stays inactive, contact support before
+      buying again.
+    </p>
+  )
+}
+
+// Invoices, payment method and cancellation for a desktop (Stripe checkout) purchase live on
+// Stripe's hosted page — nodeterm keeps no billing account to show them in-app. Rendered for a
+// lapsed buyer too: a failed card is how a desktop subscription stops being Pro.
+function BillingPortalLink(): React.JSX.Element {
+  return (
+    <div className="space-y-2">
+      <Button onClick={() => window.nodeTerminal.shell.openExternal(STRIPE_BILLING_PORTAL_URL)}>
+        Billing &amp; invoices
+      </Button>
+      <p className="text-sm text-muted">
+        Bought Pro on the desktop? Sign in to Stripe with the email you used at checkout to download
+        invoices, update your card or cancel. Purchases from {mobileStoreNames()} are billed by the
+        store, not Stripe.
+      </p>
+    </div>
+  )
+}
+
+export function LicenseSection({
+  isActive,
+  onNavigate
+}: {
+  isActive: boolean
+  onNavigate: (id: SettingsSectionId) => void
+}): React.JSX.Element {
   const ent = useEntitlement()
   const [licenseKey, setLicenseKey] = useState('')
   const [upgrading, setUpgrading] = useState(false)
@@ -115,13 +173,7 @@ export function LicenseSection({ isActive }: { isActive: boolean }): React.JSX.E
         {ent.isPremium ? (
           <div className="space-y-3">
             <ProCompare />
-            <p className="text-sm text-muted">
-              Pro — active
-              {ent.status.expiresAt
-                ? ` until ${new Date(ent.status.expiresAt * 1000).toLocaleDateString()}`
-                : ''}
-              .
-            </p>
+            <p className="text-sm text-muted">{proStatusLine(ent.status)}</p>
             {detail ? (
               <>
                 {/* No key ⇒ no field. A row reading "not available" beside a sentence saying there
@@ -162,7 +214,7 @@ export function LicenseSection({ isActive }: { isActive: boolean }): React.JSX.E
                       {releasing ? 'Releasing…' : 'Release other devices'}
                     </Button>
                     {releaseNote ? (
-                      <p className="text-sm" style={{ color: '#ff9f0a' }}>
+                      <p className="text-sm" style={{ color: 'var(--warn)' }}>
                         {releaseNote}
                       </p>
                     ) : null}
@@ -170,11 +222,16 @@ export function LicenseSection({ isActive }: { isActive: boolean }): React.JSX.E
                 ) : null}
               </>
             ) : null}
+            {offersBillingPortal(detail) ? <BillingPortalLink /> : null}
             <Button onClick={() => setConfirming('deactivate')}>Deactivate on this device</Button>
           </div>
         ) : (
           <div className="space-y-3">
             <ProCompare />
+            <AppStorePairingHint />
+            {!isBrowserRuntime() ? (
+              <Button onClick={() => onNavigate('phone')}>Open Settings → Phone</Button>
+            ) : null}
             <Button
               variant="primary"
               onClick={() => {
@@ -187,11 +244,12 @@ export function LicenseSection({ isActive }: { isActive: boolean }): React.JSX.E
             <p className="text-sm text-muted">
               {upgrading
                 ? 'Complete your purchase in the browser — Pro unlocks here automatically.'
-                : 'Unlock remote access and Pro features.'}
+                : 'Unlock Pro features.'}
             </p>
             <details>
               <summary className="cursor-pointer text-sm text-muted">Have a license key?</summary>
               <div className="mt-3 space-y-2">
+                <AppStorePairingHint />
                 <FieldRow
                   label="License key"
                   control={
@@ -214,12 +272,13 @@ export function LicenseSection({ isActive }: { isActive: boolean }): React.JSX.E
                     exactly who this screen exists for, and `Could not activate (seat_limit).` is
                     a dead end: the word is unsearchable and names no way out. */}
                 {ent.status.error ? (
-                  <p className="text-sm" style={{ color: '#ff9f0a' }}>
+                  <p className="text-sm" style={{ color: 'var(--warn)' }}>
                     {activationErrorSentence(ent.status.error)}
                   </p>
                 ) : null}
               </div>
             </details>
+            <BillingPortalLink />
           </div>
         )}
       </SearchableRow>

@@ -15,6 +15,7 @@ export class SessionHostPty {
   private readonly dataCbs: Array<(data: string) => void> = []
   private readonly exitCbs: Array<(e: { exitCode: number }) => void> = []
   private readonly attachErrorCbs: Array<(error: Error) => void> = []
+  private readonly sizeCbs: Array<(size: { cols: number; rows: number }) => void> = []
   private attachError: Error | null = null
   private detached = false
 
@@ -31,7 +32,10 @@ export class SessionHostPty {
     client: SessionHostClient,
     name: string,
     spawn: SessionHostSpawnOptions | null,
-    scrollback: number
+    scrollback: number,
+    /** A read-only viewer's attachment (`SessionHostClient.attachWatch`): `spawn` must be null. Its
+     *  writes, resizes and pauses never reach the host. */
+    mode: 'owner' | 'watch' = 'owner'
   ) {
     this.client = client
     this.name = name
@@ -42,6 +46,9 @@ export class SessionHostPty {
       onExit: (exitCode) => {
         for (const cb of this.exitCbs) cb({ exitCode })
       },
+      onSize: (size) => {
+        for (const cb of this.sizeCbs) cb(size)
+      },
       onAttachError: (error) => {
         this.attachError = error
         for (const cb of this.attachErrorCbs) cb(error)
@@ -49,7 +56,9 @@ export class SessionHostPty {
     }
     this.ready = spawn
       ? client.attach(name, spawn, scrollback, this.sub)
-      : client.attachExisting(name, this.sub)
+      : mode === 'watch'
+        ? client.attachWatch(name, this.sub)
+        : client.attachExisting(name, this.sub)
     // node-pty's real spawn never rejects asynchronously (a spawn failure throws synchronously,
     // before a Session is even constructed) — an attach failure here is the closest analogue, and
     // it must not become an unhandled rejection just because some callers (write/resize/pause/
@@ -65,6 +74,13 @@ export class SessionHostPty {
     this.exitCbs.push(cb)
   }
 
+  /** The size the shared pty actually runs at (issue #914). Not part of node-pty's `IPty`: a real
+   *  pty is exactly the size it was last given, while this one follows whichever viewer of the
+   *  session was most recently active, which may be a different process entirely. */
+  onSize(cb: (size: { cols: number; rows: number }) => void): void {
+    this.sizeCbs.push(cb)
+  }
+
   /** Reconnect replay failed for a previously-confirmed generation. Late registration receives
    * the stored error immediately so manager wiring cannot miss a fast rejection. */
   onAttachError(cb: (error: Error) => void): void {
@@ -76,8 +92,10 @@ export class SessionHostPty {
     this.client.write(this.name, this.sub, data)
   }
 
-  resize(cols: number, rows: number): void {
-    this.client.resize(this.name, this.sub, cols, rows)
+  /** `bounding`: this pty's viewers cannot adapt to a grid other than their own, so the shared
+   *  session must never grow past this claim (see `latestClaimSize`). */
+  resize(cols: number, rows: number, bounding = false): void {
+    this.client.resize(this.name, this.sub, cols, rows, bounding)
   }
 
   pause(): void {

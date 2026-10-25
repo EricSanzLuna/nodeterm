@@ -11,7 +11,7 @@
 // exercised here rather than left to the store test above it: the guard's evidence ("any card that
 // has not finished pins its parent") is derived from this same store, so the wipe let a parent with
 // live background agents read as idle and get its CLI `/exit`ed.
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useAgentNodes } from './agentNodes'
 import { buildHibernationCandidates } from '../lib/hibernationCandidates'
 import { WORKING_STALE_MS } from '@shared/agents/stale'
@@ -20,10 +20,12 @@ const reset = (): void => {
   useAgentNodes.setState({
     byId: {},
     activityById: {},
+    lastActivityAt: {},
     positions: {},
     sizes: {},
     expanded: {},
-    selectedId: null
+    selectedId: null,
+    autoHideFinished: false
   })
 }
 
@@ -146,6 +148,169 @@ describe('sweepStaleWorking — the decay a kept card owes', () => {
   })
 })
 
+describe('sweepStaleWorking counts from the LAST activity, not from the start', () => {
+  // WORKING_STALE_MS means "this long without any sign of life". Counting it from `startedAt`
+  // declared every subagent that ran longer than the window dead while its transcript was still
+  // streaming, and the next turn boundary then removed the card for good.
+  beforeEach(() => {
+    reset()
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000_000)
+  })
+  afterEach(() => vi.useRealTimers())
+
+  it('keeps a long-running card working while its transcript keeps streaming', () => {
+    const s = useAgentNodes.getState()
+    s.start('tu1', { parentNodeId: 'n1' })
+    vi.setSystemTime(1_000_000 + WORKING_STALE_MS * 3)
+    s.appendActivity('tu1', '$ Read file.ts\n')
+    s.sweepStaleWorking(1_000_000 + WORKING_STALE_MS * 3 + 60_000)
+    expect(useAgentNodes.getState().byId['tu1'].state).toBe('working')
+    useAgentNodes.getState().clearFinishedForParent('n1')
+    expect(useAgentNodes.getState().byId['tu1']).toBeDefined()
+  })
+
+  it('still decays a card whose last activity is older than the window', () => {
+    const s = useAgentNodes.getState()
+    s.start('tu1', { parentNodeId: 'n1' })
+    vi.setSystemTime(1_000_000 + 60_000)
+    s.appendActivity('tu1', 'last words\n')
+    s.sweepStaleWorking(1_000_000 + 60_000 + WORKING_STALE_MS + 1)
+    expect(useAgentNodes.getState().byId['tu1'].state).toBe('done')
+  })
+
+  it('does not touch byId on activity, so the canvas does not re-render per chunk', () => {
+    const s = useAgentNodes.getState()
+    s.start('tu1', { parentNodeId: 'n1' })
+    const before = useAgentNodes.getState().byId
+    s.appendActivity('tu1', 'chunk\n')
+    expect(useAgentNodes.getState().byId).toBe(before)
+  })
+
+  it('a replayed card keeps the host-reported last activity, so the first sweep after a reload spares it', () => {
+    const s = useAgentNodes.getState()
+    const now = 1_000_000 + WORKING_STALE_MS * 3
+    vi.setSystemTime(now)
+    s.start('tu1', { parentNodeId: 'n1', startedAt: 1_000_000, lastActivityAt: now - 30_000 })
+    expect(useAgentNodes.getState().byId['tu1']).not.toHaveProperty('lastActivityAt')
+    s.sweepStaleWorking(now + 60_000)
+    expect(useAgentNodes.getState().byId['tu1'].state).toBe('working')
+  })
+
+  it('an activity time left in the future by a clock step back is clamped, so the card still decays', () => {
+    const s = useAgentNodes.getState()
+    s.start('tu1', { parentNodeId: 'n1', startedAt: 1_000_000, lastActivityAt: 50_000_000 })
+    s.sweepStaleWorking(2_000_000)
+    expect(useAgentNodes.getState().byId['tu1'].state).toBe('working')
+    expect(useAgentNodes.getState().lastActivityAt['tu1']).toBe(2_000_000)
+    s.sweepStaleWorking(2_000_000 + WORKING_STALE_MS + 1)
+    expect(useAgentNodes.getState().byId['tu1'].state).toBe('done')
+  })
+
+  it('forgets the activity time when the card is dropped', () => {
+    const s = useAgentNodes.getState()
+    s.start('tu1', { parentNodeId: 'n1' })
+    s.appendActivity('tu1', 'chunk\n')
+    useAgentNodes.getState().clearForParent('n1')
+    expect(useAgentNodes.getState().lastActivityAt['tu1']).toBeUndefined()
+  })
+})
+
+describe('autoHideFinished: dropping a card the moment its subagent finishes', () => {
+  beforeEach(reset)
+
+  it('keeps the finished card until the turn boundary while the setting is off', () => {
+    const s = useAgentNodes.getState()
+    s.start('tu1', { parentNodeId: 'n1' })
+    s.finish('tu1', { tokens: 7 })
+    expect(useAgentNodes.getState().byId['tu1']).toMatchObject({ state: 'done', tokens: 7 })
+  })
+
+  it('drops the card on finish while the setting is on', () => {
+    const s = useAgentNodes.getState()
+    s.setAutoHideFinished(true)
+    s.start('tu1', { parentNodeId: 'n1' })
+    useAgentNodes.getState().finish('tu1', { tokens: 7 })
+    expect(useAgentNodes.getState().byId['tu1']).toBeUndefined()
+  })
+
+  it('takes the dropped card’s overrides, selection and activity with it', () => {
+    const s = useAgentNodes.getState()
+    s.setAutoHideFinished(true)
+    s.start('tu1', { parentNodeId: 'n1' })
+    s.setPosition('tu1', { x: 1, y: 2 })
+    s.setSize('tu1', { width: 400, height: 300 })
+    s.toggleExpanded('tu1')
+    s.appendActivity('tu1', 'ran')
+    s.select('tu1')
+    useAgentNodes.getState().finish('tu1', {})
+    const st = useAgentNodes.getState()
+    expect(st.positions['tu1']).toBeUndefined()
+    expect(st.sizes['tu1']).toBeUndefined()
+    expect(st.expanded['tu1']).toBeUndefined()
+    expect(st.activityById['tu1']).toBeUndefined()
+    expect(st.selectedId).toBeNull()
+  })
+
+  it('leaves a sibling that is still working, so #547 is unaffected', () => {
+    const s = useAgentNodes.getState()
+    s.setAutoHideFinished(true)
+    s.start('tu-done', { parentNodeId: 'n1' })
+    s.start('tu-running', { parentNodeId: 'n1' })
+    useAgentNodes.getState().finish('tu-done', {})
+    expect(Object.keys(useAgentNodes.getState().byId)).toEqual(['tu-running'])
+  })
+
+  it('marks the stale sweep done while the setting is off', () => {
+    const s = useAgentNodes.getState()
+    s.start('tu1', { parentNodeId: 'n1' })
+    const startedAt = useAgentNodes.getState().byId['tu1'].startedAt
+    s.sweepStaleWorking(startedAt + WORKING_STALE_MS + 1)
+    expect(useAgentNodes.getState().byId['tu1'].state).toBe('done')
+  })
+
+  it('does NOT drop the stale sweep’s cards, even while the setting is on', () => {
+    // The sweep fires because the end never ARRIVED, which is the opposite of what this setting
+    // promises. It is also the case where a visible card carries the most information: drop it and
+    // a fan-out whose subagents died silently leaves nothing behind saying one was ever launched.
+    // So the decay keeps marking `done` and the turn boundary takes the card, as it always did.
+    const s = useAgentNodes.getState()
+    s.setAutoHideFinished(true)
+    s.start('tu-stale', { parentNodeId: 'n1' })
+    s.start('tu-young', { parentNodeId: 'n1' })
+    const now = Date.now()
+    useAgentNodes.setState((st) => ({
+      byId: {
+        ...st.byId,
+        'tu-stale': { ...st.byId['tu-stale'], startedAt: now - WORKING_STALE_MS - 1 }
+      }
+    }))
+    useAgentNodes.getState().sweepStaleWorking(now)
+    const { byId } = useAgentNodes.getState()
+    expect(byId['tu-stale'].state).toBe('done')
+    expect(byId['tu-young'].state).toBe('working')
+  })
+
+  it('and the turn boundary then takes that decayed card, as it does with the setting off', () => {
+    const s = useAgentNodes.getState()
+    s.setAutoHideFinished(true)
+    s.start('tu-stale', { parentNodeId: 'n1' })
+    const startedAt = useAgentNodes.getState().byId['tu-stale'].startedAt
+    useAgentNodes.getState().sweepStaleWorking(startedAt + WORKING_STALE_MS + 1)
+    useAgentNodes.getState().clearFinishedForParent('n1')
+    expect(useAgentNodes.getState().byId['tu-stale']).toBeUndefined()
+  })
+
+  it('a late finish on a dropped card is a no-op', () => {
+    const s = useAgentNodes.getState()
+    s.setAutoHideFinished(true)
+    s.start('tu1', { parentNodeId: 'n1' })
+    useAgentNodes.getState().finish('tu1', {})
+    useAgentNodes.getState().finish('tu1', { tokens: 9 })
+    expect(useAgentNodes.getState().byId['tu1']).toBeUndefined()
+  })
+})
+
 describe('Eco still sees the live subagent after a new turn (issue #547)', () => {
   beforeEach(reset)
 
@@ -184,4 +349,12 @@ describe('Eco still sees the live subagent after a new turn (issue #547)', () =>
     s.sweepStaleWorking(startedAt + WORKING_STALE_MS + 1)
     expect(candidates()[0].liveSubagents).toBe(false)
   })
+})
+
+it('replayed starts retain host timing when a buffered live duplicate follows', () => {
+  const store = useAgentNodes.getState()
+  store.start('reload-child', { parentNodeId: 'reload-parent', startedAt: 123 })
+  store.start('reload-child', { parentNodeId: 'reload-parent' })
+  expect(useAgentNodes.getState().byId['reload-child'].startedAt).toBe(123)
+  store.clearForParent('reload-parent')
 })

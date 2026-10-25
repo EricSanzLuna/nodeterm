@@ -8,9 +8,10 @@
  * real tmux in `agent-message.realtty.test.ts` — this file assumes both and tests only what the
  * service adds.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
   deliverFromControl,
+  ptyPaneProbeDeps,
   renderMessageOutcome,
   onMessagingAgentEvent,
   createDeliveryQueue,
@@ -283,6 +284,7 @@ describe('renderMessageOutcome', () => {
       { kind: 'targetNotAgentPane', observed: 'bash' },
       { kind: 'targetNotPasteAware' },
       { kind: 'targetGone' },
+      { kind: 'targetNotStarted' },
       { kind: 'notPermitted', reason: 'switch-off' }
     ]
     for (const o of samples) {
@@ -508,5 +510,124 @@ describe('deliver-on-idle wiring (PR 7)', () => {
     )
     expect(expiredLine, 'no expired board-log line reached the sender').toBeTruthy()
     expect(expiredLine?.projectId).toBe('p1')
+  })
+})
+
+describe('a target that has not started yet (launch held off screen)', () => {
+  // The field report: `open-agent` into a project not on screen, no `--run-now`, then `send` at
+  // once. The node exists only as a held launch, so no spawn has recorded its owner — and it used
+  // to be refused `unproven-target-owner` with advice to restart a session that did not exist.
+  const unstarted = (over: Partial<AgentMessagingDeps> = {}) => {
+    let started = false
+    const deps = fakeDeps({
+      heldLaunch: (projectId, id) => !started && projectId === 'p1' && id === 'b1',
+      hasLiveSession: () => started,
+      paneOwnerProject: (id) => (started && id === 'b1' ? 'p1' : undefined),
+      ...over
+    })
+    return { deps, start: () => (started = true) }
+  }
+
+  it('is answered targetNotStarted (retryable) when no queue is wired', async () => {
+    const { deps } = unstarted()
+    const { outcome, reply } = await deliverFromControl(req(), deps)
+    expect(outcome.kind).toBe('targetNotStarted')
+    expect(RETRYABLE.targetNotStarted).toBe(true)
+    expect(reply.ok).toBe(false)
+    expect(reply.error).toMatch(/run --node/)
+    expect(deps.rec.sent).toHaveLength(0)
+  })
+
+  it('is queued, then delivered once the spawn proves ownership', async () => {
+    const { deps, start } = unstarted()
+    const waits: number[] = []
+    const queue = createDeliveryQueue(deps, {
+      schedule: (ms) => {
+        waits.push(ms)
+        return () => {}
+      }
+    })
+    deps.queue = queue
+    const { outcome } = await deliverFromControl(req(), deps)
+    expect(outcome.kind).toBe('queued')
+    // The start waits for a person to open the project: 5 minutes lost the message in the field.
+    expect(outcome.kind === 'queued' && outcome.ttlMs).toBe(24 * 60 * 60 * 1000)
+    expect(waits).toEqual([24 * 60 * 60 * 1000])
+    expect(deps.rec.sent).toHaveLength(0)
+    start()
+    await queue.onTargetIdle('b1')
+    expect(deps.rec.sent).toHaveLength(1)
+  })
+
+  it('still honours the per-project switch', async () => {
+    const { deps } = unstarted({ messagingEnabled: () => false })
+    const { outcome } = await deliverFromControl(req(), deps)
+    expect(outcome).toEqual({ kind: 'notPermitted', reason: 'switch-off' })
+  })
+
+  it('a LIVE pane with no proven owner stays refused, held launch or not', async () => {
+    const { deps } = unstarted({ hasLiveSession: () => true })
+    const { outcome } = await deliverFromControl(req(), deps)
+    expect(outcome).toEqual({ kind: 'notPermitted', reason: 'unproven-target-owner' })
+  })
+
+  it('a node with no held launch and no session stays unproven', async () => {
+    const { deps } = unstarted({ heldLaunch: () => false })
+    const { outcome } = await deliverFromControl(req(), deps)
+    expect(outcome).toEqual({ kind: 'notPermitted', reason: 'unproven-target-owner' })
+  })
+})
+
+describe('deliverFromControl — the pane-read budget reaches both probes', () => {
+  // A Windows pane read (PowerShell console/CIM) takes ~2.4 s. Driven through the shells' own
+  // wiring helper and the whole control -> runDelivery -> deliverAgentMessage chain, so dropping
+  // the budget at ANY hop turns the first case into `targetPaneUnreadable`.
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  function slowPty(budgetMs: number): {
+    pty: Parameters<typeof ptyPaneProbeDeps>[0]
+    reads: string[]
+    budgetAsks: string[]
+  } {
+    const reads: string[] = []
+    const budgetAsks: string[] = []
+    return {
+      reads,
+      budgetAsks,
+      pty: {
+        paneOwner: async (nodeId) => {
+          reads.push(nodeId)
+          await new Promise((r) => setTimeout(r, 3000))
+          return { tty: '/dev/pts/9', panePid: 100, paneId: '%1', command: 'claude', argv: ['claude'], pids: [200] }
+        },
+        paneProbeTimeoutMs: (nodeId) => {
+          budgetAsks.push(nodeId)
+          return budgetMs
+        }
+      }
+    }
+  }
+
+  it('with the Windows budget, a 3 s read is delivered — both reads aimed at the target', async () => {
+    const { pty, reads, budgetAsks } = slowPty(8000)
+    const deps = fakeDeps(ptyPaneProbeDeps(pty))
+    const pending = deliverFromControl(req(), deps)
+    await vi.advanceTimersByTimeAsync(10_000)
+    const { outcome } = await pending
+    expect(outcome.kind).toBe('delivered')
+    expect(deps.rec.sent).toHaveLength(1)
+    expect(reads).toEqual(['b1', 'b1']) // pre-write and post-write
+    expect(budgetAsks).toContain('b1')
+  })
+
+  it('under the 2 s default the same read is refused as unreadable, and nothing is sent', async () => {
+    const { pty } = slowPty(2000)
+    const deps = fakeDeps(ptyPaneProbeDeps(pty))
+    const pending = deliverFromControl(req(), deps)
+    await vi.advanceTimersByTimeAsync(10_000)
+    const { outcome } = await pending
+    expect(outcome.kind).toBe('targetPaneUnreadable')
+    expect(deps.rec.sent).toHaveLength(0)
   })
 })

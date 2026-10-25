@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest'
+import { isShellCommand } from '../../shared/agents/pane'
+import type { PaneOwner } from '../../shared/agents/pane-owner-predicate'
+import { decideWakeResume } from './wake-identity'
 import {
   planHibernation,
   shouldAutoWake,
@@ -19,6 +22,7 @@ const base = (id: string, over: object = {}) => ({
   recurring: false,
   liveSubagents: false,
   liveBackgroundTask: false,
+  paneUnverified: false,
   lastEventAt: 0,
   ...over
 })
@@ -40,7 +44,13 @@ describe('planHibernation', () => {
         base('i', { state: 'waiting' }),
         base('j', { recurring: true }),
         base('k', { liveSubagents: true }),
-        base('l', { liveBackgroundTask: true })
+        base('l', { liveBackgroundTask: true }),
+        // A node whose last exit attempt found no agent in its pane is excluded HERE, not merely
+        // refused at fire time. It is `done`, offscreen and idle and nothing about it will change
+        // on its own, so left in the plan it would hold a batch slot on every sweep for the rest
+        // of the run — the same starvation `remote` is excluded at plan time to avoid. See
+        // wake-identity.ts / issue #823.
+        base('m', { paneUnverified: true, lastEventAt: 0 })
       ],
       NOW,
       cfg
@@ -167,5 +177,42 @@ describe('shouldAutoWake — the mount timer / visibility edge / kanban modal-op
   it('does not fire for a node that is neither hibernated nor paused (nothing to wake)', () => {
     expect(shouldAutoWake(false, false)).toBe(false)
     expect(shouldAutoWake(undefined, undefined)).toBe(false)
+  })
+})
+
+// Eco is platform-neutral: a Windows session-host pane goes through exactly the policy a tmux pane
+// does, and the wake has to recognise the Windows shells the exit settled on.
+describe('Eco on Windows (session host) — the same policy as tmux', () => {
+  it('a candidate that differs only by backend gets the same verdict', () => {
+    const tmux = [base('a', { lastEventAt: 1 }), base('b', { lastEventAt: 2, offscreen: false })]
+    const host = tmux.map((c) => ({ ...c, backend: 'session-host', platform: 'win32' }))
+    expect(planHibernation(host, NOW, cfg)).toEqual(planHibernation(tmux, NOW, cfg))
+    expect(planHibernation(host, NOW, cfg)).toEqual(['a'])
+  })
+
+  it.each(['pwsh.exe', 'PWSH.EXE', 'powershell.exe', 'cmd.exe', 'pwsh', 'cmd'])(
+    '%s is a shell for the exit poll',
+    (name) => expect(isShellCommand(name)).toBe(true)
+  )
+
+  const owner = (command: string, argv: string[] = [command]): PaneOwner => ({
+    panePid: 10,
+    tty: 'win32-console:10',
+    paneId: 'win32:gen-1:2026-10-01T00:00:00Z',
+    command,
+    argv,
+    pids: [10]
+  })
+
+  it.each(['pwsh', 'powershell', 'cmd'])('wakes into an idle %s console', (shell) => {
+    expect(decideWakeResume({ owner: owner(shell), recorded: null, exitedByUs: false, agentId: 'claude' })).toBe('resume')
+    const recorded = { panePid: 10, paneId: 'win32:gen-1:2026-10-01T00:00:00Z', command: shell }
+    expect(decideWakeResume({ owner: owner(shell), recorded, exitedByUs: true, agentId: 'claude' })).toBe('resume')
+  })
+
+  it('never wakes into a console a node-run agent still owns', () => {
+    expect(
+      decideWakeResume({ owner: owner('node', ['claude']), recorded: null, exitedByUs: false, agentId: 'claude' })
+    ).toBe('agent-running')
   })
 })

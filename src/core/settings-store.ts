@@ -2,6 +2,7 @@ import { readFileSync } from "fs";
 import path from "path";
 import { writeFileAtomic } from "./fs-atomic";
 import { IPC } from "../shared/ipc";
+import { isNewProjectStorage } from "../shared/project-storage";
 import { platform } from "./platform";
 import { DEFAULT_SETTINGS, type Settings } from "../shared/types";
 
@@ -28,7 +29,7 @@ function mergeSettings(saved: Partial<Settings> | null | undefined): Settings {
   // A shortcut EQUAL to the default seeds nothing: the override would only restate what the
   // registry already says, and would then pin that chord against any future default change.
   // **The seeded value survives the read path.** `speech.dictation` has its OWN conflict bucket
-  // (`conflictBucket` in shared/keybindings.ts), so it can never be a participant in a
+  // (`conflictBuckets` in shared/keybindings.ts), so it can never be a participant in a
   // cross-command collision, and the READ path's sanitizer (`sanitizeKeybindingOverrides`) has
   // nothing to strip — neither the seed nor the user's own override on the same chord. (It used
   // not to: both were deleted on load, and dictation silently fell back to the registry default.)
@@ -70,6 +71,39 @@ function mergeSettings(saved: Partial<Settings> | null | undefined): Settings {
   if (gpu === false) merged.terminalGpuRendering = "off";
   else if (gpu !== "on" && gpu !== "off" && gpu !== "auto" && gpu !== "shared")
     merged.terminalGpuRendering = "auto";
+  // `agentLaunchMode` is the three-way successor to the `vanillaLaunchDefault` boolean. A saved
+  // file from before this field existed carries only the boolean: `true` was an explicit opt into
+  // subscription/vanilla, so it migrates to `'subscription'`; `false` (or absent) is the default
+  // and maps to `'gateway'`. Once `agentLaunchMode` is present it is the truth and the boolean is
+  // only a downgrade mirror (the renderer write path keeps it in sync for an older build).
+  // Validate to the default for an unrecognized value — settings.json is hand-editable.
+  const savedLaunchMode = (saved as { agentLaunchMode?: unknown } | null | undefined)
+    ?.agentLaunchMode;
+  if (
+    savedLaunchMode === "gateway" ||
+    savedLaunchMode === "gateway-model" ||
+    savedLaunchMode === "subscription"
+  ) {
+    merged.agentLaunchMode = savedLaunchMode;
+  } else if (merged.vanillaLaunchDefault === true) {
+    merged.agentLaunchMode = "subscription";
+  } else {
+    merged.agentLaunchMode = DEFAULT_SETTINGS.agentLaunchMode;
+  }
+  // Keep the mirror in lockstep with the resolved mode so an older build still honors the choice.
+  merged.vanillaLaunchDefault = merged.agentLaunchMode === "subscription";
+  // Same rule for where new folder projects keep their canvas (issue #1145).
+  if (!isNewProjectStorage(merged.newProjectStorage as unknown))
+    merged.newProjectStorage = DEFAULT_SETTINGS.newProjectStorage;
+  // Background mode is hand-editable too: anything but the three known values is the default.
+  const bg = merged.runInBackgroundOnClose as unknown;
+  if (bg !== "auto" && bg !== "on" && bg !== "off")
+    merged.runInBackgroundOnClose = DEFAULT_SETTINGS.runInBackgroundOnClose;
+  // Pre-release switch that became the "Liquid Glass" appearance; honoured once so a tester's
+  // choice carries over, and only where the appearance still followed the terminal.
+  const legacyGlass = (saved as { glassTerminals?: unknown } | null | undefined)?.glassTerminals;
+  if (legacyGlass === true && merged.appTheme === "auto") merged.appTheme = "liquid-glass";
+  delete (merged as { glassTerminals?: unknown }).glassTerminals;
   return merged;
 }
 

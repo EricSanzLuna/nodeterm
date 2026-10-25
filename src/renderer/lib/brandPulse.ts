@@ -10,6 +10,7 @@ import type { AgentId } from '@shared/agents/config'
 import claudeIcon from '../assets/claude.svg'
 import codexIcon from '../assets/codex-color.svg'
 import geminiIcon from '../assets/gemini-color.svg'
+import antigravityIcon from '../assets/antigravity-color.svg'
 import opencodeIcon from '../assets/opencode.svg'
 
 // Brand logo per builtin agent; custom/unknown agents have none (callers fall back to the terminal
@@ -24,7 +25,10 @@ export const AGENT_LOGO: Partial<Record<string, string>> = {
   claude: claudeIcon,
   codex: codexIcon,
   gemini: geminiIcon,
-  opencode: opencodeIcon
+  opencode: opencodeIcon,
+  // Google's multi-colour arch. Multi-colour (a masked gradient), so an asset like gemini's — not an
+  // inline `currentColor` mark.
+  antigravity: antigravityIcon
 }
 
 /**
@@ -40,7 +44,7 @@ export const brandLogoSrc = (agentId: AgentId): string | undefined =>
 
 /** Does this agent have a brand mark to draw? grok is inlined rather than an asset, so it is not in
  *  AGENT_LOGO — ask through here rather than testing that map directly. */
-export const INLINE_MARK_AGENTS = ['grok', 'copilot'] as const
+export const INLINE_MARK_AGENTS = ['grok', 'copilot', 'cursor'] as const
 export type InlineMark = (typeof INLINE_MARK_AGENTS)[number]
 export const inlineMarkFor = (agentId: AgentId): InlineMark | null =>
   (INLINE_MARK_AGENTS as readonly string[]).includes(agentId) ? (agentId as InlineMark) : null

@@ -39,6 +39,18 @@ describe('SettingsStore nested-default merge', () => {
     expect(s.fontSize).toBe(15)
   })
 
+  it.each([
+    ['true over auto becomes Liquid Glass', { glassTerminals: true }, 'liquid-glass'],
+    ['true over an explicit dark keeps dark', { glassTerminals: true, appTheme: 'dark' }, 'dark'],
+    ['false changes nothing', { glassTerminals: false }, 'auto']
+  ] as const)('pre-release glassTerminals: %s, and the key is dropped', (_name, saved, theme) => {
+    writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(saved), 'utf-8')
+    const store = new SettingsStore()
+    store.init()
+    expect(store.get().appTheme).toBe(theme)
+    expect('glassTerminals' in store.get()).toBe(false)
+  })
+
   it('turns pty shadow clients ON for an existing settings.json that predates the flag', () => {
     writeFileSync(path.join(dir, 'settings.json'), JSON.stringify({ tmuxEnabled: true }), 'utf-8')
     const store = new SettingsStore()
@@ -179,6 +191,66 @@ describe('SettingsStore nested-default merge', () => {
       expect(load(42).get().terminalGpuRendering).toBe('auto')
       expect(load(null).get().terminalGpuRendering).toBe('auto')
       expect(load({ mode: 'shared' }).get().terminalGpuRendering).toBe('auto')
+    })
+  })
+
+  describe('runInBackgroundOnClose', () => {
+    const load = (saved: Record<string, unknown>): Settings => {
+      writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(saved), 'utf-8')
+      const store = new SettingsStore()
+      store.init()
+      return store.get()
+    }
+
+    it("defaults to 'auto' for a settings.json that predates the key", () => {
+      expect(load({ fontSize: 13 }).runInBackgroundOnClose).toBe('auto')
+    })
+
+    it('keeps the three known values', () => {
+      for (const v of ['auto', 'on', 'off']) expect(load({ runInBackgroundOnClose: v }).runInBackgroundOnClose).toBe(v)
+    })
+
+    it("normalizes a hand-edited garbage value to 'auto'", () => {
+      expect(load({ runInBackgroundOnClose: true }).runInBackgroundOnClose).toBe('auto')
+      expect(load({ runInBackgroundOnClose: 'tray' }).runInBackgroundOnClose).toBe('auto')
+      expect(load({ runInBackgroundOnClose: null }).runInBackgroundOnClose).toBe('auto')
+    })
+  })
+
+  describe('agent launch mode migration', () => {
+    const loadWith = (saved: Record<string, unknown>): Settings => {
+      writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(saved), 'utf-8')
+      const store = new SettingsStore()
+      store.init()
+      return store.get()
+    }
+
+    it('migrates the legacy vanilla boolean and keeps its downgrade mirror synchronized', () => {
+      expect(loadWith({ vanillaLaunchDefault: true })).toMatchObject({
+        agentLaunchMode: 'subscription',
+        vanillaLaunchDefault: true
+      })
+      expect(loadWith({ vanillaLaunchDefault: false })).toMatchObject({
+        agentLaunchMode: 'gateway',
+        vanillaLaunchDefault: false
+      })
+      expect(loadWith({})).toMatchObject({
+        agentLaunchMode: 'gateway',
+        vanillaLaunchDefault: false
+      })
+    })
+
+    it('keeps each valid mode authoritative and normalizes invalid values to the default', () => {
+      expect(
+        loadWith({ agentLaunchMode: 'gateway-model', vanillaLaunchDefault: true })
+      ).toMatchObject({ agentLaunchMode: 'gateway-model', vanillaLaunchDefault: false })
+      expect(
+        loadWith({ agentLaunchMode: 'subscription', vanillaLaunchDefault: false })
+      ).toMatchObject({ agentLaunchMode: 'subscription', vanillaLaunchDefault: true })
+      expect(loadWith({ agentLaunchMode: 'unknown', vanillaLaunchDefault: false })).toMatchObject({
+        agentLaunchMode: 'gateway',
+        vanillaLaunchDefault: false
+      })
     })
   })
 
